@@ -1,0 +1,13 @@
+# ---- 构建产物 ----
+build/
+__pycache__/
+*.spec
+
+# ---- 项目私有记忆（不入库） ----
+.workbuddy/
+
+# ---- 测试样本（含真实发票图片，不入库） ----
+test_samples/
+
+# ---- 打包后的二进制通过 GitHub Releases 分发，不提交进仓库 ----
+outputs/发票二维码工具.exe
