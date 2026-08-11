@@ -50,6 +50,16 @@ outputs/
   └─ 发票二维码工具.exe       # 打包产物（单文件，见 GitHub Releases 下载）
 ```
 
+## 下载可执行文件
+
+前往本仓库 **Releases** 页面下载最新版：
+
+- `InvoiceQRDownloader_v2.0.exe` —— 主程序（单文件，双击即用；因 GitHub Release 附件名不支持中文，此处使用英文文件名，程序界面与本地文件仍为中文名 `发票二维码工具.exe`）
+- `InvoiceQR_Usage.txt` —— 使用说明
+- `InvoiceQR_Changelog.txt` —— 更新日志
+
+> 仓库根目录同样提供中文版 `使用说明.txt` / `更新日志.txt`，内容与上方附件一致。
+
 ## 技术栈
 
 - Python 3.13 + `tkinter`（GUI）
