@@ -1,5 +1,7 @@
 # ---- 构建产物 ----
 build/
+build_new/
+dist_new/
 __pycache__/
 *.spec
 
@@ -26,6 +28,7 @@ outputs/
 /upload_changelog.py
 /test_v37.py
 /test_e2e_v37.py
+/test_concurrency.py
 /ui_preview.py
 /verify_exe_ui.py
 /arrow_picker.py
