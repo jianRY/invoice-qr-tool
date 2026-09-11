@@ -11,3 +11,26 @@ test_samples/
 
 # ---- 打包后的二进制通过 GitHub Releases 分发，不提交进仓库 ----
 outputs/发票二维码工具.exe
+outputs/
+
+# ---- 内部文件：部署 / 发布 / 测试脚本、截图、打包物 ----
+# 仓库是公开的，这些只在本机使用，绝不能被误提交
+/deploy/
+/generated-images/
+/publish_v3.py
+/make_update.py
+/make_icon.py
+/extract_release_assets.py
+/build_deploy_package.py
+/upload_only.py
+/upload_changelog.py
+/test_v37.py
+/test_e2e_v37.py
+/ui_preview.py
+/verify_exe_ui.py
+/arrow_picker.py
+/icon_candidates.png
+/exe_ui.png
+/ui_preview.png
+*.zip
+*.tar.gz
