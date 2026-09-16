@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.0"
+__VERSION__ = "4.1"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
