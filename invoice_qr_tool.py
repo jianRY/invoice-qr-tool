@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.1"
+__VERSION__ = "4.2"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -172,6 +172,17 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
 
+2026-09-16  v4.2
+- **重新设计应用图标**：由「AI 生图」改为几何绘制，新图标为「取景框 + 二维码」——
+  深蓝渐变圆角底、中央二维码、四角青色识别框；内含 16 / 24 / 32 / 48 / 64 / 128 / 256
+  共 7 档尺寸，任务栏与资源管理器里的小图标不再糊。旧图标右下角残留的「AI生成」水印一并去除。
+- **修复窗口图标发虚**：Windows 上 Tk 的 iconbitmap 会取 ICO 内最小的一档（16px）再放大，
+  导致标题栏与任务栏图标模糊；现改用 Win32 方式显式加载 32 / 16px 两档后设置，
+  实测读回窗口图标的像素与图标文件完全一致。主窗口与「更新进度」「使用说明」两个弹窗均已应用。
+- **任务栏身份修正**：设置 AppUserModelID，任务栏不再把本程序归到 Python 名下、显示 Python 图标。
+- 安装程序 / 卸载程序同步换用新图标（窗口图标与可执行文件图标），三支 exe 图标统一。
+- 官网 logo 与浏览器标签页图标同步更新（体积由约 1 MB 降至 59 KB）。
+
 2026-09-16  v4.1
 - **新增「PDF 前置转换」步骤（自动执行，无需勾选）**：目标文件夹里只要有 PDF，软件就先
   自动把 PDF 逐页转成 JPG，再往下走原有的识别 / 下载 / 汇总流程。三种情况：
@@ -188,7 +199,7 @@ CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 
 2026-09-16  v4.0
 - **合并发布：在 GitHub v3.8 基础上整合本地开发成果发布 4.0**：保留 v3.7/v3.8 全部能力（并发 6 路处理、可随时「■ 停止」、PDF 转 JPG、汇总 Excel 去千分位与公式修正等），并新增：
-- **双 exe 分发**：除原有单文件运行版外，新增「可安装版」（`InvoiceQRInstaller_v4.0.exe`），以管理员权限安装到 Program Files、创建开始菜单 / 桌面快捷方式、写入「应用和功能」卸载项（含卸载程序）。
+- **双 exe 分发**：除原有单文件运行版外，新增「可安装版」（`InvoiceQRInstaller_4.0.exe`），以管理员权限安装到 Program Files、创建开始菜单 / 桌面快捷方式、写入「应用和功能」卸载项（含卸载程序）。
 - **发布流水线自签名**：所有 exe 走 SHA256 + RFC3161 时间戳自签名（签名者 CN=jianRY），消除 SmartScreen / 未知发布者警告。
 - 构建与发布一体化：本地 `build_release.py` 一键完成「构建双 exe → 逐个签名 → 生成说明 → 推送 GitHub → 打 tag → 发 Release 上传双 exe」。
 
@@ -421,6 +432,62 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+def setup_app_id() -> None:
+    """设置 Windows 任务栏身份（AppUserModelID），必须在 tk.Tk() 之前调用。
+
+    不设置的话，任务栏会把本程序归到 Python 名下、显示 Python 的图标。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "jianRY.InvoiceQrTool")
+    except Exception:
+        pass
+
+
+def apply_window_icon(win) -> None:
+    """给窗口设置应用图标（主窗口与每个 Toplevel 都要调用）。
+
+    ⚠️ Windows 上 Tk 的 iconbitmap 会取 ICO 里最小的一档（16px）再放大，
+    导致标题栏与任务栏图标发虚。这里额外用 Win32 LoadImage 按 32/16px 显式
+    加载后经 WM_SETICON 设置，两个尺寸都清晰。
+    """
+    ico = _resource_path("app_icon.ico")
+    if not os.path.isfile(ico):
+        return
+    try:
+        win.iconbitmap(ico)          # 非 Windows 平台靠它；Windows 上仅作保底
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        LR_LOADFROMFILE, IMAGE_ICON, WM_SETICON = 0x0010, 1, 0x0080
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                      ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = ctypes.c_void_p
+        win.update_idletasks()
+        hwnd = user32.GetAncestor(win.winfo_id(), 2)   # GA_ROOT = 2
+        if not hwnd:
+            return
+        big = user32.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+        small = user32.LoadImageW(None, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        if big:
+            user32.SendMessageW(hwnd, WM_SETICON, ctypes.c_void_p(1), ctypes.c_void_p(big))
+        if small:
+            user32.SendMessageW(hwnd, WM_SETICON, ctypes.c_void_p(0), ctypes.c_void_p(small))
+    except Exception:
+        pass
+
+
 def send_to_recycle_bin(path: str) -> bool:
     """把文件移动到回收站（而非彻底删除），便于误删后恢复。返回是否成功。
 
@@ -590,6 +657,7 @@ class UpdateProgressDialog:
             self.win.protocol("WM_DELETE_WINDOW", lambda: None)
         except Exception:
             pass
+        apply_window_icon(self.win)
         self._build_widgets()
         self._poll()
 
@@ -1988,10 +2056,7 @@ class InvoiceQrToolApp:
         self.root.title(f"发票二维码识别下载工具 v{__VERSION__}")
         self.root.geometry("800x600")
         self.root.minsize(700, 450)
-        try:
-            self.root.iconbitmap(_resource_path("app_icon.ico"))
-        except Exception:
-            pass
+        apply_window_icon(self.root)
 
         self.folder_var = tk.StringVar()
         self.open_after_var = tk.BooleanVar(value=True)
@@ -2158,6 +2223,7 @@ class InvoiceQrToolApp:
             win.grab_set()
         except Exception:
             pass
+        apply_window_icon(win)
         txt = scrolledtext.ScrolledText(win, wrap=tk.WORD, state=tk.NORMAL)
         txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         txt.insert(tk.END, USAGE_TEXT + "\n\n" + CHANGELOG_TEXT)
@@ -2399,6 +2465,7 @@ def main():
         _cli_test(folder, summarize=summarize)
         return
 
+    setup_app_id()          # 必须在 tk.Tk() 之前，任务栏才会认本程序的图标与身份
     root = tk.Tk()
     app = InvoiceQrToolApp(root)
     root.mainloop()

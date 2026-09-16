@@ -24,12 +24,13 @@ for node in ast.walk(tree):
                     out[t.id] = node.value.value
 
 written = []
-# 本地中文版
+# 本地中文版：根目录（仓库内文档）与 outputs/ 都写，避免两处长期漂移
 for key, fname in (("USAGE_TEXT", "使用说明.txt"),
                    ("CHANGELOG_TEXT", "更新日志.txt")):
-    path = os.path.join(ROOT, "outputs", fname)
-    open(path, "w", encoding="utf-8").write(out[key])
-    written.append((path, len(out[key])))
+    for base in (ROOT, os.path.join(ROOT, "outputs")):
+        path = os.path.join(base, fname)
+        open(path, "w", encoding="utf-8").write(out[key])
+        written.append((path, len(out[key])))
 # 发布 ASCII 版
 for key, fname in (("USAGE_TEXT", "InvoiceQR_Usage.txt"),
                    ("CHANGELOG_TEXT", "InvoiceQR_Changelog.txt")):
