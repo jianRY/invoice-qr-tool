@@ -48,6 +48,11 @@ import requests
 URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
 
 SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+SUPPORTED_PDF_EXTS = (".pdf",)
+
+# 「PDF 前置转换」子文件夹名：只要目标文件夹里出现 PDF，就把 PDF 转出的图片与原有图片
+# 一起收进这个子文件夹，再在其中按原逻辑处理（输出 PDF/ 未识别/ 汇总表也都落在它里面）。
+POSTPROCESS_DIR_NAME = "处理后"
 
 # 状态前缀：把“未下载 / 未识别 / 其它”的图片复制到「未识别」子文件夹时加在文件名前
 PREFIX_UNRECOGNIZED = "未识别-"  # 未识别到任何二维码
@@ -102,9 +107,18 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
     误判成「未下载」而需要人工重跑。
 11. 处理过程中可点「■ 停止」随时中止：尚未开始的图片会被直接跳过，已下载的 PDF 全部保留，
     原图始终不动；停止后不再执行汇总与打开文件夹。
+12. **PDF 前置转换（自动，无需勾选）**：目标文件夹里只要有 PDF，软件会先自动把 PDF 逐页
+    转成 JPG，再往下走识别/下载流程。分三种情况：
+    - 全是图片 → 不新建任何文件夹，完全按原逻辑处理（与旧版一致）；
+    - 全是 PDF → 在目标文件夹内新建「处理后」，PDF 转出的图片放入其中，然后处理「处理后」；
+    - PDF + 图片混合 → 同样新建「处理后」，PDF 转出的图片 **加上原有图片的副本** 一起放入，
+      再处理「处理后」（原始图片文件保留不动）。
+    转出的页面命名为「原文件名_1.jpg / 原文件名_2.jpg …」（按页码递增）。
+    「处理后」每次处理都会**清空重建**，不会带入上一次的遗留结果；
+    命名冲突会自动加后缀区分；单个 PDF 损坏 / 加密时只跳过该份，不中断整体。
 
 【使用步骤】
-1. 把待处理的图片放在同一个文件夹里。
+1. 把待处理的图片（和/或 PDF）放在同一个文件夹里。
 2. 打开本软件，点「浏览…」选择该文件夹。
 3. 按需勾选：
    - 处理完成后打开文件夹
@@ -129,6 +143,8 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
   随后自动切换到新版本，安全且无损，不再需要复杂的覆盖/备份/回滚机制。
 
 【输出规则速查】
+（注：只要文件夹里含 PDF，以下输出全部落在「处理后」子文件夹内 —— 即 目标文件夹\处理后\…）
+- 含 PDF（自动）         → 新建「处理后」，PDF 转「原名_1.jpg / 原名_2.jpg …」+ 复制原有图片进
 - 网址 + 下载成功      → PDF/<原名>.pdf，原图片文件名保持不变
 - 网址 + 无 PDF 可下载 → 复制一份到「未识别/未下载-<原名>」
 - 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
@@ -136,6 +152,12 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
 - 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额/统筹为纯数字、无千分位，
                          含「是否重复」列与右侧统计区汇总）
+
+【独立工具：只转 PDF】
+命令行方式可只做前置转换（不识别、不下载、不汇总）：
+    发票二维码工具.exe --pdf2img "<文件夹路径>"
+效果：在该文件夹内新建（或清空重建）「处理后」，把 PDF 转成「原名_1.jpg…」并与原有图片
+一起放进去，随后可再打开软件对该「处理后」文件夹走完整流程。
 
 【说明】
 - 二维码识别使用 zxing-cpp，对截图 / 小二维码会自动多尺度放大，比 OpenCV 自带更稳。
@@ -149,6 +171,20 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-16  v4.1
+- **新增「PDF 前置转换」步骤（自动执行，无需勾选）**：目标文件夹里只要有 PDF，软件就先
+  自动把 PDF 逐页转成 JPG，再往下走原有的识别 / 下载 / 汇总流程。三种情况：
+  ① 全是图片 → 不新建任何文件夹，完全按原逻辑处理（与旧版一致）；
+  ② 全是 PDF → 在目标文件夹内新建「处理后」，PDF 转出的图片放入其中，随后处理「处理后」；
+  ③ PDF + 图片混合 → 同样新建「处理后」，PDF 转出的图片 + **原有图片的副本** 一起放入，
+     再处理「处理后」（原始图片保留不动）。
+- 转出的页面命名「原文件名_1.jpg / 原文件名_2.jpg …」（按页码递增，取代此前的 `_第N页`）。
+- 「处理后」文件夹每次处理都会**清空重建**，避免上一次的遗留结果干扰本次处理；
+  命名冲突（如转出的 X_1.jpg 与原文件夹的 X_1.jpg 撞名）自动加后缀区分，不覆盖；
+  单个 PDF 损坏 / 加密 / 无权限时只记日志跳过，不中断整体流程。
+- **新增独立工具入口**：`发票二维码工具.exe --pdf2img "<文件夹>"` 可只做这一步转换
+  （不识别、不下载、不汇总），转换完可直接对生成的「处理后」文件夹跑完整流程。
 
 2026-09-16  v4.0
 - **合并发布：在 GitHub v3.8 基础上整合本地开发成果发布 4.0**：保留 v3.7/v3.8 全部能力（并发 6 路处理、可随时「■ 停止」、PDF 转 JPG、汇总 Excel 去千分位与公式修正等），并新增：
@@ -1070,8 +1106,19 @@ def download_pdf(
     raise last_err if last_err is not None else PdfNotAvailable("下载失败")
 
 
-def convert_pdf_to_images(pdf_path: str, out_dir: str, base_name: str) -> list[str]:
-    """将 PDF 每一页渲染为 JPG 图片，长边 2000px，短边自适应；返回生成的文件路径列表"""
+def convert_pdf_to_images(
+    pdf_path: str,
+    out_dir: str,
+    base_name: str,
+    page_fmt: str = "_第{n}页",
+    name_fn=None,
+) -> list[str]:
+    """将 PDF 每一页渲染为 JPG 图片，长边 2000px，短边自适应；返回生成的文件路径列表
+
+    page_fmt：默认命名模板（与旧版一致「原名_第N页.jpg」）。
+    name_fn(base_name, page_no) -> 文件名：需要自定义命名 / 去重时传入，优先生效，
+              返回 None 表示跳过该页。
+    """
     import pymupdf  # 懒加载：仅在转图时才需要
 
     generated = []
@@ -1084,7 +1131,12 @@ def convert_pdf_to_images(pdf_path: str, out_dir: str, base_name: str) -> list[s
             scale = 2000.0 / max(w, h)
             mat = pymupdf.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            out_name = f"{base_name}_第{page_num + 1}页.jpg"
+            if name_fn is not None:
+                out_name = name_fn(base_name, page_num + 1)
+                if not out_name:
+                    continue
+            else:
+                out_name = f"{base_name}{page_fmt.format(n=page_num + 1)}.jpg"
             out_path = os.path.join(out_dir, out_name)
             # 以 JPEG 输出（质量 92）：体积远小于 PNG，便于上传与分享。
             # alpha=False 已保证无透明通道，符合 JPEG 要求。
@@ -1551,6 +1603,144 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     return finish("success")
 
 
+# =====================================================================
+# PDF 前置转换（独立工具）
+#   只要目标文件夹里出现 PDF，就把 PDF 逐页转成 JPG，与原有图片一起收进
+#   「处理后」子文件夹，再把后续识别/下载/汇总全部放到该子文件夹里进行。
+#   全为图片时完全跳过，保持原有行为不变。
+# =====================================================================
+
+def _unique_path(dest_dir: str, name: str, used: set) -> str:
+    """在 dest_dir 下为 name 找一个不与 used 冲突的文件名（大小写不敏感）。
+
+    used 为「已占用的文件名小写集合」，命中则在名字尾部追加 _2、_3…
+    （如 原文件名_1.jpg 已被原图片占用 → 原文件名_1_2.jpg）。
+    """
+    stem, ext = os.path.splitext(name)
+    cand = name
+    i = 1
+    while cand.lower() in used:
+        i += 1
+        cand = f"{stem}_{i}{ext}"
+    used.add(cand.lower())
+    return cand
+
+
+def prepare_target_folder(
+    folder: str,
+    log=print,
+    cancel: "CancelToken | None" = None,
+    sub_name: str = POSTPROCESS_DIR_NAME,
+):
+    """PDF 前置转换（独立步骤，可单独复用）：返回后续流程应处理的文件夹路径。
+
+    三种场景：
+      ① 全为图片           → 不新建任何文件夹，原路径原样返回（行为与旧版完全一致）；
+      ② 全为 PDF           → 新建/重建「处理后」，PDF 逐页转成 JPG 放进去，返回「处理后」；
+      ③ PDF + 图片混合     → 新建/重建「处理后」，PDF 转图 + 复制原有图片一起放进去，返回「处理后」。
+
+    约定：
+      - 转出的页面命名「原文件名_1.jpg / 原文件名_2.jpg …」；
+      - 原有图片是**复制**，原始文件夹里的文件一律保留不动；
+      - 「处理后」每次都**清空重建**，避免上一次的遗留结果干扰本次处理；
+      - 命名冲突自动加后缀区分，不覆盖已有文件；
+      - 单个 PDF 转换失败（损坏 / 加密 / 无权限）只记日志跳过，不中断整体。
+
+    返回 (目标文件夹, info)；info 字段：
+      has_pdf / converted_pages / converted_pdfs / copied_images / failed / skipped / target。
+    """
+    cancel = cancel if cancel is not None else CancelToken()
+    info = {
+        "has_pdf": 0, "converted_pages": 0, "converted_pdfs": 0,
+        "copied_images": 0, "failed": 0, "skipped": False, "target": folder,
+    }
+
+    try:
+        entries = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+    except Exception as e:
+        log(f"前置转换：读取文件夹失败（{e}），按原文件夹继续处理。")
+        return folder, info
+
+    pdfs = sorted(
+        [f for f in entries if f.lower().endswith(SUPPORTED_PDF_EXTS)], key=lambda x: x.lower()
+    )
+    images = sorted(
+        [f for f in entries if f.lower().endswith(SUPPORTED_IMAGE_EXTS)], key=lambda x: x.lower()
+    )
+
+    # ① 没有 PDF：跳过前置转换，原逻辑照旧
+    if not pdfs:
+        if images:
+            log(f"前置转换：未发现 PDF（{len(images)} 个图片文件），跳过转换，直接处理原文件夹。")
+        return folder, info
+
+    info["has_pdf"] = len(pdfs)
+    log(f"前置转换：发现 {len(pdfs)} 个 PDF、{len(images)} 个图片文件 → 先转图片，"
+        f"并统一放入「{sub_name}」子文件夹后继续处理。")
+
+    target = os.path.join(folder, sub_name)
+
+    # 「处理后」清空重建（要求：每次重建，不带上次遗留）
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+            log(f"前置转换：已清空旧的「{sub_name}」文件夹。")
+        elif os.path.exists(target):
+            os.remove(target)
+        os.makedirs(target, exist_ok=True)
+    except Exception as e:
+        log(f"前置转换：建立「{sub_name}」失败（{e}），按原文件夹继续处理。")
+        return folder, info
+
+    info["target"] = target
+    used: set = set()
+
+    # ② 先复制原有图片（原文件保留不动），占住文件名避免与转出的页面重名
+    for name in images:
+        if cancel.cancelled:
+            info["skipped"] = True
+            log("前置转换：已请求停止，剩余图片未复制。")
+            break
+        dest_name = _unique_path(target, name, used)
+        try:
+            shutil.copy2(os.path.join(folder, name), os.path.join(target, dest_name))
+            info["copied_images"] += 1
+        except Exception as e:
+            info["failed"] += 1
+            log(f"  -> 复制原图片失败：{name}（{e}）")
+
+    # ③ 逐份 PDF 转 JPG，命名「原文件名_1.jpg / _2.jpg …」
+    for name in pdfs:
+        if cancel.cancelled:
+            info["skipped"] = True
+            log("前置转换：已请求停止，剩余 PDF 未转换。")
+            break
+        pdf_path = os.path.join(folder, name)
+        base = os.path.splitext(name)[0]
+
+        def _name_fn(b, n, _t=target, _u=used):
+            # 用「原名_页码.jpg」，与已有文件冲突时自动加后缀
+            return _unique_path(_t, f"{b}_{n}.jpg", _u)
+
+        try:
+            made = convert_pdf_to_images(pdf_path, target, base, name_fn=_name_fn)
+            info["converted_pages"] += len(made)
+            info["converted_pdfs"] += 1
+            log(f"  -> {name}：转换 {len(made)} 页 → "
+                f"{os.path.basename(made[0]) if made else '（无内容）'}"
+                + (f" … {os.path.basename(made[-1])}" if len(made) > 1 else ""))
+        except Exception as e:
+            info["failed"] += 1
+            log(f"  -> PDF 转换失败：{name}（{e}）")
+
+    log(f"前置转换完成：PDF {info['converted_pdfs']}/{info['has_pdf']} 份、"
+        f"共 {info['converted_pages']} 页转成图片，复制原图片 {info['copied_images']} 个"
+        + (f"，失败 {info['failed']} 个" if info["failed"] else "")
+        + f"；后续在「{sub_name}」内处理。")
+
+    return target, info
+
+
 def process_folder(
     folder: str,
     open_after: bool,
@@ -1559,8 +1749,13 @@ def process_folder(
     log_queue: queue.Queue,
     cancel: "CancelToken | None" = None,
     workers: int = DEFAULT_WORKERS,
+    preconvert: bool = True,
 ):
     """处理整个文件夹：每张图片一个任务并发执行，结果由本线程统一汇总。
+
+    前置步骤（preconvert=True 时）：目标文件夹里只要有 PDF，就先做「PDF → JPG」转换，
+    并把转换结果与原有图片一起收进「处理后」子文件夹，再在该子文件夹内执行后续全部流程；
+    全为图片时跳过该步骤，行为与旧版完全一致。
 
     并发只用在「识别 + 下载 + 转图」这条流水线上，最后的「汇总发票」保持串行
     —— pdfplumber 是纯 Python 解析、被 GIL 锁死，实测并发 1.0× 无收益（甚至略慢）。
@@ -1579,6 +1774,14 @@ def process_folder(
         log("错误：请选择一个有效的文件夹路径。")
         log_queue.put(("done",))
         return
+
+    # ★ 前置：PDF → JPG 转换（有 PDF 时才动作；全图片直接跳过）
+    if preconvert:
+        folder, _pc_info = prepare_target_folder(folder, log=log, cancel=cancel)
+        if cancel.cancelled:
+            log("已在「前置转换」阶段停止，本次未开始识别。")
+            log_queue.put(("done",))
+            return
 
     pdf_dir = os.path.join(folder, "PDF")
     img_dir = os.path.join(pdf_dir, "图片") if convert_pdf else None
@@ -2144,6 +2347,19 @@ def _cleanup_legacy_update_artifacts():
         pass
 
 
+def _cli_pdf2img(folder: str) -> None:
+    """独立工具入口：只做「PDF → JPG」前置转换，不识别、不下载、不汇总。
+
+    效果与软件内置的前置步骤一致：在目标文件夹内新建（或清空重建）「处理后」，
+    把 PDF 逐页转成「原文件名_1.jpg …」并与原有图片一起放进去。
+    """
+    print(f"PDF 前置转换：{folder}")
+    target, info = prepare_target_folder(folder, log=print)
+    print(f"完成：PDF {info['converted_pdfs']}/{info['has_pdf']} 份、"
+          f"{info['converted_pages']} 页 → 图片；复制原图片 {info['copied_images']} 个。")
+    print(f"输出目录：{target}")
+
+
 def main():
     args = sys.argv[1:]
 
@@ -2162,6 +2378,16 @@ def main():
 
     # 清理早期更新机制遗留的临时文件
     _cleanup_legacy_update_artifacts()
+
+    # 独立工具模式：仅把文件夹里的 PDF 转成图片（含「处理后」整理），到此为止
+    if "--pdf2img" in args:
+        i = args.index("--pdf2img")
+        folder = args[i + 1] if i + 1 < len(args) else None
+        if not folder:
+            print("用法：发票二维码工具.exe --pdf2img <文件夹>")
+            return
+        _cli_pdf2img(folder)
+        return
 
     if "--test" in args:
         i = args.index("--test")
