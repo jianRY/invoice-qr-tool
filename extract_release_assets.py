@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """从 invoice_qr_tool.py 抽取 USAGE_TEXT / CHANGELOG_TEXT（用 ast，不执行模块），
-同步写入两处：
-  1) outputs/使用说明.txt、outputs/更新日志.txt        —— 本地中文版（给本地用户看）
-  2) outputs/release_assets/InvoiceQR_Usage.txt、
-     outputs/release_assets/InvoiceQR_Changelog.txt     —— 发布用 ASCII 版（GitHub 附件）
-用 AST 抽取可保证「源码/本地/Release」三处说明永远一致，避免手动改漏。"""
+同步写入根目录与 outputs/ 两处：
+  outputs/使用说明.txt、outputs/更新日志.txt   —— 本地中文版（给本地用户看）
+
+  ⚠️ outputs/release_assets/ 下的 InvoiceQR_Usage.txt / InvoiceQR_Changelog.txt
+  不在这里生成：那是**发布用**的安装指引与「按本次提交生成的」更新日志，
+  由 build_release.py 独占生成；两个脚本都写同名文件会互相覆盖，故此处不再写。
+用 AST 抽取可保证「源码 / 本地 txt」两处说明永远一致，避免手动改漏。"""
 import ast
 import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(ROOT, "invoice_qr_tool.py")
-ASSET_DIR = os.path.join(ROOT, "outputs", "release_assets")
-os.makedirs(ASSET_DIR, exist_ok=True)
 
 tree = ast.parse(open(SRC, encoding="utf-8").read())
 
@@ -75,13 +75,6 @@ for key, fname in (("USAGE_TEXT", "使用说明.txt"),
         path = os.path.join(base, fname)
         open(path, "w", encoding="utf-8").write(out[key])
         written.append((path, len(out[key])))
-# 发布 ASCII 版
-for key, fname in (("USAGE_TEXT", "InvoiceQR_Usage.txt"),
-                   ("CHANGELOG_TEXT", "InvoiceQR_Changelog.txt")):
-    path = os.path.join(ASSET_DIR, fname)
-    open(path, "w", encoding="utf-8").write(out[key])
-    written.append((path, len(out[key])))
-
 for path, n in written:
     print(f"写入 {path} ({n} 字符)")
 
