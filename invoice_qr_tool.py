@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.2"
+__VERSION__ = "4.3"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -93,11 +93,14 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 4. 可选：处理完成后自动打开文件夹。
 5. 可选：将下载的 PDF 转为 JPG 图片（长边 2000px，短边自适应），保存到「PDF/图片」。
 6. 可选：处理完成后汇总发票（生成 Excel）。对「PDF」文件夹内所有发票 PDF，
-   提取「交款人 / 票据号码 / 开票日期 / 金额合计（小写）/ 医保统筹基金支付」，
-   汇总为「PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx」；金额与统筹列为数字格式（纯数字、无千分位，
-   可直接求和与二次计算），并新增「是否重复」列（同一票据号码出现≥2次则标记“是”）；
-   表格右侧统计区新增：票据张数 / 合计总金额 / 合计总统筹金额 / 可赔付金额 /
-   重复票据金额合计 / 重复票据统筹合计。
+   提取「交款人 / 票据号码 / 开票日期 / 金额合计（小写）/ 医保统筹基金支付 / 大病保险支付」，
+   汇总为「PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx」；金额、统筹、大病保险列为数字格式（纯数字、
+   无千分位，可直接求和与二次计算），并新增「是否重复」列（同一票据号码出现≥2次则标记“是”）；
+   表格右侧统计区：票据张数 / 合计总金额 / 合计总统筹金额 /〔合计大病保险支付〕/ 可赔付金额 /
+   重复票据金额合计 / 重复票据统筹合计 /〔重复票据大病保险合计〕。
+   说明：加〔〕的两项与「大病保险支付」列一样，**仅在识别到该栏时才出现**；本批票据若一张
+   都没识别到（票据无此栏），该列连同其汇总项整体省略，输出与旧版完全一致。
+   可赔付金额 = 合计总金额 − 合计总统筹金额（若识别到大病保险支付，则再减去该项合计）。
 7. 处理结束后，弹出「识别结果统计」：总计识别图片数、成功下载 PDF、识别但未下载、
    未识别、其它各多少张，并附本次耗时、平均每张耗时与并发路数，方便核对处理结果。
 8. 日志区右上角提供「清空日志」按钮，一键清空历史日志，便于开始下一个任务。
@@ -150,8 +153,8 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 - 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
 - 识别到二维码但非网址 → 复制一份到「未识别/其它-<原名>」
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
-- 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额/统筹为纯数字、无千分位，
-                         含「是否重复」列与右侧统计区汇总）
+- 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额/统筹/大病保险为纯数字、
+                         无千分位，含「是否重复」列与右侧统计区汇总）
 
 【独立工具：只转 PDF】
 命令行方式可只做前置转换（不识别、不下载、不汇总）：
@@ -172,6 +175,20 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
 
+2026-09-16  v4.3
+- **汇总表新增「大病保险支付」列**：识别方式与「医保统筹基金支付」完全一致（票据右下角
+  基金支付区的同一版式、同样的取值规则），列位置紧随统筹列之后，写入纯数字可求和。
+  例：某张住院票据 医保统筹 111,710.09、大病保险 4,868.33。
+- 右侧统计区同步新增「合计大病保险支付」「重复票据大病保险合计」两项
+  （后者只对标记为“是”的重复票据求和）。
+- **该列为条件输出**：仅当本批票据中至少有一张识别到「大病保险支付」时才生成该列及其
+  统计项；若一张都没识别到（票据本身无此栏），该列连同其汇总项整体省略 —— 没这数值就忽略，
+  输出与旧版完全一致，不会多出空列。
+- **口径调整**：「可赔付金额」由「合计总金额 − 合计总统筹金额」改为在此基础上**再减去
+  合计大病保险支付**。大病保险同属已由基金 / 保险支付、患者并未实际支出的部分，
+  不扣除会虚高可赔付额。未识别到大病保险列时公式不变。
+- 汇总表列号不再硬编码：改为按列名动态推算（含列宽、金额格式、合计行与统计区公式），
+  后续再加提取字段不会再牵动其它列。
 2026-09-16  v4.2
 - **重新设计应用图标**：由「AI 生图」改为几何绘制，新图标为「取景框 + 二维码」——
   深蓝渐变圆角底、中央二维码、四角青色识别框；内含 16 / 24 / 32 / 48 / 64 / 128 / 256
@@ -1372,6 +1389,7 @@ def parse_invoice(pdf_path):
         "开票日期": None,
         "金额合计（小写）": None,
         "医保统筹基金支付": None,
+        "大病保险支付": None,
     }
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -1395,18 +1413,31 @@ def parse_invoice(pdf_path):
     fields["金额合计（小写）"] = lower
     fields["医保统筹基金支付"] = _to_num(
         _field_search(pages_words, [("医保统筹基金支付：", False)]))
+    # 大病保险支付：与「医保统筹基金支付」同属票据右下角的基金支付区，
+    # 版式与取值规则一致，故用同样的方式识别（全角/半角冒号由 _norm_colon 统一）。
+    # 识别到该栏（含 0.00）即记为数值；整份票据没有这一栏时为 None，
+    # 汇总表据此决定是否输出该列 —— 没识别到就整体忽略，不留空列。
+    fields["大病保险支付"] = _to_num(
+        _field_search(pages_words, [("大病保险支付：", False)]))
 
     return fields, None
 
 
-_SUMMARY_HEADERS = ["文件名", "交款人", "票据号码", "开票日期",
-                    "金额合计（小写）", "医保统筹基金支付", "是否重复"]
+# 汇总表数据列（顺序即 Excel 列序）。最后一项「大病保险支付」为**可选列**：
+# 仅当本批票据中至少有一张识别到该栏时才输出；一张都没识别到则整列连同其统计项
+# 一并省略，输出与旧版完全一致，不会多出空白列。
+_SUMMARY_FIELDS = ["文件名", "交款人", "票据号码", "开票日期",
+                   "金额合计（小写）", "医保统筹基金支付", "大病保险支付"]
+_AMOUNT_FIELD = "金额合计（小写）"
+_POOL_FIELD = "医保统筹基金支付"
+_DABING_FIELD = "大病保险支付"
 
 
-def _write_summary_excel(rows, out_path):
+def _write_summary_excel(rows, out_path, include_dabing=False):
     # 懒加载 openpyxl：仅在真正写 Excel 时才导入，缩短启动时间
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+    from openpyxl.utils import get_column_letter
 
     _SUMMARY_FILL = PatternFill("solid", fgColor="1F4E78")
     _SUMMARY_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -1417,12 +1448,28 @@ def _write_summary_excel(rows, out_path):
     # 金额显示格式：不用千分位分隔（避免外部工具解析 / 二次计算出错），仅保留两位小数
     _MONEY_FMT = "0.00"
 
+    # ---- 列布局（全部按列名定位，新增列时无需再改硬编码列号）----
+    headers = list(_SUMMARY_FIELDS if include_dabing else _SUMMARY_FIELDS[:-1])
+    headers.append("是否重复")
+    ncols = len(headers)
+    col_of = {name: i + 1 for i, name in enumerate(headers)}
+    amount_col = get_column_letter(col_of[_AMOUNT_FIELD])
+    pool_col = get_column_letter(col_of[_POOL_FIELD])
+    dabing_col = get_column_letter(col_of[_DABING_FIELD]) if include_dabing else ""
+    dup_col = get_column_letter(col_of["是否重复"])
+    # 金额类列（写数字、套两位小数格式）
+    money_cols = [col_of[_AMOUNT_FIELD], col_of[_POOL_FIELD]]
+    if include_dabing:
+        money_cols.append(col_of[_DABING_FIELD])
+    # 传入的行统一为 7 项（含大病保险）；不需要该列时裁掉末尾。
+    cut = len(_SUMMARY_FIELDS) if include_dabing else len(_SUMMARY_FIELDS) - 1
+
     wb = Workbook()
     ws = wb.active
     ws.title = "发票汇总"
 
-    ws.append(_SUMMARY_HEADERS)
-    for c in range(1, len(_SUMMARY_HEADERS) + 1):
+    ws.append(headers)
+    for c in range(1, ncols + 1):
         cell = ws.cell(row=1, column=c)
         cell.fill = _SUMMARY_FILL
         cell.font = _SUMMARY_FONT
@@ -1439,47 +1486,86 @@ def _write_summary_excel(rows, out_path):
 
     for r in rows:
         tn = r[_TICKET_IDX]
-        r.append("是" if (tn and _ticket_counts[tn] >= 2) else "")
-        ws.append(r)
+        dup = "是" if (tn and _ticket_counts[tn] >= 2) else ""
+        ws.append(list(r[:cut]) + [dup])
         row_idx = ws.max_row
-        for c in range(1, len(_SUMMARY_HEADERS) + 1):
+        for c in range(1, ncols + 1):
             cell = ws.cell(row=row_idx, column=c)
             cell.border = _SUMMARY_BORDER
             cell.alignment = _SUMMARY_CENTER
-        # 金额列（E）、统筹列（F）写入的是数字，套两位小数金额格式；
+        # 金额列写入的是数字，套两位小数金额格式；
         # 空字符串（解析失败/缺失）保持为空，不影响求和。
-        for c in (5, 6):
+        for c in money_cols:
             v = ws.cell(row=row_idx, column=c).value
             if isinstance(v, (int, float)):
                 ws.cell(row=row_idx, column=c).number_format = _MONEY_FMT
 
     last = ws.max_row
     if last >= 2:
-        # 合计行：金额合计写在 E 列、统筹合计写在 F 列（与表头列一一对应）
-        ws.append(["合计", "", "", "",
-                   f"=SUM(E2:E{last})", f"=SUM(F2:F{last})"])
-        for c in range(1, len(_SUMMARY_HEADERS) + 1):
+        # 合计行：各金额列分别求和（列号由列名推算，新增列无需改动）
+        total_row = [""] * ncols
+        total_row[0] = "合计"
+        total_row[col_of[_AMOUNT_FIELD] - 1] = f"=SUM({amount_col}2:{amount_col}{last})"
+        total_row[col_of[_POOL_FIELD] - 1] = f"=SUM({pool_col}2:{pool_col}{last})"
+        if include_dabing:
+            total_row[col_of[_DABING_FIELD] - 1] = (
+                f"=SUM({dabing_col}2:{dabing_col}{last})")
+        ws.append(total_row)
+        for c in range(1, ncols + 1):
             cell = ws.cell(row=ws.max_row, column=c)
             cell.font = Font(bold=True)
             cell.border = _SUMMARY_BORDER
             cell.alignment = _SUMMARY_CENTER
             cell.fill = PatternFill("solid", fgColor="DDEBF7")
-        for c in (5, 6):
+        for c in money_cols:
             ws.cell(row=ws.max_row, column=c).number_format = _MONEY_FMT
 
     # ---- 右侧统计区（单独一组，竖排列更醒目）----
-    # 列：I=标签, J=数值（G 列已用作「是否重复」数据列，H 为间隔列）
-    stat_label_col, stat_val_col = 9, 10
+    # 列：紧跟数据列之后空一列，标签列 / 数值列由数据列数推算
+    # （7 列数据时仍是 I=标签、J=数值，与旧版一致）
+    stat_label_col = ncols + 2
+    stat_val_col = ncols + 3
+    stat_vcol = get_column_letter(stat_val_col)
     stat_title_row = 1
     stat_first_row = 2
+    # 先按显示顺序排好标签，据此算出各统计项的行号，再用行号拼公式；
+    # 这样「可赔付金额」等跨行引用不会随列数 / 项数变化而写错。
+    stat_labels = ["票据张数", "合计总金额", "合计总统筹金额"]
+    if include_dabing:
+        stat_labels.append("合计大病保险支付")
+    stat_labels.append("可赔付金额")
+    stat_labels += ["重复票据金额合计", "重复票据统筹合计"]
+    if include_dabing:
+        stat_labels.append("重复票据大病保险合计")
+    row_of = {lab: stat_first_row + i for i, lab in enumerate(stat_labels)}
+
+    # 可赔付金额 = 合计总金额 − 已由医保基金 / 保险支付的金额
+    # （统筹必扣；有「大病保险支付」列时一并扣除，否则该部分会虚高计入可赔付额）
+    deduct_cells = [f"{stat_vcol}{row_of['合计总统筹金额']}"]
+    if include_dabing:
+        deduct_cells.append(f"{stat_vcol}{row_of['合计大病保险支付']}")
+
     stat_items = [
         ("票据张数", f"=COUNTA(A2:A{last})"),
-        ("合计总金额", f"=SUM(E2:E{last})"),
-        ("合计总统筹金额", f"=SUM(F2:F{last})"),
-        ("可赔付金额", "=J3-J4"),  # 合计总金额(J3) - 合计总统筹金额(J4)
-        ("重复票据金额合计", f'=SUMIF(G2:G{last},"是",E2:E{last})'),
-        ("重复票据统筹合计", f'=SUMIF(G2:G{last},"是",F2:F{last})'),
+        ("合计总金额", f"=SUM({amount_col}2:{amount_col}{last})"),
+        ("合计总统筹金额", f"=SUM({pool_col}2:{pool_col}{last})"),
     ]
+    if include_dabing:
+        stat_items.append(
+            ("合计大病保险支付", f"=SUM({dabing_col}2:{dabing_col}{last})"))
+    stat_items.append(
+        ("可赔付金额",
+         f"={stat_vcol}{row_of['合计总金额']}-" + "-".join(deduct_cells)))
+    stat_items += [
+        ("重复票据金额合计",
+         f'=SUMIF({dup_col}2:{dup_col}{last},"是",{amount_col}2:{amount_col}{last})'),
+        ("重复票据统筹合计",
+         f'=SUMIF({dup_col}2:{dup_col}{last},"是",{pool_col}2:{pool_col}{last})'),
+    ]
+    if include_dabing:
+        stat_items.append(
+            ("重复票据大病保险合计",
+             f'=SUMIF({dup_col}2:{dup_col}{last},"是",{dabing_col}2:{dabing_col}{last})'))
     # 标题
     tcell = ws.cell(row=stat_title_row, column=stat_label_col, value="统计")
     tcell.fill = _SUMMARY_FILL
@@ -1504,9 +1590,12 @@ def _write_summary_excel(rows, out_path):
         vc.border = _SUMMARY_BORDER
         vc.number_format = _MONEY_FMT if label != "票据张数" else "0"
 
-    widths = [26, 14, 18, 14, 16, 18, 12, 3, 16, 18]
+    widths = [26, 14, 18, 14, 16, 18]
+    if include_dabing:
+        widths.append(18)
+    widths += [12, 3, 16, 18]  # 是否重复 | 间隔列 | 统计标签 | 统计数值
     for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
+        ws.column_dimensions[get_column_letter(i)].width = w
 
     ws.freeze_panes = "A2"
     wb.save(out_path)
@@ -1531,13 +1620,16 @@ def summarize_invoices(pdf_folder: str, log=print):
     log(f"开始汇总：找到 {len(pdf_files)} 个 PDF 发票。")
     rows = []
     ok = 0
+    dabing_hits = 0  # 识别到「大病保险支付」栏的票据数（>=1 才输出该列）
     for f in pdf_files:
         name = os.path.basename(f)
         fields, err = parse_invoice(f)
         if err:
             log(f"  [跳过] {name}：{err}")
-            rows.append([name, "解析失败", "", "", "", ""])
+            rows.append([name, "解析失败", "", "", "", "", ""])
             continue
+        if fields["大病保险支付"] is not None:
+            dabing_hits += 1
         rows.append([
             name,
             fields["交款人"] or "",
@@ -1545,6 +1637,7 @@ def summarize_invoices(pdf_folder: str, log=print):
             fields["开票日期"] or "",
             fields["金额合计（小写）"] if fields["金额合计（小写）"] is not None else "",
             fields["医保统筹基金支付"] if fields["医保统筹基金支付"] is not None else "",
+            fields["大病保险支付"] if fields["大病保险支付"] is not None else "",
         ])
         ok += 1
         log(f"  [OK] {name}  交款人={fields['交款人']}  "
@@ -1552,8 +1645,13 @@ def summarize_invoices(pdf_folder: str, log=print):
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(pdf_folder, f"发票汇总_{ts}.xlsx")
-    _write_summary_excel(rows, out_path)
+    include_dabing = dabing_hits > 0
+    _write_summary_excel(rows, out_path, include_dabing=include_dabing)
     log(f"汇总完成：成功 {ok} / 共 {len(pdf_files)} 个。")
+    if include_dabing:
+        log(f"识别到「大病保险支付」的票据 {dabing_hits} / {ok} 张，已输出该列及其汇总。")
+    else:
+        log("本批票据均未识别到「大病保险支付」，汇总表不输出该列。")
     log(f"已导出：{out_path}")
     return out_path
 
