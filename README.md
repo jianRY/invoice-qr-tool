@@ -90,7 +90,7 @@ outputs/
 
 ```bash
 python -m venv envs/default
-envs/default/Scripts/python.exe -m pip install opencv-python zxing-cpp pymupdf pdfplumber openpyxl requests pyinstaller
+envs/default/Scripts/python.exe -m pip install opencv-python zxingcpp pymupdf pdfplumber openpyxl requests pyinstaller
 envs/default/Scripts/python.exe -m PyInstaller --onefile --windowed --name 发票二维码工具 \
   --hidden-import numpy --hidden-import cv2 --hidden-import zxingcpp \
   --hidden-import pymupdf --hidden-import requests --hidden-import pdfplumber \
