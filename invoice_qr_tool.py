@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.4"
+__VERSION__ = "4.5"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -79,8 +79,12 @@ GITHUB_LATEST_RELEASE_URL = (
 )
 
 
-USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
+USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 ================================
+
+项目地址（源码 / 下载 / 更新日志）：
+    https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}
+最新版本与安装包请见仓库 Releases 页；软件启动后也会自动检查更新。
 
 【功能】
 1. 识别指定文件夹内图片中的二维码（全部图片均识别，不再按网址去重）。
@@ -180,6 +184,14 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-16  v4.5
+- **使用说明置顶项目地址**：说明文本开头即列出「源码 / 下载 / 更新日志」入口
+  https://github.com/jianRY/invoice-qr-tool，软件「帮助 → 使用说明」窗口、
+  随附的 使用说明.txt 与 GitHub Release 附件（InvoiceQR_Usage.txt）三处同源。
+- 该地址由源码常量 GITHUB_REPO_OWNER / GITHUB_REPO_NAME 拼接生成，仓库改名只需改一处。
+- 修复说明文件抽取脚本：extract_release_assets.py 升级为支持 f-string 常量
+  （原先只识别普通字符串，USAGE_TEXT 改为 f-string 后会抽取失败）。
 
 2026-09-16  v4.4
 - **汇总表新增「医疗救助支付」列**（与「大病保险支付」同一机制）：识别方式同为票据右下角
