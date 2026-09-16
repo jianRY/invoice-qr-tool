@@ -310,17 +310,27 @@ def publish(new_tag, token):
     git("push", "origin", branch, check=False)
     git("push", "origin", new_tag, check=False)
     print("[发布] 已推送分支 {} 与标签 {}".format(branch, new_tag))
-    # 3) 创建 Release
+    # 3) 获取或创建 Release（幂等：已存在则复用，便于补传附件 / 重跑）
     body = open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), encoding="utf-8").read()
-    status, data = api(
-        "POST", "https://api.github.com/repos/{}/{}/releases".format(OWNER, REPO), token,
-        json_data={"tag_name": new_tag, "name": "发票二维码识别下载工具 " + new_tag,
-                   "body": body, "draft": False, "prerelease": False},
-    )
-    upload_url = data.get("upload_url", "").split("{")[0]
-    print("[发布] 创建 Release {} (HTTP {})".format(new_tag, status))
-    # 4) 上传附件
+    rel_url = "https://api.github.com/repos/{}/{}/releases".format(OWNER, REPO)
+    status, data = api("GET", rel_url + "/tags/" + new_tag, token)
+    if status == 200 and data.get("id"):
+        release_id = data["id"]
+        upload_url = data.get("upload_url", "").split("{")[0]
+        print("[发布] 复用已有 Release {} (HTTP {})".format(new_tag, status))
+    else:
+        status, data = api(
+            "POST", rel_url, token,
+            json_data={"tag_name": new_tag, "name": "发票二维码识别下载工具 " + new_tag,
+                       "body": body, "draft": False, "prerelease": False},
+        )
+        release_id = data.get("id")
+        upload_url = data.get("upload_url", "").split("{")[0]
+        print("[发布] 创建 Release {} (HTTP {})".format(new_tag, status))
+    # 4) 上传附件（先删同名旧附件，保证幂等可重跑）
     from urllib.parse import quote
+    _, assets_data = api("GET", "https://api.github.com/repos/{}/{}/releases/{}/assets".format(OWNER, REPO, release_id), token)
+    existing = {a.get("name"): a.get("id") for a in (assets_data or [])}
     for fn, ctype in [
         ("InvoiceQRDownloader_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
         ("InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
@@ -330,10 +340,13 @@ def publish(new_tag, token):
         p = os.path.join(ASSET_DIR, fn)
         if not os.path.exists(p):
             print("    跳过（缺失）:", fn); continue
+        if fn in existing:
+            api("DELETE", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(OWNER, REPO, existing[fn]), token)
+            print("    删除旧附件:", fn)
         with open(p, "rb") as fh:
             raw = fh.read()
         url = "{}?name={}&label={}".format(upload_url, quote(fn), quote(fn))
-        st, _ = api("POST", url, token, raw_body=raw, ctype=ctype)
+        st, _ = api("POST", url, token, raw=raw, ctype=ctype)
         print("    上传 {} ({}KB) -> HTTP {}".format(fn, len(raw) // 1024, st))
     # 5) 记录已发布提交
     with open(LAST_RELEASE_COMMIT, "w", encoding="utf-8") as f:
