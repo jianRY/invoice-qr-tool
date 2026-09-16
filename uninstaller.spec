@@ -5,7 +5,7 @@ a = Analysis(
     ['D:/workbuddy/发票处理/installer_src/app_uninstaller.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('D:/workbuddy/发票处理/app_icon.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,4 +36,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    icon=['D:/workbuddy/发票处理/app_icon.ico'],
 )
