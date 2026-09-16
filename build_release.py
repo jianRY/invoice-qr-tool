@@ -483,11 +483,20 @@ def publish(new_tag, token):
         if st not in (200, 201):
             raise RuntimeError("上传附件 {} 失败：HTTP {}".format(fn, st))
     # 5) 记录已发布提交
+    # 该文件不入库（.gitignore），所以通常没有可提交的内容；只有确实产生了新提交才推送。
+    # 否则代理抖动时这次多余的 push 会让「已经发布成功」的流程以非 0 退出，很容易被误判成发版失败。
     with open(LAST_RELEASE_COMMIT, "w", encoding="utf-8") as f:
         f.write(head_commit() + "\n")
     git("add", "-A", check=False)
-    git("commit", "-m", "chore: 记录 {} 发布提交".format(new_tag), check=False)
-    push_or_fail("origin", branch, "分支 " + branch)
+    r = git("commit", "-m", "chore: 记录 {} 发布提交".format(new_tag), check=False)
+    if r.returncode == 0:
+        try:
+            push_or_fail("origin", branch, "分支 " + branch)
+        except RuntimeError as e:
+            print("[发布] ⚠ 基线提交推送失败（不影响本次发布，Release 与附件均已就绪）：")
+            print("       " + str(e).replace("\n", "\n       "))
+    else:
+        print("[发布] 无新增提交需要推送（发布基线文件不入库）。")
     print("[发布] 完成。地址：https://github.com/{}/{}/releases/tag/{}".format(OWNER, REPO, new_tag))
 
 
