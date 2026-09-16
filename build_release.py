@@ -9,7 +9,8 @@
   3. 构建「可安装版」exe（onefile，内嵌单文件版主程序 + 卸载程序）
   4. 三个 exe 全部走 sign.py 自签名（SHA256 + RFC3161 时间戳）
   5. 生成 Usage / Changelog 文本
-  6. （--publish 时）git push（走代理）→ 打 tag → 在 GitHub 创建 Release 并上传双 exe
+  6. 同步官网 website/ 的版本号 / 下载直链 / 日期 / 体积（宝塔脚本拉取后即展示新版网页）
+  7. （--publish 时）git push（走代理）→ 打 tag → 在 GitHub 创建 Release 并上传双 exe
 
 安全护栏：
   - 本地目标版本必须 > GitHub 线上最新版本，否则拒绝发布（防止用旧代码覆盖新版）。
@@ -51,6 +52,7 @@ PORTABLE_OUT = os.path.join(ROOT, "dist", APP_EXE)
 UNINST_OUT = os.path.join(ROOT, "dist", "uninstaller.exe")
 INSTALLER_OUT = os.path.join(ROOT, "dist", APP_NAME + "_安装程序.exe")
 ASSET_DIR = os.path.join(ROOT, "outputs", "release_assets")
+WEBSITE_DIR = os.path.join(ROOT, "website")   # 官网静态页（宝塔脚本 git pull 后自动部署）
 VERSION_FILE = os.path.join(ROOT, "VERSION")
 LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 PROXY = "http://127.0.0.1:10808"
@@ -295,6 +297,49 @@ def make_assets(new_tag):
     return portable_name, installer_name
 
 
+# ---------------- 官网同步 ----------------
+def update_website(new_tag):
+    """把官网页面（website/）里的版本号 / 下载直链 / 发布日期 / 体积
+    同步成本次发布的数据，保证宝塔自动脚本 git pull 后展示的新版网页一致。
+
+    只改「版本相关」的字段，不动文案与版式，幂等可重跑。
+    """
+    ver = new_tag.lstrip("v")                    # 4.0
+    today = time.strftime("%Y-%m-%d")            # 2026-09-16
+    try:
+        size_mb = round(os.path.getsize(PORTABLE_OUT) / 1_000_000)   # 十进制 MB
+    except OSError:
+        size_mb = 0
+
+    def rewrite(path, pairs):
+        if not os.path.exists(path):
+            print("    跳过（缺失）:", os.path.basename(path)); return
+        s = open(path, encoding="utf-8").read()
+        for pat, rep in pairs:
+            s = re.sub(pat, rep, s)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(s)
+
+    # 首页：徽章「当前版本 vX.Y」、数据卡「vX.Y」、结尾按钮「免费下载 vX.Y」
+    rewrite(os.path.join(WEBSITE_DIR, "index.html"), [
+        (r"当前版本 v[\d.]+", "当前版本 " + new_tag),
+        (r'(class="v"[^>]*>)\s*v[\d.]+', r"\g<1>" + new_tag),
+        (r"免费下载 v[\d.]+", "免费下载 " + new_tag),
+    ])
+    # 下载页：meta 描述、版本 chip、日期 chip、体积 chip、主下载直链（含无 v 前缀的真实附件名）
+    rewrite(os.path.join(WEBSITE_DIR, "download.html"), [
+        (r"v[\d.]+（Windows", new_tag + "（Windows"),
+        (r'(<span class="chip">)v[\d.]+', r"\g<1>" + new_tag),
+        (r'(<span class="chip gray">)\d{4}-\d{2}-\d{2}', r"\g<1>" + today),
+        (r'(<span class="chip gray">≈ )\d+( MB)', r"\g<1>" + str(size_mb) + r"\g<2>"),
+        (r"releases/download/v[\d.]+/InvoiceQRDownloader[_v]*[\d.]+\.exe",
+         "releases/download/{}/InvoiceQRDownloader_{}.exe".format(new_tag, ver)),
+        (r"releases/download/v[\d.]+/InvoiceQRInstaller[_v]*[\d.]+\.exe",
+         "releases/download/{}/InvoiceQRInstaller_{}.exe".format(new_tag, ver)),
+    ])
+    print("[网页] 官网版本数据已同步 -> {} | 日期 {} | {} MB".format(new_tag, today, size_mb))
+
+
 # ---------------- 发布 ----------------
 def publish(new_tag, token):
     # 1) 仓库公开（匿名读取 Release 需要）
@@ -419,6 +464,7 @@ def main():
         print("产物:", p, "{}KB".format(os.path.getsize(p) // 1024))
 
     make_assets(new_tag)
+    update_website(new_tag)   # 同步官网版本数据（宝塔脚本拉取后展示的新版网页）
 
     if do_publish:
         # 仅当有新提交才发布
