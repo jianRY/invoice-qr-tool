@@ -1,0 +1,10 @@
+# 发票二维码识别下载工具 · 运行时依赖
+# 安装：envs\default\Scripts\python.exe -m pip install -r requirements.txt
+# 注意：PyPI 发行包名为 zxing-cpp（import 名仍为 zxingcpp）；本机用 Python 3.12 搭建 venv。
+opencv-python==5.0.0.93
+zxing-cpp==3.1.1
+pymupdf==1.28.2
+pdfplumber==0.11.10
+openpyxl==3.1.5
+requests==2.34.2
+pyinstaller==6.22.3
