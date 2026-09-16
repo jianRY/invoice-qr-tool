@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.6"
+__VERSION__ = "4.7.0"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -184,6 +184,14 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-16  v4.7.0
+- **版本号改为三段式 X.Y.Z**（tag 形如 v4.7.0，不再出现两段式 v4.6）：
+  主界面标题、更新日志、官网与更新包文件名（`发票二维码工具_v4.7.0.exe`）统一三段式。
+- **发版时的递增规则**：读「上次发布提交..HEAD」的提交标题 —— 含 feat / 新增 等功能类提交
+  则升次版本位（4.6.3 → 4.7.0）；仅有 fix / docs / chore 等则只升修订位（4.6.3 → 4.6.4）。
+  也可用 `--version 4.7.1` 手动指定（写 4.7 等价于 4.7.0）。
+- 自动更新的版本比较本就按三段元组（缺失段补 0），旧版客户端仍可正确识别新版本号。
 
 2026-09-16  v4.6
 - **Release 附件的安装指引（InvoiceQR_Usage.txt）同样把项目地址置顶**，下载后第一眼
@@ -475,10 +483,10 @@ def _derive_base_name(exe_path: str) -> str:
 
 
 def _version_str(version: tuple) -> str:
-    """把版本元组格式化成字符串，去掉末尾多余的 0。 (3,4,0)->'3.4'；(3,5,1)->'3.5.1'。"""
-    parts = [str(x) for x in version]
-    while len(parts) > 1 and parts[-1] == "0":
-        parts.pop()
+    """把版本元组格式化成三段式字符串。 (4,7,0)->'4.7.0'；(4,6,1)->'4.6.1'。"""
+    parts = [str(x) for x in version][:3]
+    while len(parts) < 3:
+        parts.append("0")
     return ".".join(parts)
 
 

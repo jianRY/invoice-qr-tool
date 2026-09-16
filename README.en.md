@@ -54,14 +54,14 @@ The UI also has **Usage**, **Changelog**, and **Check for Updates** buttons, alw
 ### How the auto-update works
 
 - The app reads the public repo's latest Release (`releases/latest`) and compares versions semantically.
-- When a higher version is found, it downloads the asset named `InvoiceQRDownloader_vX.Y.exe` from that Release to a temp folder, copies it next to the current exe as `_pending.exe`, then a self-launched `.bat` script replaces the current exe after the old process exits and relaunches the new one with a `--pending` self-check flag.
+- When a higher version is found, it downloads the asset named `InvoiceQRDownloader_X.Y.Z.exe` from that Release to a temp folder, copies it next to the current exe as `_pending.exe`, then a self-launched `.bat` script replaces the current exe after the old process exits and relaunches the new one with a `--pending` self-check flag.
 - The new process confirms it started successfully, then clears the backup (update succeeds). If it never confirms, the script restores the backup (rollback).
 
 ## Download the executable
 
 Go to the repo's **Releases** page to download the latest (the repo is public, no login needed):
 
-- `InvoiceQRDownloader_v3.4.exe` — main program (single file, double-click to run; the GitHub attachment uses an ASCII name because Release asset names can't be Chinese — the in-app title and local file are still the Chinese name `发票二维码工具.exe`)
+- `InvoiceQRDownloader_4.7.0.exe` — main program (single file, double-click to run; the GitHub attachment uses an ASCII name because Release asset names can't be Chinese — the in-app title and local file are still the Chinese name `发票二维码工具.exe`)
 - `InvoiceQR_Usage.txt` — usage instructions
 - `InvoiceQR_Changelog.txt` — changelog
 

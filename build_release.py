@@ -20,10 +20,16 @@
 用法：
   python build_release.py                # 仅构建 + 签名 + 生成资源（本地验证用）
   python build_release.py --publish      # 构建 + 签名 + 推送 GitHub + 发 Release
-  python build_release.py --publish --version 3.9   # 指定版本号
+  python build_release.py --publish --version 4.7.0  # 手动指定三段式版本号
   python build_release.py --publish --force         # 即使版本号不高于线上也发布
   python build_release.py --skip-build   # 跳过 PyInstaller，直接对已有 dist/ 签名+发布
-  python build_release.py --publish-only --version 4.0  # 已构建+签名，仅提交/打tag/发Release（不重签）
+  python build_release.py --publish-only --version 4.7.1  # 已构建+签名，仅提交/打tag/发Release（不重签）
+
+版本号规则（三段式 X.Y.Z，tag 形如 v4.7.0；不再出现两段式 v4.7）：
+  - 自动递增：读「上次发布提交..HEAD」的提交标题 ——
+      含 feat / feature / 新增 / 新功能 / 增加功能 / 添加功能  → 升次版本位（4.6.3 → 4.7.0）
+      仅 fix / docs / chore / refactor 等                      → 只升修订位（4.6.3 → 4.6.4）
+  - 手动指定：--version 4.7.0（写 4.7 等价于 4.7.0）。目标版本必须高于线上最新。
 """
 import os
 import re
@@ -93,17 +99,70 @@ def parse_ver(tag):
 
 
 def fmt_ver(v):
-    return "v{}.{}".format(v[0], v[1]) + ("" if v[2] == 0 else ".{}".format(v[2]))
+    """恒定为三段 X.Y.Z：v4.7.0 / v4.6.1（不再省略第三段）。"""
+    return "v{}.{}.{}".format(v[0], v[1], v[2])
 
 
 def bump_minor(v):
+    """升次版本位（功能更新）：4.6.3 -> 4.7.0"""
     return (v[0], v[1] + 1, 0)
+
+
+def bump_patch(v):
+    """升修订位（修复 / 文档 / 杂项）：4.6.3 -> 4.6.4"""
+    return (v[0], v[1], v[2] + 1)
+
+
+def normalize_ver(text):
+    """把 --version 的输入规整成三段元组：'4.7' -> (4,7,0)、'4.7.1' -> (4,7,1)。"""
+    nums = [int(x) for x in re.findall(r"\d+", str(text or ""))[:3]]
+    if not nums:
+        return (0, 0, 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+
+# 提交标题里出现这些词 = 功能更新（升次版本位）；其余一律只升修订位
+_FEATURE_WORDS = ("feat", "feature", "新增", "新功能", "增加功能", "添加功能")
+
+
+def is_feature_commit(subject):
+    """"feat(...)"/"新增 xxx" 算功能提交；fix/docs/chore 等不算。"""
+    t = (subject or "").strip().lower()
+    m = re.match(r"^([a-z]+)", t)
+    if m and m.group(1) in ("feat", "feature"):
+        return True
+    return any(w in t for w in _FEATURE_WORDS if not w.isascii())
+
+
+def release_subjects():
+    """本次待发布的提交标题（上次发布提交..HEAD）；无基线时取最近 15 条。"""
+    last = ""
+    if os.path.exists(LAST_RELEASE_COMMIT):
+        last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
+    rng = "{}..HEAD".format(last) if last else "-15"
+    out = git("log", "--pretty=%s", rng, check=False).stdout or ""
+    if not out.strip() and last:
+        out = git("log", "--pretty=%s", "-15", check=False).stdout or ""
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def bump_auto(v):
+    """按本次待发布提交的内容决定递进位：有功能提交 → 升 Y；否则升 Z。
+
+    返回 (新版本元组, 依据说明)。"""
+    subs = release_subjects()
+    feats = [t for t in subs if is_feature_commit(t)]
+    if feats:
+        return bump_minor(v), "含功能提交 {} 条（{}）→ 升次版本位".format(len(feats), feats[0])
+    return bump_patch(v), "无功能提交（共 {} 条 fix/docs/chore 等）→ 只升修订位".format(len(subs))
 
 
 def read_version():
     if os.path.exists(VERSION_FILE):
         return open(VERSION_FILE, encoding="utf-8").read().strip()
-    return "3.6"
+    return "0.0.0"
 
 
 def write_version(v):
@@ -521,11 +580,14 @@ def main():
 
     # 目标版本：显式指定 > 自动在线上最新版基础上 +1（满足“版本号按实际情况新增”）
     if ver_override:
-        new_v = parse_ver(ver_override)
+        new_v = normalize_ver(ver_override)
+        print("[版本] 手动指定 {} -> {}".format(ver_override, fmt_ver(new_v)))
     elif do_publish and latest_v > (0, 0, 0):
-        new_v = bump_minor(latest_v)
+        new_v, why = bump_auto(latest_v)
+        print("[版本] 自动递增 {} -> {}".format(latest, fmt_ver(new_v)))
+        print("[版本] 依据:", why)
     else:
-        new_v = local_v if local_v > (0, 0, 0) else (3, 7, 0)
+        new_v = local_v if local_v > (0, 0, 0) else (0, 0, 1)
     new_tag = fmt_ver(new_v)
     print("目标版本:", new_tag, "| 线上最新:", latest or "(未知)")
 
