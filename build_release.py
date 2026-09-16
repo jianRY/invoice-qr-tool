@@ -119,6 +119,9 @@ def get_pat():
 # ---------------- Git ----------------
 def git(*args, check=True, capture=True):
     env = os.environ.copy()
+    # 关键：本环境 PATH 常失效，git 会找不到 git-remote-https（报
+    # 'remote-https' is not a git command）。显式指定 GIT_EXEC_PATH 兜底。
+    env["GIT_EXEC_PATH"] = os.path.dirname(GIT)
     r = subprocess.run(
         [GIT] + list(args), capture_output=capture, text=True,
         encoding="utf-8", errors="replace", env=env,
