@@ -66,7 +66,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "3.8"
+__VERSION__ = "4.0"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -149,6 +149,12 @@ USAGE_TEXT = """发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-16  v4.0
+- **合并发布：在 GitHub v3.8 基础上整合本地开发成果发布 4.0**：保留 v3.7/v3.8 全部能力（并发 6 路处理、可随时「■ 停止」、PDF 转 JPG、汇总 Excel 去千分位与公式修正等），并新增：
+- **双 exe 分发**：除原有单文件运行版外，新增「可安装版」（`InvoiceQRInstaller_v4.0.exe`），以管理员权限安装到 Program Files、创建开始菜单 / 桌面快捷方式、写入「应用和功能」卸载项（含卸载程序）。
+- **发布流水线自签名**：所有 exe 走 SHA256 + RFC3161 时间戳自签名（签名者 CN=jianRY），消除 SmartScreen / 未知发布者警告。
+- 构建与发布一体化：本地 `build_release.py` 一键完成「构建双 exe → 逐个签名 → 生成说明 → 推送 GitHub → 打 tag → 发 Release 上传双 exe」。
 
 2026-09-11  v3.8
 - **并发处理**：每张图片作为一个独立任务，由线程池并发执行（默认 6 路），

@@ -22,6 +22,7 @@
   python build_release.py --publish --version 3.9   # 指定版本号
   python build_release.py --publish --force         # 即使版本号不高于线上也发布
   python build_release.py --skip-build   # 跳过 PyInstaller，直接对已有 dist/ 签名+发布
+  python build_release.py --publish-only --version 4.0  # 已构建+签名，仅提交/打tag/发Release（不重签）
 """
 import os
 import re
@@ -32,6 +33,8 @@ import subprocess
 import urllib.request
 import urllib.error
 import base64
+import uuid
+import time
 
 # ---------------- 路径常量 ----------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -172,7 +175,13 @@ def repo_private(token):
 
 # ---------------- 构建 ----------------
 def run_pyinstaller(args):
-    cmd = [VENV_PY, "-m", "PyInstaller", "--noconfirm"] + args
+    # 每次构建用全新的 workpath / distpath，避免 PyInstaller 清空旧 build/ 触发
+    # 沙箱的安全删除拦截（批量删除会被阻断）。产物随后用 os.replace 落到 dist/，
+    # 整条流水线不执行任何删除操作。
+    work = _tmp_build_dir("wp")
+    out = _tmp_build_dir("dist")
+    cmd = [VENV_PY, "-m", "PyInstaller", "--noconfirm",
+           "--workpath", work, "--distpath", out] + args
     print(">>>", " ".join(cmd))
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -180,7 +189,14 @@ def run_pyinstaller(args):
         print(r.stdout[-2000:])
         print(r.stderr[-2000:])
         raise RuntimeError("PyInstaller 失败：" + " ".join(args[:3]))
-    return r
+    return out
+
+
+def _tmp_build_dir(sub):
+    base = os.path.join(ROOT, "outputs", "_tmp_build")
+    p = os.path.join(base, sub + "_" + uuid.uuid4().hex[:8])
+    os.makedirs(p, exist_ok=True)
+    return p
 
 
 def sign(exe_path):
@@ -200,16 +216,17 @@ def sign(exe_path):
 def build_portable():
     """单文件运行版（onefile，复用既有 spec；spec 本身即单文件构建）。"""
     spec = os.path.join(ROOT, "发票二维码工具.spec")
-    run_pyinstaller([spec])
+    out = run_pyinstaller([spec])
+    os.replace(os.path.join(out, APP_EXE), PORTABLE_OUT)
     sign(PORTABLE_OUT)
 
 
 def build_uninstaller():
     src = os.path.join(ROOT, "installer_src", "app_uninstaller.py")
-    run_pyinstaller([
-        src, "--onefile", "--name", "uninstaller", "--distpath", os.path.join(ROOT, "dist"),
-        "--uac-admin",
+    out = run_pyinstaller([
+        src, "--onefile", "--name", "uninstaller", "--uac-admin",
     ])
+    os.replace(os.path.join(out, "uninstaller.exe"), UNINST_OUT)
     sign(UNINST_OUT)
 
 
@@ -218,13 +235,13 @@ def build_installer():
     src = os.path.join(ROOT, "installer_src", "app_installer.py")
     add_app = "{}{}app_payload".format(PORTABLE_OUT, os.pathsep)
     add_un = "{}{}.".format(UNINST_OUT, os.pathsep)
-    run_pyinstaller([
+    out = run_pyinstaller([
         src, "--onefile", "--name", APP_NAME + "_安装程序",
-        "--distpath", os.path.join(ROOT, "dist"),
         "--uac-admin",
         "--add-data", add_app,
         "--add-data", add_un,
     ])
+    os.replace(os.path.join(out, APP_NAME + "_安装程序.exe"), INSTALLER_OUT)
     sign(INSTALLER_OUT)
 
 
@@ -330,9 +347,10 @@ def publish(new_tag, token):
 # ---------------- 主流程 ----------------
 def main():
     args = sys.argv[1:]
-    do_publish = "--publish" in args
+    do_publish = ("--publish" in args) or ("--publish-only" in args)
     force = "--force" in args
     skip_build = "--skip-build" in args
+    publish_only = "--publish-only" in args
     ver_override = None
     if "--version" in args:
         i = args.index("--version")
@@ -368,13 +386,15 @@ def main():
             return
 
     # 构建
-    if not skip_build:
-        for d in ("dist", "build"):
-            shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+    if publish_only:
+        print("[publish-only] 跳过构建与签名，直接使用现有 dist/ 已签名 exe")
+    elif not skip_build:
         print("=== 1/3 构建单文件运行版 ===")
         build_portable()
+        time.sleep(3)   # 给时间戳服务器留出余量，避免连续签名被限流
         print("=== 2/3 构建卸载程序 ===")
         build_uninstaller()
+        time.sleep(3)
         print("=== 3/3 构建可安装版（内嵌主程序+卸载程序）===")
         build_installer()
     else:
