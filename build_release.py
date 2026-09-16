@@ -141,6 +141,13 @@ def head_commit():
 
 # ---------------- GitHub API ----------------
 def api(method, url, token=None, json_data=None, raw=None, ctype=None):
+    """调用 GitHub REST API，**不因 4xx/5xx 抛异常**，统一返回 (status, body)。
+
+    这一点很关键：发布流程要先 `GET /releases/tags/<tag>` 判断 Release 是否已存在，
+    而「不存在」时 GitHub 返回的就是 404。如果这里直接把 HTTPError 抛出去，就永远
+    走不到「创建 Release」的分支（v4.1 首次发布即因此中断）。调用方一律用返回的
+    status 自行判断。
+    """
     req = urllib.request.Request(url, method=method)
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
@@ -152,9 +159,17 @@ def api(method, url, token=None, json_data=None, raw=None, ctype=None):
     elif json_data is not None:
         req.add_header("Content-Type", "application/json")
         req.data = json.dumps(json_data).encode("utf-8")
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        body = resp.read().decode("utf-8", "replace")
-        return resp.status, (json.loads(body) if body else {})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            return resp.status, (json.loads(body) if body else {})
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+        return e.code, data
 
 
 def latest_release_tag(token):
@@ -375,6 +390,10 @@ def publish(new_tag, token):
         release_id = data.get("id")
         upload_url = data.get("upload_url", "").split("{")[0]
         print("[发布] 创建 Release {} (HTTP {})".format(new_tag, status))
+    if not release_id:
+        raise RuntimeError(
+            "创建/复用 Release {} 失败：HTTP {}，响应 {}".format(new_tag, status, str(data)[:400])
+        )
     # 4) 上传附件（先删同名旧附件，保证幂等可重跑）
     from urllib.parse import quote
     _, assets_data = api("GET", "https://api.github.com/repos/{}/{}/releases/{}/assets".format(OWNER, REPO, release_id), token)
@@ -396,6 +415,8 @@ def publish(new_tag, token):
         url = "{}?name={}&label={}".format(upload_url, quote(fn), quote(fn))
         st, _ = api("POST", url, token, raw=raw, ctype=ctype)
         print("    上传 {} ({}KB) -> HTTP {}".format(fn, len(raw) // 1024, st))
+        if st not in (200, 201):
+            raise RuntimeError("上传附件 {} 失败：HTTP {}".format(fn, st))
     # 5) 记录已发布提交
     with open(LAST_RELEASE_COMMIT, "w", encoding="utf-8") as f:
         f.write(head_commit() + "\n")
