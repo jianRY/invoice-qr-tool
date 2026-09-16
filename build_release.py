@@ -366,12 +366,18 @@ def publish(new_tag, token):
             json_data={"private": False})
         print("[发布] 仓库已设为公开")
     # 2) 推送
+    #    临时把令牌内联进 remote URL（避免弹凭据窗），用完**立刻**改回干净地址，
+    #    绝不让 PAT 留在 .git/config 里。后续 push 走 wincred，无需内联。
     branch = current_branch()
     pat = get_pat()
+    clean_url = "https://github.com/{}/{}.git".format(OWNER, REPO)
     remote_url = "https://{}@github.com/{}/{}.git".format(pat, OWNER, REPO)
-    git("remote", "set-url", "origin", remote_url, check=False)
-    git("push", "origin", branch, check=False)
-    git("push", "origin", new_tag, check=False)
+    try:
+        git("remote", "set-url", "origin", remote_url, check=False)
+        git("push", "origin", branch, check=False)
+        git("push", "origin", new_tag, check=False)
+    finally:
+        git("remote", "set-url", "origin", clean_url, check=False)
     print("[发布] 已推送分支 {} 与标签 {}".format(branch, new_tag))
     # 3) 获取或创建 Release（幂等：已存在则复用，便于补传附件 / 重跑）
     body = open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), encoding="utf-8").read()
