@@ -1,10 +1,17 @@
 发票二维码识别下载工具 · 更新记录
 ================================
 
+2026-09-16  v4.6
+- **Release 附件的安装指引（InvoiceQR_Usage.txt）同样把项目地址置顶**，下载后第一眼
+  即可看到源码 / 下载 / 更新日志入口。
+- 明确说明文件生成职责：outputs/release_assets/ 改由 build_release.py **独占生成**
+  （安装指引 + 按本次提交生成的更新日志）；extract_release_assets.py 只写根目录与
+  outputs/ 的本地说明，不再写该目录 —— 原先两个脚本写同名文件会互相覆盖。
+
 2026-09-16  v4.5
 - **使用说明置顶项目地址**：说明文本开头即列出「源码 / 下载 / 更新日志」入口
-  https://github.com/jianRY/invoice-qr-tool，软件「帮助 → 使用说明」窗口、
-  随附的 使用说明.txt 与 GitHub Release 附件（InvoiceQR_Usage.txt）三处同源。
+  https://github.com/jianRY/invoice-qr-tool，软件「帮助 → 使用说明」窗口与随附的
+  使用说明.txt（根目录 / outputs 两处）内容一致。
 - 该地址由源码常量 GITHUB_REPO_OWNER / GITHUB_REPO_NAME 拼接生成，仓库改名只需改一处。
 - 修复说明文件抽取脚本：extract_release_assets.py 升级为支持 f-string 常量
   （原先只识别普通字符串，USAGE_TEXT 改为 f-string 后会抽取失败）。

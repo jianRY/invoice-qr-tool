@@ -359,6 +359,8 @@ def make_assets(new_tag):
     usage = (
         "发票二维码识别下载工具 {tag}\n"
         "================================\n\n"
+        "项目主页（源码 / 下载 / 更新日志）：\n"
+        "{url}\n\n"
         "【单文件运行版】InvoiceQRDownloader_{tag}.exe\n"
         "  直接双击运行，无需安装。程序会在同目录读写配置与输出。\n\n"
         "【可安装版】InvoiceQRInstaller_{tag}.exe\n"
@@ -366,7 +368,6 @@ def make_assets(new_tag):
         "  → 自动创建开始菜单 / 桌面快捷方式，并写入「应用和功能」卸载项。\n"
         "  卸载：设置 → 应用 → 发票二维码工具 → 卸载，或控制面板。\n\n"
         "两版功能完全一致，按使用场景选择即可。\n"
-        "项目主页：{url}\n"
     ).format(tag=new_tag.lstrip("v"), url=PROJECT_URL)
     with open(os.path.join(ASSET_DIR, "InvoiceQR_Usage.txt"), "w", encoding="utf-8") as f:
         f.write(usage)
