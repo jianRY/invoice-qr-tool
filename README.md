@@ -78,7 +78,7 @@ outputs/
 
 ## 技术栈
 
-- Python 3.13 + `tkinter`（GUI）
+- Python 3.12 + `tkinter`（GUI）
 - `zxing-cpp`（二维码识别）、`OpenCV`（图像预处理）
 - `PyMuPDF`（PDF 转图片）、`pdfplumber` + `openpyxl`（发票字段提取与 Excel 汇总）
 - `requests`（下载）
@@ -86,13 +86,13 @@ outputs/
 
 ## 从源码构建
 
-需要 Windows 与本机 Python 3.13（含 `tkinter`）：
+需要 Windows 与本机 Python 3.12（含 `tkinter`）：
 
 ```bash
 python -m venv envs/default
-envs/default/Scripts/python.exe -m pip install opencv-python zxingcpp pymupdf pdfplumber openpyxl requests pyinstaller
+envs/default/Scripts/python.exe -m pip install opencv-python zxing-cpp pymupdf pdfplumber openpyxl requests pyinstaller
 envs/default/Scripts/python.exe -m PyInstaller --onefile --windowed --name 发票二维码工具 \
-  --hidden-import numpy --hidden-import cv2 --hidden-import zxingcpp \
+  --hidden-import numpy --hidden-import cv2 --hidden-import zxing-cpp \
   --hidden-import pymupdf --hidden-import requests --hidden-import pdfplumber \
   --hidden-import openpyxl --hidden-import pdfminer --hidden-import pdfminer.high_level \
   --hidden-import openpyxl.styles invoice_qr_tool.py
