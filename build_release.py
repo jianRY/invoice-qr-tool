@@ -160,12 +160,13 @@ def git(*args, check=True, capture=True):
     return r
 
 
-def push_or_fail(remote, ref, what, attempts=3):
-    """推送并**校验结果**，失败自动重试。
+def push_or_fail(remote, ref, what, attempts=5):
+    """推送并**校验结果**，失败自动重试（指数退避）。
 
     两个必须点：
     1) 不能静默推送 —— 原先用 check=False，一旦失败流程仍继续，Release 可能建在错误提交上；
-    2) 网络/代理会瞬时抖动（实测 `Empty reply from server`），无人值守发版不该被一次抖动打断。
+    2) 本机代理会间歇性抖动（实测同一 URL 三次里两次 `502 Bad Gateway` / `Empty reply from server`），
+       无人值守发版不该被一次抖动打断，故退避重试 5 次（5/10/20/40 秒）。
     """
     last = None
     for i in range(1, attempts + 1):
@@ -175,7 +176,7 @@ def push_or_fail(remote, ref, what, attempts=3):
             return
         last = r
         if i < attempts:
-            wait = 6 * i
+            wait = 5 * (2 ** (i - 1))
             print("    推送{}失败（returncode={}），{} 秒后重试…".format(what, r.returncode, wait))
             time.sleep(wait)
     raise RuntimeError(
