@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""发票二维码工具 —— 安装程序（PyInstaller onefile 打包，--uac-admin 提权）。
+r"""发票二维码工具 —— 安装程序（PyInstaller onefile 打包，--uac-admin 提权）。
 
 打包时通过 --add-data 把以下两个文件嵌进来：
 - 便携版主程序：app_payload/发票二维码工具.exe   （即「单文件运行版」）
@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+from appicon import setup_app_id, apply_window_icon
 
 APP_NAME = "发票二维码工具"
 APP_EXE = "发票二维码工具.exe"
@@ -128,10 +130,12 @@ def do_install(target, make_desktop, run_after):
 
 
 def main():
+    setup_app_id()          # 必须在 tk.Tk() 之前
     root = tk.Tk()
     root.title("安装 " + APP_NAME)
     root.geometry("480x220")
     root.resizable(False, False)
+    apply_window_icon(root)
 
     tk.Label(root, text="选择安装位置：", anchor="w").pack(fill="x", padx=18, pady=(14, 2))
     frm = tk.Frame(root)

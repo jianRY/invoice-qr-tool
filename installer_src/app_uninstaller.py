@@ -12,6 +12,8 @@ import shutil
 import tkinter as tk
 from tkinter import messagebox
 
+from appicon import setup_app_id, apply_window_icon
+
 APP_NAME = "发票二维码工具"
 INSTALL_REG = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{}".format(APP_NAME)
 
@@ -77,10 +79,12 @@ def do_uninstall():
 
 
 def main():
+    setup_app_id()          # 必须在 tk.Tk() 之前
     root = tk.Tk()
     root.title("卸载 " + APP_NAME)
     root.geometry("380x170")
     root.resizable(False, False)
+    apply_window_icon(root)
     tk.Label(
         root,
         text="确定要卸载 {} 吗？\n该操作将删除程序目录及快捷方式。".format(APP_NAME),

@@ -48,6 +48,7 @@ PROJECT_URL = "https://github.com/jianRY/invoice-qr-tool"
 OWNER = "jianRY"
 REPO = "invoice-qr-tool"
 APP_EXE = "发票二维码工具.exe"
+APP_ICON = os.path.join(ROOT, "app_icon.ico")   # 三支 exe 共用的应用图标
 PORTABLE_OUT = os.path.join(ROOT, "dist", APP_EXE)
 UNINST_OUT = os.path.join(ROOT, "dist", "uninstaller.exe")
 INSTALLER_OUT = os.path.join(ROOT, "dist", APP_NAME + "_安装程序.exe")
@@ -245,6 +246,8 @@ def build_uninstaller():
     src = os.path.join(ROOT, "installer_src", "app_uninstaller.py")
     out = run_pyinstaller([
         src, "--onefile", "--name", "uninstaller", "--uac-admin",
+        "--icon", APP_ICON,
+        "--add-data", "{}{}.".format(APP_ICON, os.pathsep),
     ])
     os.replace(os.path.join(out, "uninstaller.exe"), UNINST_OUT)
     sign(UNINST_OUT)
@@ -258,6 +261,8 @@ def build_installer():
     out = run_pyinstaller([
         src, "--onefile", "--name", APP_NAME + "_安装程序",
         "--uac-admin",
+        "--icon", APP_ICON,
+        "--add-data", "{}{}.".format(APP_ICON, os.pathsep),
         "--add-data", add_app,
         "--add-data", add_un,
     ])
