@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>发票二维码识别下载工具 · 一键归档电子票据</title>
+  <meta name="description" content="发票二维码识别下载工具：自动识别发票图片中的二维码，下载电子票据 PDF，并按票据号码汇总成 Excel 台账。单文件 EXE，免安装。" />
+  <link rel="icon" type="image/png" href="assets/app-icon.png" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+  <!-- 导航 -->
+  <header class="nav">
+    <div class="container">
+      <a class="brand" href="index.html">
+        <img src="assets/app-icon.png" alt="logo" />
+        <span>发票二维码识别下载工具<small>Invoice QR Downloader</small></span>
+      </a>
+      <nav class="nav-links">
+        <a href="#features">主要功能</a>
+        <a href="#scenarios">使用场景</a>
+        <a href="#how">使用步骤</a>
+        <a class="nav-cta" href="download.html">免费下载</a>
+      </nav>
+    </div>
+  </header>
+
+  <!-- 英雄区 -->
+  <section class="hero">
+    <div class="container">
+      <div class="hero-text">
+        <span class="badge"><span class="dot"></span> 当前版本 v3.6 · 免费 · 单文件免安装</span>
+        <h1>把一堆发票照片<br><span class="hl">一键变成结构化台账</span></h1>
+        <p class="lead">
+          自动识别发票图片里的二维码，批量下载电子票据 PDF，并按票据号码智能汇总成 Excel。
+          财务报销、医疗票据归档，从此告别手工逐个扫码与复制粘贴。
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="download.html">⬇ 立即下载（Windows）</a>
+          <a class="btn btn-ghost" href="#features">查看主要功能</a>
+        </div>
+        <div class="hero-meta">
+          <div><b>111 MB</b>单文件 EXE</div>
+          <div><b>0 安装</b>双击即用</div>
+          <div><b>本地运行</b>数据不出本机</div>
+        </div>
+      </div>
+
+      <div class="hero-card">
+        <div class="hd">
+          <img src="assets/app-icon.png" alt="app" />
+          <div class="t">发票二维码工具</div>
+          <div class="v">v3.6</div>
+        </div>
+        <div class="row"><span class="name">门诊票据001.jpg</span><span class="tag tag-ok">已下载</span></div>
+        <div class="row"><span class="name">住院票据017.jpg</span><span class="tag tag-ok">已下载</span></div>
+        <div class="row"><span class="name">票据033.jpg</span><span class="tag tag-warn">未识别</span></div>
+        <div class="row"><span class="name">票据058.jpg</span><span class="tag tag-warn">未下载</span></div>
+        <div class="foot">自动归类 · 原图保留 · 重复票据自动标记</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 信任条 -->
+  <section class="trust">
+    <div class="container">
+      <div class="item"><span class="ic">🔒</span> 全程本地运行，票据不出本机</div>
+      <div class="item"><span class="ic">⚡</span> 多尺度识别，小码也稳</div>
+      <div class="item"><span class="ic">📊</span> 一键汇总 Excel，含重复检测</div>
+      <div class="item"><span class="ic">🔄</span> 内置自动更新，一键升级</div>
+    </div>
+  </section>
+
+  <!-- 主要功能 -->
+  <section class="section" id="features">
+    <div class="container">
+      <div class="head">
+        <div class="eyebrow">Core Features</div>
+        <h2>主要功能</h2>
+        <p>从识别、下载到汇总归档，一套工具覆盖发票电子化的完整流程。</p>
+      </div>
+      <div class="grid grid-3">
+        <div class="card">
+          <div class="ic">🔍</div>
+          <h3>二维码智能识别</h3>
+          <p>对截图、小尺寸二维码自动多尺度放大识别，比通用方案更稳更准。</p>
+        </div>
+        <div class="card">
+          <div class="ic">⬇️</div>
+          <h3>自动下载电子票据</h3>
+          <p>识别到网址后自动抓取对应 PDF，保存到「PDF」文件夹，文件名与原始图片保持一致。</p>
+        </div>
+        <div class="card">
+          <div class="ic">🗂️</div>
+          <h3>智能分类整理</h3>
+          <p>成功下载的保持原名；未下载 / 未识别 / 其它三类自动复制到「未识别」文件夹并加前缀，原图不丢失。</p>
+        </div>
+        <div class="card">
+          <div class="ic">📑</div>
+          <h3>一键汇总台账</h3>
+          <p>把 PDF 发票提取「交款人 / 票据号码 / 开票日期 / 金额 / 统筹支付」汇总成 Excel，含重复检测与统计。</p>
+        </div>
+        <div class="card">
+          <div class="ic">💰</div>
+          <h3>金额精准识别</h3>
+          <p>支持千分位逗号、完整识别到小数点后两位；小写解析失败时以中文大写兜底，避免漏识别。</p>
+        </div>
+        <div class="card">
+          <div class="ic">🚀</div>
+          <h3>内置自动更新</h3>
+          <p>启动静默检查 GitHub 最新版，一键升级；旧版自动移入回收站，可随时还原。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 使用场景 -->
+  <section class="section section-tight" id="scenarios" style="background:var(--bg-soft);">
+    <div class="container">
+      <div class="head">
+        <div class="eyebrow">Use Cases</div>
+        <h2>典型使用场景</h2>
+        <p>无论个人报销还是单位归档，都能把零散票据快速变成可用数据。</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="case">
+          <div class="num">1</div>
+          <div>
+            <h3>医疗票据归档</h3>
+            <p>门诊 / 住院电子票据批量归档，自动汇总医保统筹支付与自付金额，方便商业保险理赔与家庭记账。</p>
+          </div>
+        </div>
+        <div class="case">
+          <div class="num">2</div>
+          <div>
+            <h3>财务报销整理</h3>
+            <p>把一叠发票照片快速变成结构化 Excel 台账，直接用于部门报销统计，省去手工录入。</p>
+          </div>
+        </div>
+        <div class="case">
+          <div class="num">3</div>
+          <div>
+            <h3>票据批量下载</h3>
+            <p>扫码 / 截图一堆票据二维码，自动批量拉取电子版 PDF，告别手工逐个打开网页下载。</p>
+          </div>
+        </div>
+        <div class="case">
+          <div class="num">4</div>
+          <div>
+            <h3>重复票据排查</h3>
+            <p>按票据号码自动标记重复项，防止同一张发票被重复报销，台账更干净可靠。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 使用步骤 -->
+  <section class="section" id="how">
+    <div class="container">
+      <div class="head">
+        <div class="eyebrow">How it works</div>
+        <h2>三步，完成批量处理</h2>
+        <p>无需配置，打开即用。</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="n">1</div>
+          <h3>选择文件夹</h3>
+          <p>把待处理的发票图片放在同一文件夹，点「浏览」选中它。</p>
+        </div>
+        <div class="step">
+          <div class="n">2</div>
+          <h3>勾选选项</h3>
+          <p>按需勾选「打开文件夹 / PDF 转图片 / 汇总发票」，点「开始处理」。</p>
+        </div>
+        <div class="step">
+          <div class="n">3</div>
+          <h3>获取结果</h3>
+          <p>PDF 在「PDF」文件夹，问题图副本在「未识别」，汇总表为 Excel，一目了然。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="section section-tight">
+    <div class="container">
+      <div class="cta-band">
+        <h2>准备好告别手工整理发票了吗？</h2>
+        <p>免费、单文件、免安装，下载后双击即可使用。</p>
+        <a class="btn-white" href="download.html">⬇ 免费下载 v3.6</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- 页脚 -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div>
+          <div class="brand"><img src="assets/app-icon.png" alt="logo" style="width:34px;height:34px;border-radius:9px;" /><span>发票二维码识别下载工具</span></div>
+          <p class="desc">一款面向个人与财务的发票电子化小工具：识别二维码、下载电子票据、汇总成台账，全部在本地完成。</p>
+        </div>
+        <div>
+          <h5>产品</h5>
+          <ul>
+            <li><a href="#features">主要功能</a></li>
+            <li><a href="#scenarios">使用场景</a></li>
+            <li><a href="download.html">下载</a></li>
+          </ul>
+        </div>
+        <div>
+          <h5>资源</h5>
+          <ul>
+            <li><a href="https://github.com/jianRY/invoice-qr-tool/releases" target="_blank" rel="noopener">更新日志</a></li>
+            <li><a href="https://github.com/jianRY/invoice-qr-tool" target="_blank" rel="noopener">GitHub 仓库</a></li>
+          </ul>
+        </div>
+        <div>
+          <h5>支持</h5>
+          <ul>
+            <li><a href="download.html">系统要求</a></li>
+            <li><a href="https://github.com/jianRY/invoice-qr-tool/releases" target="_blank" rel="noopener">常见问题</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="bottom">
+        <span>© 2026 发票二维码识别下载工具 · 本地运行，数据不出本机</span>
+        <span>免费 · 免安装 · 单文件</span>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
