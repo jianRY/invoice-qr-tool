@@ -160,20 +160,29 @@ def git(*args, check=True, capture=True):
     return r
 
 
-def push_or_fail(remote, ref, what):
-    """推送并**校验结果**。
+def push_or_fail(remote, ref, what, attempts=3):
+    """推送并**校验结果**，失败自动重试。
 
-    原先用 check=False 静默推送，一旦失败（本机 PortableGit 会「静默失败」，无任何输出）
-    流程仍会继续，Release 可能指向错误提交 —— 必须显式失败。
+    两个必须点：
+    1) 不能静默推送 —— 原先用 check=False，一旦失败流程仍继续，Release 可能建在错误提交上；
+    2) 网络/代理会瞬时抖动（实测 `Empty reply from server`），无人值守发版不该被一次抖动打断。
     """
-    r = git("push", remote, ref, check=False)
-    if r.returncode != 0:
-        raise RuntimeError(
-            "推送{}失败（returncode={}）：\nSTDOUT: {}\nSTDERR: {}\n"
-            "提示：若为静默失败，检查 build_release.py 的 _pick_git() 是否选中了系统 Git。".format(
-                what, r.returncode,
-                (r.stdout or "").strip()[-800:], (r.stderr or "").strip()[-800:]))
-    print("    已推送", what)
+    last = None
+    for i in range(1, attempts + 1):
+        r = git("push", remote, ref, check=False)
+        if r.returncode == 0:
+            print("    已推送 {}{}".format(what, "" if i == 1 else "（第 {} 次尝试）".format(i)))
+            return
+        last = r
+        if i < attempts:
+            wait = 6 * i
+            print("    推送{}失败（returncode={}），{} 秒后重试…".format(what, r.returncode, wait))
+            time.sleep(wait)
+    raise RuntimeError(
+        "推送{}失败（已重试 {} 次，returncode={}）：\nSTDOUT: {}\nSTDERR: {}\n"
+        "提示：若为静默失败，检查 build_release.py 的 _pick_git() 是否选中了系统 Git。".format(
+            what, attempts, last.returncode,
+            (last.stdout or "").strip()[-800:], (last.stderr or "").strip()[-800:]))
 
 
 def current_branch():
