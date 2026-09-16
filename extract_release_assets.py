@@ -15,13 +15,57 @@ ASSET_DIR = os.path.join(ROOT, "outputs", "release_assets")
 os.makedirs(ASSET_DIR, exist_ok=True)
 
 tree = ast.parse(open(SRC, encoding="utf-8").read())
+
+
+def _str_value(node, ns):
+    """把「纯字符串常量 / f-string / 相邻字符串相加」求成文本，不执行任何代码。
+
+    USAGE_TEXT 现为 f-string（顶部插入仓库地址时引用了 GITHUB_REPO_* 常量），
+    旧的 ast.Constant 判断取不到值，故在此补上 JoinedStr / BinOp 两种形态。
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for v in node.values:
+            if isinstance(v, ast.Constant):
+                parts.append(str(v.value))
+            elif isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Name):
+                parts.append(str(ns.get(v.value.id, "")))
+            else:
+                return None
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _str_value(node.left, ns)
+        right = _str_value(node.right, ns)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+# 第一遍：收集模块级字符串常量，供 f-string 插值使用（如 GITHUB_REPO_OWNER）
+ns = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                val = _str_value(node.value, ns)
+                if val is not None:
+                    ns[t.id] = val
+
+# 第二遍：抽取目标文案
 out = {}
-for node in ast.walk(tree):
+for node in tree.body:
     if isinstance(node, ast.Assign):
         for t in node.targets:
             if isinstance(t, ast.Name) and t.id in ("USAGE_TEXT", "CHANGELOG_TEXT"):
-                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                    out[t.id] = node.value.value
+                val = _str_value(node.value, ns)
+                if val is not None:
+                    out[t.id] = val
+
+for key in ("USAGE_TEXT", "CHANGELOG_TEXT"):
+    if key not in out or not out[key].strip():
+        raise SystemExit(f"抽取失败：源码中未找到可解析的 {key}（请检查其赋值形式）")
 
 written = []
 # 本地中文版：根目录（仓库内文档）与 outputs/ 都写，避免两处长期漂移
