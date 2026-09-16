@@ -17,3 +17,7 @@ outputs/
 
 # ---- 下载的源码基线压缩包（本地保留即可，不入库） ----
 *.tar.gz
+
+# ---- 敏感/自动生成（不入库） ----
+.github_token
+.last_release_commit
