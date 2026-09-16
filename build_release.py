@@ -1,0 +1,409 @@
+# -*- coding: utf-8 -*-
+"""
+发票二维码工具 —— 构建 / 签名 / 发布 一体化脚本
+================================================
+
+职责：
+  1. 构建「单文件运行版」exe（onefile，复用发票二维码工具.spec 的 Analysis 配置）
+  2. 构建「卸载程序」exe（onefile）
+  3. 构建「可安装版」exe（onefile，内嵌单文件版主程序 + 卸载程序）
+  4. 三个 exe 全部走 sign.py 自签名（SHA256 + RFC3161 时间戳）
+  5. 生成 Usage / Changelog 文本
+  6. （--publish 时）git push（走代理）→ 打 tag → 在 GitHub 创建 Release 并上传双 exe
+
+安全护栏：
+  - 本地目标版本必须 > GitHub 线上最新版本，否则拒绝发布（防止用旧代码覆盖新版）。
+  - 仅在检测到「相对上次发布有新的提交」时才发布。
+  - 不打印任何令牌 / 密码；PAT 运行时从 wincred 读取。
+
+用法：
+  python build_release.py                # 仅构建 + 签名 + 生成资源（本地验证用）
+  python build_release.py --publish      # 构建 + 签名 + 推送 GitHub + 发 Release
+  python build_release.py --publish --version 3.9   # 指定版本号
+  python build_release.py --publish --force         # 即使版本号不高于线上也发布
+  python build_release.py --skip-build   # 跳过 PyInstaller，直接对已有 dist/ 签名+发布
+"""
+import os
+import re
+import sys
+import json
+import shutil
+import subprocess
+import urllib.request
+import urllib.error
+import base64
+
+# ---------------- 路径常量 ----------------
+ROOT = os.path.dirname(os.path.abspath(__file__))
+VENV_PY = os.path.join(ROOT, "envs", "default", "Scripts", "python.exe")
+GIT = r"C:\Users\toxuj\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git.exe"
+WCRED = r"C:\Users\toxuj\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git-credential-wincred.exe"
+SIGN_PY = r"D:\workbuddy\诉讼案件网站\.pybuild_cache\signing\sign.py"
+APP_NAME = "发票二维码工具"
+PROJECT_URL = "https://github.com/jianRY/invoice-qr-tool"
+OWNER = "jianRY"
+REPO = "invoice-qr-tool"
+APP_EXE = "发票二维码工具.exe"
+PORTABLE_OUT = os.path.join(ROOT, "dist", APP_EXE)
+UNINST_OUT = os.path.join(ROOT, "dist", "uninstaller.exe")
+INSTALLER_OUT = os.path.join(ROOT, "dist", APP_NAME + "_安装程序.exe")
+ASSET_DIR = os.path.join(ROOT, "outputs", "release_assets")
+VERSION_FILE = os.path.join(ROOT, "VERSION")
+LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
+PROXY = "http://127.0.0.1:10808"
+
+# 代理全局生效（urllib / git 都用）
+os.environ.setdefault("HTTPS_PROXY", PROXY)
+os.environ.setdefault("HTTP_PROXY", PROXY)
+os.environ.setdefault("https_proxy", PROXY)
+os.environ.setdefault("http_proxy", PROXY)
+
+
+# ---------------- 版本工具 ----------------
+def parse_ver(tag):
+    if not tag:
+        return (0, 0, 0)
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(tag))
+    if not m:
+        return (0, 0, 0)
+    g = m.groups()
+    return (int(g[0]), int(g[1]), int(g[2]) if g[2] else 0)
+
+
+def fmt_ver(v):
+    return "v{}.{}".format(v[0], v[1]) + ("" if v[2] == 0 else ".{}".format(v[2]))
+
+
+def bump_minor(v):
+    return (v[0], v[1] + 1, 0)
+
+
+def read_version():
+    if os.path.exists(VERSION_FILE):
+        return open(VERSION_FILE, encoding="utf-8").read().strip()
+    return "3.6"
+
+
+def write_version(v):
+    with open(VERSION_FILE, "w", encoding="utf-8") as f:
+        f.write(v + "\n")
+
+
+# ---------------- 凭据 ----------------
+def get_pat():
+    # 1) wincred（与 git 同一凭据，无需落盘）
+    try:
+        r = subprocess.run(
+            [WCRED, "get"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        for line in r.stdout.splitlines():
+            if line.startswith("password="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    # 2) 回退：本地 .github_token（gitignore）
+    f = os.path.join(ROOT, ".github_token")
+    if os.path.exists(f):
+        return open(f, encoding="utf-8").read().strip()
+    return None
+
+
+# ---------------- Git ----------------
+def git(*args, check=True, capture=True):
+    env = os.environ.copy()
+    r = subprocess.run(
+        [GIT] + list(args), capture_output=capture, text=True,
+        encoding="utf-8", errors="replace", env=env,
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError("git {} 失败:\n{}".format(" ".join(args), r.stderr))
+    return r
+
+
+def current_branch():
+    return git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+
+
+def head_commit():
+    return git("rev-parse", "HEAD").stdout.strip()
+
+
+# ---------------- GitHub API ----------------
+def api(method, url, token=None, json_data=None, raw=None, ctype=None):
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    if raw is not None:
+        req.add_header("Content-Type", ctype or "application/octet-stream")
+        req.data = raw
+    elif json_data is not None:
+        req.add_header("Content-Type", "application/json")
+        req.data = json.dumps(json_data).encode("utf-8")
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        return resp.status, (json.loads(body) if body else {})
+
+
+def latest_release_tag(token):
+    url = "https://api.github.com/repos/{}/{}/releases/latest".format(OWNER, REPO)
+    try:
+        status, data = api("GET", url, token)
+        if status == 200:
+            return data.get("tag_name")
+    except Exception:
+        pass
+    return None
+
+
+def repo_private(token):
+    try:
+        status, data = api("GET", "https://api.github.com/repos/{}/{}".format(OWNER, REPO), token)
+        if status == 200:
+            return bool(data.get("private"))
+    except Exception:
+        pass
+    return False
+
+
+# ---------------- 构建 ----------------
+def run_pyinstaller(args):
+    cmd = [VENV_PY, "-m", "PyInstaller", "--noconfirm"] + args
+    print(">>>", " ".join(cmd))
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        print(r.stdout[-2000:])
+        print(r.stderr[-2000:])
+        raise RuntimeError("PyInstaller 失败：" + " ".join(args[:3]))
+    return r
+
+
+def sign(exe_path):
+    if not os.path.exists(exe_path):
+        raise RuntimeError("待签名文件不存在：" + exe_path)
+    print(">>> 签名:", exe_path)
+    r = subprocess.run(
+        [VENV_PY, SIGN_PY, exe_path, APP_NAME, PROJECT_URL],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if r.returncode != 0:
+        print(r.stdout[-1500:]); print(r.stderr[-1500:])
+        raise RuntimeError("签名失败：" + exe_path)
+    print("    签名输出:", (r.stdout or r.stderr).strip().splitlines()[-1] if (r.stdout or r.stderr).strip() else "ok")
+
+
+def build_portable():
+    """单文件运行版（onefile，复用既有 spec；spec 本身即单文件构建）。"""
+    spec = os.path.join(ROOT, "发票二维码工具.spec")
+    run_pyinstaller([spec])
+    sign(PORTABLE_OUT)
+
+
+def build_uninstaller():
+    src = os.path.join(ROOT, "installer_src", "app_uninstaller.py")
+    run_pyinstaller([
+        src, "--onefile", "--name", "uninstaller", "--distpath", os.path.join(ROOT, "dist"),
+        "--uac-admin",
+    ])
+    sign(UNINST_OUT)
+
+
+def build_installer():
+    """可安装版：内嵌单文件版主程序 + 卸载程序。"""
+    src = os.path.join(ROOT, "installer_src", "app_installer.py")
+    add_app = "{}{}app_payload".format(PORTABLE_OUT, os.pathsep)
+    add_un = "{}{}.".format(UNINST_OUT, os.pathsep)
+    run_pyinstaller([
+        src, "--onefile", "--name", APP_NAME + "_安装程序",
+        "--distpath", os.path.join(ROOT, "dist"),
+        "--uac-admin",
+        "--add-data", add_app,
+        "--add-data", add_un,
+    ])
+    sign(INSTALLER_OUT)
+
+
+# ---------------- 资源生成 ----------------
+def make_assets(new_tag):
+    os.makedirs(ASSET_DIR, exist_ok=True)
+    # 复制双 exe（ASCII 文件名，GitHub 附件不支持中文）
+    portable_name = "InvoiceQRDownloader_{}.exe".format(new_tag.lstrip("v"))
+    installer_name = "InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v"))
+    shutil.copy2(PORTABLE_OUT, os.path.join(ASSET_DIR, portable_name))
+    shutil.copy2(INSTALLER_OUT, os.path.join(ASSET_DIR, installer_name))
+
+    # Changelog：相对上次发布提交的 git log
+    last = ""
+    if os.path.exists(LAST_RELEASE_COMMIT):
+        last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
+    if last:
+        rng = "{}..HEAD".format(last)
+    else:
+        rng = "-15"
+    log = git("log", "--oneline", rng, check=False).stdout.strip()
+    if not log:
+        log = git("log", "--oneline", "-15").stdout.strip()
+    lines = log.splitlines()
+    changelog = "# 发票二维码识别下载工具 {}\n\n".format(new_tag)
+    changelog += "## 更新内容\n"
+    for ln in lines:
+        changelog += "- " + ln + "\n"
+    changelog += "\n## 下载说明\n"
+    changelog += "- `{}`：单文件运行版（双击即用，无需安装）。\n".format(portable_name)
+    changelog += "- `{}`：可安装版（装到 Program Files，开始菜单/桌面快捷方式，含卸载程序）。\n".format(installer_name)
+    changelog += "- 软件界面与本地文件名仍为中文 `{}`。\n".format(APP_EXE)
+    with open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), "w", encoding="utf-8") as f:
+        f.write(changelog)
+
+    usage = (
+        "发票二维码识别下载工具 {tag}\n"
+        "================================\n\n"
+        "【单文件运行版】InvoiceQRDownloader_{tag}.exe\n"
+        "  直接双击运行，无需安装。程序会在同目录读写配置与输出。\n\n"
+        "【可安装版】InvoiceQRInstaller_{tag}.exe\n"
+        "  右键「以管理员身份运行」→ 选择安装目录（默认 C:\\Program Files\\发票二维码工具）\n"
+        "  → 自动创建开始菜单 / 桌面快捷方式，并写入「应用和功能」卸载项。\n"
+        "  卸载：设置 → 应用 → 发票二维码工具 → 卸载，或控制面板。\n\n"
+        "两版功能完全一致，按使用场景选择即可。\n"
+        "项目主页：{url}\n"
+    ).format(tag=new_tag.lstrip("v"), url=PROJECT_URL)
+    with open(os.path.join(ASSET_DIR, "InvoiceQR_Usage.txt"), "w", encoding="utf-8") as f:
+        f.write(usage)
+    print("资源已生成:", ASSET_DIR)
+    return portable_name, installer_name
+
+
+# ---------------- 发布 ----------------
+def publish(new_tag, token):
+    # 1) 仓库公开（匿名读取 Release 需要）
+    if repo_private(token):
+        api("PATCH", "https://api.github.com/repos/{}/{}".format(OWNER, REPO), token,
+            json_data={"private": False})
+        print("[发布] 仓库已设为公开")
+    # 2) 推送
+    branch = current_branch()
+    pat = get_pat()
+    remote_url = "https://{}@github.com/{}/{}.git".format(pat, OWNER, REPO)
+    git("remote", "set-url", "origin", remote_url, check=False)
+    git("push", "origin", branch, check=False)
+    git("push", "origin", new_tag, check=False)
+    print("[发布] 已推送分支 {} 与标签 {}".format(branch, new_tag))
+    # 3) 创建 Release
+    body = open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), encoding="utf-8").read()
+    status, data = api(
+        "POST", "https://api.github.com/repos/{}/{}/releases".format(OWNER, REPO), token,
+        json_data={"tag_name": new_tag, "name": "发票二维码识别下载工具 " + new_tag,
+                   "body": body, "draft": False, "prerelease": False},
+    )
+    upload_url = data.get("upload_url", "").split("{")[0]
+    print("[发布] 创建 Release {} (HTTP {})".format(new_tag, status))
+    # 4) 上传附件
+    from urllib.parse import quote
+    for fn, ctype in [
+        ("InvoiceQRDownloader_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
+        ("InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
+        ("InvoiceQR_Usage.txt", "text/plain; charset=utf-8"),
+        ("InvoiceQR_Changelog.txt", "text/plain; charset=utf-8"),
+    ]:
+        p = os.path.join(ASSET_DIR, fn)
+        if not os.path.exists(p):
+            print("    跳过（缺失）:", fn); continue
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        url = "{}?name={}&label={}".format(upload_url, quote(fn), quote(fn))
+        st, _ = api("POST", url, token, raw_body=raw, ctype=ctype)
+        print("    上传 {} ({}KB) -> HTTP {}".format(fn, len(raw) // 1024, st))
+    # 5) 记录已发布提交
+    with open(LAST_RELEASE_COMMIT, "w", encoding="utf-8") as f:
+        f.write(head_commit() + "\n")
+    git("add", "-A", check=False)
+    git("commit", "-m", "chore: 记录 {} 发布提交".format(new_tag), check=False)
+    git("push", "origin", branch, check=False)
+    print("[发布] 完成。地址：https://github.com/{}/{}/releases/tag/{}".format(OWNER, REPO, new_tag))
+
+
+# ---------------- 主流程 ----------------
+def main():
+    args = sys.argv[1:]
+    do_publish = "--publish" in args
+    force = "--force" in args
+    skip_build = "--skip-build" in args
+    ver_override = None
+    if "--version" in args:
+        i = args.index("--version")
+        if i + 1 < len(args):
+            ver_override = args[i + 1]
+
+    token = get_pat() if do_publish else None
+    latest = latest_release_tag(token) if do_publish else None
+    latest_v = parse_ver(latest)
+    local_v = parse_ver(read_version())
+
+    # 目标版本：显式指定 > 自动在线上最新版基础上 +1（满足“版本号按实际情况新增”）
+    if ver_override:
+        new_v = parse_ver(ver_override)
+    elif do_publish and latest_v > (0, 0, 0):
+        new_v = bump_minor(latest_v)
+    else:
+        new_v = local_v if local_v > (0, 0, 0) else (3, 7, 0)
+    new_tag = fmt_ver(new_v)
+    print("目标版本:", new_tag, "| 线上最新:", latest or "(未知)")
+
+    # 自动化效率：相对上次发布无新提交则直接跳过（不构建）
+    if do_publish:
+        last = (open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
+                if os.path.exists(LAST_RELEASE_COMMIT) else "")
+        if last and head_commit() == last and not force:
+            print("[护栏] 相对上次发布无新提交，跳过（无需构建/发布）。")
+            return
+        # 安全护栏：目标版本不高于线上最新则拒绝发布（防止旧代码覆盖新版）
+        if not force and new_v <= latest_v:
+            print("[护栏] 目标版本 {} 不高于线上最新 {}，跳过发布。"
+                  "如需覆盖请用 --force 或先 --version 指定更高版本。".format(new_tag, latest))
+            return
+
+    # 构建
+    if not skip_build:
+        for d in ("dist", "build"):
+            shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+        print("=== 1/3 构建单文件运行版 ===")
+        build_portable()
+        print("=== 2/3 构建卸载程序 ===")
+        build_uninstaller()
+        print("=== 3/3 构建可安装版（内嵌主程序+卸载程序）===")
+        build_installer()
+    else:
+        sign(PORTABLE_OUT); sign(UNINST_OUT); sign(INSTALLER_OUT)
+
+    for p in (PORTABLE_OUT, UNINST_OUT, INSTALLER_OUT):
+        if not os.path.exists(p):
+            raise RuntimeError("构建产物缺失：" + p)
+        print("产物:", p, "{}KB".format(os.path.getsize(p) // 1024))
+
+    make_assets(new_tag)
+
+    if do_publish:
+        # 仅当有新提交才发布
+        last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip() if os.path.exists(LAST_RELEASE_COMMIT) else ""
+        if last and head_commit() == last and not force:
+            print("[护栏] 相对上次发布无新提交，跳过发布。")
+            return
+        if token is None:
+            print("[错误] 未能获取 GitHub PAT，无法发布。请确认 wincred 中 git:https://github.com 凭据。")
+            return
+        write_version(new_tag.lstrip("v"))
+        git("add", "-A", check=False)
+        git("commit", "-m", "release: {}".format(new_tag), check=False)
+        git("tag", new_tag, check=False)
+        publish(new_tag, token)
+    else:
+        print("\n[本地验证完成] 未执行发布（需要 --publish）。产物与签名均已就绪。")
+
+
+if __name__ == "__main__":
+    main()
