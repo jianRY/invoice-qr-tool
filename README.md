@@ -78,8 +78,8 @@ README.md / README.en.md     # 说明文档
 
 前往本仓库 **Releases** 页面下载最新版（仓库公开，无需登录）：
 
-- `InvoiceQRDownloader_X.Y.exe` —— **单文件运行版**（双击即用，无需安装）
-- `InvoiceQRInstaller_X.Y.exe` —— **可安装版**（安装到 Program Files，创建开始菜单 / 桌面快捷方式，写入「应用和功能」卸载项）
+- `InvoiceQRDownloader_X.Y.Z.exe` —— **单文件运行版**（双击即用，无需安装）
+- `InvoiceQRInstaller_X.Y.Z.exe` —— **可安装版**（安装到 Program Files，创建开始菜单 / 桌面快捷方式，写入「应用和功能」卸载项）
 - `InvoiceQR_Usage.txt` —— 使用说明
 - `InvoiceQR_Changelog.txt` —— 更新日志
 
