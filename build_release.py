@@ -38,9 +38,25 @@ import uuid
 import time
 
 # ---------------- 路径常量 ----------------
+def _pick_git():
+    """挑选可用的 git 可执行文件。
+
+    优先**系统 Git**：本机 Bash 的 PATH 常失效，PortableGit 的 git 因而找不到
+    remote-https helper —— 补 GIT_EXEC_PATH 只会把报错变成「静默失败」
+    （returncode=128、stdout/stderr 全空），无人值守发版时会误判成功。
+    系统 Git 的 helper 位于 mingw64/libexec/git-core，布局正确，实测可用。
+    """
+    for c in (r"C:\Program Files\Git\cmd\git.exe",
+              r"C:\Program Files (x86)\Git\cmd\git.exe",
+              r"C:\Users\toxuj\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git.exe"):
+        if os.path.isfile(c):
+            return c
+    return "git"
+
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VENV_PY = os.path.join(ROOT, "envs", "default", "Scripts", "python.exe")
-GIT = r"C:\Users\toxuj\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git.exe"
+GIT = _pick_git()
 WCRED = r"C:\Users\toxuj\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git-credential-wincred.exe"
 SIGN_PY = r"D:\workbuddy\诉讼案件网站\.pybuild_cache\signing\sign.py"
 APP_NAME = "发票二维码工具"
@@ -118,18 +134,46 @@ def get_pat():
 
 
 # ---------------- Git ----------------
-def git(*args, check=True, capture=True):
+def git_env():
+    """构造 git 的运行环境。
+
+    本机 PATH 常被裁剪，git 会找不到远端 helper。把 git 所在目录补进 PATH；
+    若是 PortableGit（helper 在 mingw64/bin，不在 libexec/git-core），再补 GIT_EXEC_PATH。
+    """
     env = os.environ.copy()
-    # 关键：本环境 PATH 常失效，git 会找不到 git-remote-https（报
-    # 'remote-https' is not a git command）。显式指定 GIT_EXEC_PATH 兜底。
-    env["GIT_EXEC_PATH"] = os.path.dirname(GIT)
+    d = os.path.dirname(GIT)
+    env["PATH"] = d + os.pathsep + env.get("PATH", "")
+    if "PortableGit" in GIT:
+        env["GIT_EXEC_PATH"] = d
+    return env
+
+
+def git(*args, check=True, capture=True):
     r = subprocess.run(
         [GIT] + list(args), capture_output=capture, text=True,
-        encoding="utf-8", errors="replace", env=env,
+        encoding="utf-8", errors="replace", env=git_env(),
     )
     if check and r.returncode != 0:
-        raise RuntimeError("git {} 失败:\n{}".format(" ".join(args), r.stderr))
+        raise RuntimeError("git {} 失败（returncode={}）:\nSTDOUT: {}\nSTDERR: {}".format(
+            " ".join(args), r.returncode,
+            (r.stdout or "").strip()[-1500:], (r.stderr or "").strip()[-1500:]))
     return r
+
+
+def push_or_fail(remote, ref, what):
+    """推送并**校验结果**。
+
+    原先用 check=False 静默推送，一旦失败（本机 PortableGit 会「静默失败」，无任何输出）
+    流程仍会继续，Release 可能指向错误提交 —— 必须显式失败。
+    """
+    r = git("push", remote, ref, check=False)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "推送{}失败（returncode={}）：\nSTDOUT: {}\nSTDERR: {}\n"
+            "提示：若为静默失败，检查 build_release.py 的 _pick_git() 是否选中了系统 Git。".format(
+                what, r.returncode,
+                (r.stdout or "").strip()[-800:], (r.stderr or "").strip()[-800:]))
+    print("    已推送", what)
 
 
 def current_branch():
@@ -379,8 +423,8 @@ def publish(new_tag, token):
     remote_url = "https://{}@github.com/{}/{}.git".format(pat, OWNER, REPO)
     try:
         git("remote", "set-url", "origin", remote_url, check=False)
-        git("push", "origin", branch, check=False)
-        git("push", "origin", new_tag, check=False)
+        push_or_fail("origin", branch, "分支 " + branch)
+        push_or_fail("origin", new_tag, "标签 " + new_tag)
     finally:
         git("remote", "set-url", "origin", clean_url, check=False)
     print("[发布] 已推送分支 {} 与标签 {}".format(branch, new_tag))
@@ -433,7 +477,7 @@ def publish(new_tag, token):
         f.write(head_commit() + "\n")
     git("add", "-A", check=False)
     git("commit", "-m", "chore: 记录 {} 发布提交".format(new_tag), check=False)
-    git("push", "origin", branch, check=False)
+    push_or_fail("origin", branch, "分支 " + branch)
     print("[发布] 完成。地址：https://github.com/{}/{}/releases/tag/{}".format(OWNER, REPO, new_tag))
 
 
