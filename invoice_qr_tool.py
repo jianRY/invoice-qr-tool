@@ -71,7 +71,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.7.0"
+__VERSION__ = "4.8.0"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -151,6 +151,10 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 也可随时通过顶部菜单栏「帮助 → 检查更新」手动检查。
 - 更新源为公开仓库 jianRY/invoice-qr-tool 的 Release，无需任何账号或令牌。
 - 更新过程有「更新进度」提示框：展示阶段、进度条、下载速度、已下载大小与详细日志。
+- **下载过程中可随时取消**：进度框里有「✖ 取消更新」按钮（点窗口 ✕ 同样生效）。
+  取消后立即断开下载并清理临时文件，当前版本不变、软件照常可用。
+  注意：下载完成后「保存新版本」的一两秒内不可取消（避免留下损坏的文件）；
+  新版本已启动后也无法回退。
 - 下载完成后，新版本直接保存到当前程序同一目录下，文件名自动带版本号
   （如「发票二维码工具_v3.8.exe」）；旧的 EXE 会被移入回收站（随时可还原），
   随后自动切换到新版本，安全且无损，不再需要复杂的覆盖/备份/回滚机制。
@@ -184,6 +188,20 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-17  v4.8.0
+- **更新过程支持中途取消**：下载新版本时进度框新增「✖ 取消更新」按钮，点窗口右上角
+  ✕ 也等同取消。取消后立刻断开下载、清理临时文件，**当前版本完全不受影响**，
+  软件可继续正常使用（原先一旦开始就只能等它下载完，无法中止）。
+- 取消的生效范围做了分阶段处理：**下载中**可随时取消；**下载完成后保存新文件的
+  那一两秒**属临界区不可取消（此时打断可能留下损坏的 exe），按钮会变为「保存中…」
+  并提示「此步骤无法取消」；**新版本已启动**后则无法回退。
+- 取消后进度框停在可查看状态（日志保留「已取消更新：下载已中断，临时文件已清理」），
+  点「关闭」即可回到主界面，不必重启软件。
+- 顺带修复：取消时 `requests` 会尝试读完剩余响应体才返回（表现为「点了取消却卡住」），
+  改为先切断原始 socket 再关闭，取消即时生效。
+- 顺带修复：更新失败或取消时，半截的 `.part` 更新包有时没被清掉（曾实测残留 100MB+）；
+  现在统一在最外层清理，且软件启动时也会扫一遍临时目录，清掉历史遗留的半截更新包。
 
 2026-09-16  v4.7.0
 - **版本号改为三段式 X.Y.Z**（tag 形如 v4.7.0，不再出现两段式 v4.6）：
@@ -448,25 +466,76 @@ def get_latest_release():
     return version, download_url, notes
 
 
-def _download_file(url: str, dest: str, progress_cb=None) -> bool:
-    """带进度回调的下载；返回是否成功。"""
+class _UpdateCancelled(Exception):
+    """用户主动取消更新。
+
+    单独用一个异常类型，是为了让它能穿过 `_download_file` 的兜底 except
+    （那里会把网络类异常统一当作「下载失败」返回 False，取消不能被混为一谈）。"""
+
+
+def _abort_response(resp):
+    """彻底切断一个流式响应。
+
+    ⚠️ 必须**先关原始 socket** 再 close()：requests 在响应体未读尽时调用
+    close()，会尝试先从 socket 读取剩余数据来“补全”，那一步会阻塞住，
+    表现为「点了取消却迟迟不返回」。先 raw.close() 就绕开了这条补全路径。
+    """
+    if resp is None:
+        return
+    try:
+        if getattr(resp, "raw", None) is not None:
+            resp.raw.close()
+    except Exception:
+        pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def _download_file(url: str, dest: str, progress_cb=None, cancel=None) -> bool:
+    """带进度回调的下载；返回是否成功。
+
+    cancel: threading.Event；置位则立刻断开连接，并抛出 _UpdateCancelled。
+            半截文件的清理由调用方在最外层 finally 统一负责（见 perform_update），
+            这样无论内部走哪条异常路径，都不会把 .part 留在磁盘上。
+    """
     headers = {"User-Agent": "InvoiceQRDownloader"}
+    resp = None
+    abort = False
     try:
         resp = requests.get(url, headers=headers, stream=True, timeout=60)
         resp.raise_for_status()
         total = int(resp.headers.get("Content-Length", 0)) or 0
         written = 0
-        with open(dest, "wb") as f:
+        f = open(dest, "wb")
+        try:
             for chunk in resp.iter_content(chunk_size=256 * 1024):
+                if cancel is not None and cancel.is_set():
+                    abort = True
+                    raise _UpdateCancelled()
                 if not chunk:
                     continue
                 f.write(chunk)
                 written += len(chunk)
                 if progress_cb and total:
                     progress_cb(written, total)
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
         return True
+    except _UpdateCancelled:
+        abort = True
+        raise
     except Exception:
+        # 网络类异常统一视为「下载失败」，交由调用方清理 .part
+        abort = True
         return False
+    finally:
+        if abort:
+            _abort_response(resp)   # 立刻断开，不等连接池回收
 
 
 def _derive_base_name(exe_path: str) -> str:
@@ -606,22 +675,27 @@ def send_to_recycle_bin(path: str) -> bool:
         return False
 
 
-def perform_update(download_url: str, latest_version: tuple, on_event=None) -> bool:
+def perform_update(download_url: str, latest_version: tuple, on_event=None,
+                   cancel=None) -> bool:
     """下载 GitHub 最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
     并把旧的 EXE 移动到回收站。
 
-    流程：
-      1. 下载最新 exe 到临时 .part 文件；
-      2. 原子移动到「同目录/基础名_v版本.exe」；
-      3. 以 --recycle-old "<当前exe路径>" 启动新版本，再由新进程回收正在运行的旧 exe
-         （避免直接删除正在运行的自身文件被系统锁定）。
+    流程（cancel 只在能干净收尾的阶段生效）：
+      ① 下载 → 可取消：立刻断开、删除半截 .part，等于什么都没发生；
+      ② 下载完成后的落盘 / 原子移动（约 1~2 秒内）→ **不可取消**，
+         此时打断可能留下损坏的 exe，故只提示「正在保存，请稍候」；
+      ③ 新版本已启动 → 既成事实，无法回退。
 
-    on_event: 更新进度框回调，事件格式同前（stage/progress/detail/done）。
-    返回是否成功触发替换。
+    参数：
+      cancel: threading.Event；置位表示用户点了「取消更新」。
+    返回：是否成功触发替换（取消 / 失败均返回 False）。
     """
     def emit(ev):
         if on_event:
             on_event(ev)
+
+    def _cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
 
     emit({"type": "stage", "text": "正在下载新版本…"})
     tmp_dir = tempfile.gettempdir()
@@ -646,14 +720,44 @@ def perform_update(download_url: str, latest_version: tuple, on_event=None) -> b
         _last_w[0] = written
         emit({"type": "progress", "written": written, "total": total, "speed": speed})
 
-    if not _download_file(download_url, part, progress_cb=_prog):
-        emit({"type": "detail", "text": "下载失败：无法获取更新文件，请稍后重试或手动更新。"})
-        emit({"type": "done", "ok": False})
+    def _cleanup_part():
+        """删除半截 .part（取消 / 下载失败共用；删除失败不影响主流程）。"""
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+                return True
+        except Exception:
+            pass
         return False
 
+    def _emit_cancelled(extra):
+        _cleanup_part()
+        emit({"type": "detail", "text": extra})
+        emit({"type": "detail", "text": "当前版本保持不变，软件可继续正常使用。"})
+        emit({"type": "cancelled"})
+        emit({"type": "done", "ok": False})
+
+    # ---- ① 下载（可取消）----
+    try:
+        if not _download_file(download_url, part, progress_cb=_prog, cancel=cancel):
+            _cleanup_part()
+            emit({"type": "detail", "text": "下载失败：无法获取更新文件，请稍后重试或手动更新。"})
+            emit({"type": "done", "ok": False})
+            return False
+    except _UpdateCancelled:
+        _emit_cancelled("已取消更新：下载已中断，临时文件已清理。")
+        return False
+
+    if _cancelled():
+        # 极端情形：刚好在下载结束时点取消，同样干净收尾
+        _emit_cancelled("已取消更新：临时文件已清理。")
+        return False
+
+    # ---- ② 落盘（临界区，不可取消）----
     size_mb = os.path.getsize(part) / 1048576
     emit({"type": "detail", "text": f"下载完成（{size_mb:.1f} MB），正在保存到原目录…"})
-    emit({"type": "stage", "text": "下载完成，正在保存新版本…"})
+    emit({"type": "stage", "text": "下载完成，正在保存新版本（此步请稍候，无法取消）…"})
+    emit({"type": "lock"})   # 通知 UI 禁用「取消更新」
 
     try:
         current_exe = sys.executable  # 当前 EXE 自身路径（打包后）
@@ -695,6 +799,8 @@ def perform_update(download_url: str, latest_version: tuple, on_event=None) -> b
         except Exception as e:
             emit({"type": "detail",
                   "text": f"启动新版本失败：{e}，旧版本仍保留，可手动打开新文件。"})
+            emit({"type": "detail",
+                  "text": f"新版本文件已保存在：{new_exe}"})
             emit({"type": "done", "ok": False})
             return False
     except Exception as e:
@@ -704,12 +810,19 @@ def perform_update(download_url: str, latest_version: tuple, on_event=None) -> b
 
 
 class UpdateProgressDialog:
-    """更新进度框：展示阶段、进度条、下载速度、已下载大小与详细日志。"""
+    """更新进度框：展示阶段、进度条、下载速度、已下载大小与详细日志。
+
+    支持中途取消：下载阶段点「取消更新」（或点窗口 ✕）即中断下载并清理临时文件，
+    当前版本不受影响；进入「保存新版本」的临界区后不可取消（约 1~2 秒）。
+    """
 
     def __init__(self, parent):
         self.parent = parent
         self.queue = queue.Queue()
         self._closed = False
+        self.cancel = threading.Event()   # 置位 = 用户请求取消
+        self._locked = False              # True = 已进入不可取消的落盘阶段
+        self._cancelling = False          # 已点过取消，正在等下载线程收尾
         self.win = tk.Toplevel(parent)
         self.win.title("更新进度")
         self.win.geometry("480x380")
@@ -717,8 +830,8 @@ class UpdateProgressDialog:
         try:
             self.win.transient(parent)
             self.win.grab_set()
-            # 更新进行中禁止手动关闭，避免中断替换
-            self.win.protocol("WM_DELETE_WINDOW", lambda: None)
+            # ✕ 等同于「取消更新」：下载阶段可中断；临界区/已结束时按实际状态处理
+            self.win.protocol("WM_DELETE_WINDOW", self._on_window_close)
         except Exception:
             pass
         apply_window_icon(self.win)
@@ -751,15 +864,72 @@ class UpdateProgressDialog:
         )
         self.txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 
-        self.btn_close = ttk.Button(
-            self.win, text="关闭", command=self._close, state=tk.DISABLED
+        btn_row = ttk.Frame(self.win)
+        btn_row.pack(pady=(0, 10))
+        self.btn_cancel = ttk.Button(
+            btn_row, text="✖ 取消更新", command=self.request_cancel
         )
-        self.btn_close.pack(pady=(0, 10))
+        self.btn_cancel.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_close = ttk.Button(
+            btn_row, text="关闭", command=self._close, state=tk.DISABLED
+        )
+        self.btn_close.pack(side=tk.LEFT)
 
     def emit(self, **kw):
         self.queue.put(kw)
 
+    # ---- 取消 ----
+    def request_cancel(self):
+        """用户请求取消更新。
+
+        - 下载阶段：对请求置位并禁用按钮，等下载线程清理完临时文件后切成「关闭」。
+        - 落盘阶段 / 已结束：不做中断（前者会留半截 exe，后者无事可取消）。
+        """
+        if self._closed or self._cancelling or self._locked or self.cancel.is_set():
+            return
+        if str(self.btn_cancel["state"]) == "disabled":
+            return
+        self._cancelling = True
+        self.cancel.set()
+        # 按钮置灰并提示，避免重复点击；真正的收尾由工作线程回报后完成
+        try:
+            self.btn_cancel.configure(state=tk.DISABLED, text="正在取消…")
+        except Exception:
+            pass
+        self.stage_var.set("正在取消更新…")
+        self._append("收到取消请求，正在断开下载并清理临时文件…")
+
+    def _on_window_close(self):
+        """点 ✕：能取消就取消（不关窗，等收尾），否则按状态处理。"""
+        if self.btn_close["state"] != "disabled":
+            self._close()
+            return
+        if self._locked:
+            # 落盘临界区：明确告知不打断，避免留下损坏的 exe
+            self._append("正在保存新版本，此步骤无法取消，请稍候…")
+            return
+        if not self._cancelling:
+            self.request_cancel()
+
+    def _finish_cancelled(self):
+        """工作线程确认取消已生效：定稿 UI（保留日志供查看，按钮切成「关闭」）。"""
+        self._cancelling = False
+        self._locked = True          # 关闭一切取消入口
+        self.stage_var.set("已取消更新")
+        try:
+            self.btn_cancel.pack_forget()   # 取消入口消失，只留「关闭」
+        except Exception:
+            pass
+        try:
+            self.btn_close.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+
     def _close(self):
+        # 下载还没断开时，不允许直接关窗（先取消、等收尾）
+        if self._cancelling and not self._locked:
+            self._append("正在取消，请稍候…")
+            return
         if self._closed:
             return
         self._closed = True
@@ -796,12 +966,32 @@ class UpdateProgressDialog:
                 self.speed_var.set(f"{sp / 1024:.1f} KB/s")
         elif t == "detail":
             self._append(ev.get("text", ""))
+        elif t == "lock":
+            # 进入不可取消的落盘阶段
+            self._locked = True
+            try:
+                self.btn_cancel.configure(state=tk.DISABLED, text="保存中…")
+            except Exception:
+                pass
+        elif t == "cancelled":
+            self._finish_cancelled()
         elif t == "done":
             ok = ev.get("ok", False)
-            self.stage_var.set("更新完成，正在切换到新版本…" if ok else "更新失败")
-            self._append("更新完成，即将切换到新版本。" if ok else "更新失败，请重试或手动更新。")
+            cancelled = self.cancel.is_set()
+            self._locked = True          # 收尾阶段不再允许取消
+            if ok:
+                self.stage_var.set("更新完成，正在切换到新版本…")
+                self._append("更新完成，即将切换到新版本。")
+            elif cancelled:
+                self._finish_cancelled()
+            else:
+                self.stage_var.set("更新失败")
+                self._append("更新失败，请重试或手动更新。")
+            try:
+                self.btn_cancel.configure(state=tk.DISABLED)
+            except Exception:
+                pass
             self.btn_close.configure(state=tk.NORMAL)
-            self.win.protocol("WM_DELETE_WINDOW", self._close)
 
     def _append(self, text):
         self.txt.configure(state=tk.NORMAL)
@@ -811,16 +1001,21 @@ class UpdateProgressDialog:
 
 
 def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
-    """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。"""
+    """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。
+
+    取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
+    """
     dlg = UpdateProgressDialog(root)
 
     def _worker():
         def on_event(ev):
             dlg.emit(**ev)
-        ok = perform_update(download_url, version, on_event=on_event)
+        ok = perform_update(download_url, version, on_event=on_event,
+                            cancel=dlg.cancel)
         if ok:
             # 让进度框显示“更新完成”约 1 秒，再关闭主程序交给新版本接管
             root.after(1000, lambda: (dlg._close(), root.destroy()))
+        # 取消 / 失败：什么都不做，主程序与进度框保持可用
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -2577,7 +2772,11 @@ def _cli_test(folder: str, summarize: bool = False) -> None:
 
 
 def _cleanup_legacy_update_artifacts():
-    """清理早期版本（bat / --pending / 备份机制）遗留的临时文件，避免堆积。"""
+    """清理早期版本（bat / --pending / 备份机制）遗留的临时文件，避免堆积。
+
+    另外清理临时目录里的半截更新包（.part）—— 之前若更新被强杀 / 进程卡死，
+    会留下上百 MB 的无用文件且再没人管它。
+    """
     try:
         work_dir = os.path.dirname(sys.executable)
         for name in ("_pending.exe", "_backup.exe", "_replace_in_progress",
@@ -2588,6 +2787,14 @@ def _cleanup_legacy_update_artifacts():
                     os.remove(p)
                 except Exception:
                     pass
+    except Exception:
+        pass
+    # 半截更新包：正被占用（说明有更新在进行）时删不掉，静默跳过即可
+    try:
+        part = os.path.join(tempfile.gettempdir(),
+                            "InvoiceQRDownloader_update.part")
+        if os.path.isfile(part):
+            os.remove(part)
     except Exception:
         pass
 
