@@ -3,7 +3,9 @@
 
 a = Analysis(
     ['invoice_qr_tool.py'],
-    pathex=[],
+    # 主程序按功能拆出了 iqr_net / iqr_summary / iqr_update 三个同级模块，
+    # 显式把 spec 所在目录加进搜索路径，确保它们一定被收进包里。
+    pathex=[SPECPATH],
     binaries=[],
     datas=[('app_icon.ico', '.')],
     hiddenimports=[],

@@ -27,19 +27,40 @@
 import os
 import re
 import sys
-import glob
 import time
 import queue
 import shutil
-import subprocess
-import tempfile
-import datetime
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import requests
+
+# 本地模块（原为本文件的一部分，见各模块 docstring）：
+#   iqr_net     —— 会话管理与下载
+#   iqr_summary —— 发票解析与汇总表写出
+#   iqr_update  —— 自动更新
+from iqr_net import (
+    DEFAULT_WORKERS,
+    CancelToken, PdfNotAvailable, DownloadNetworkError,
+    close_all_sessions, download_pdf,
+)
+from iqr_summary import (
+    parse_invoice, summarize_invoices, _write_summary_excel,
+    # 汇总表的「契约」：列名、标签、工具函数。保留在主程序命名空间里，
+    # 外部脚本与自测一直通过 invoice_qr_tool 访问它们。
+    _SUMMARY_BASE_FIELDS, _SUMMARY_COND_FIELDS, _DEDUCT_FIELDS,
+    _AMOUNT_FIELD, _POOL_FIELD, _TICKET_FIELD, _SEQ_FIELD, SEQ_COL_WIDTH,
+    _AUX_TAG, _AUX_FIRST, _norm_colon, _Pages, _field_search,
+    _normalize_date, _to_num, _inject_formula_cache,
+)
+from iqr_update import (
+    GITHUB_REPO_OWNER, GITHUB_REPO_NAME,
+    _parse_version, _version_str, _derive_base_name,
+    get_latest_release, perform_update, send_to_recycle_bin,
+    _cleanup_legacy_update_artifacts,
+)
+
 
 # 注意：cv2 / numpy / pymupdf / pdfplumber / openpyxl / zxingcpp 等重型依赖
 # 在启动时并不需要（GUI 与更新检查仅用到 tkinter + requests）。它们改为在
@@ -47,6 +68,9 @@ import requests
 # 懒加载由各功能函数内部 import 完成，Python 会缓存已导入模块，重复调用无额外开销。
 
 URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
+# 二维码文本里 URL 后面常紧跟中文标点（如「请访问 https://xxx。」）：这些字符不可能
+# 属于合法 URL，却会被上面那条正则一并吞进去，导致下载失败，故统一削掉尾随标点。
+URL_TAIL_JUNK = "。，、；：！？）】》」”’…"
 
 SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 SUPPORTED_PDF_EXTS = (".pdf",)
@@ -60,24 +84,17 @@ PREFIX_UNRECOGNIZED = "未识别-"  # 未识别到任何二维码
 PREFIX_NOT_DOWNLOADED = "未下载-"  # 识别到网址但无可下载的 PDF
 PREFIX_OTHER = "其它-"           # 其它情况（识别到二维码但内容非网址等）
 
-# 并发设置
-#   每张图片是一个独立任务，由线程池并发执行。绝大多数耗时都在“等网络下载 PDF”上，
-#   这部分 CPU 全程空转，并发收益最大（实测 16 张：串行 2.01s → 6 路 0.40s，约 5×）。
-#   CPU 部分（二维码识别）也能提速（60 张 4.82s → 1.62s，约 3×），因为 zxing/OpenCV
-#   是 C++ 扩展、会释放 GIL。
-#   注意：「汇总发票」阶段的 pdfplumber 解析是纯 Python、被 GIL 锁死，实测并发无收益（1.0×），
-#   所以那里保持串行，不要改成线程池。
-DEFAULT_WORKERS = 6        # 并发路数（对同一发票平台是 6 次并发请求，过低提不上速、过高易被限流）
-DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含首次），仅对网络类错误重试
-RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
+# 二维码识别的内存护栏。zxing-cpp 识别小二维码靠「逐级放大重试」，而放大后的位图是
+# 实体内存（宽 × 高 × 3 字节）：4000×3000 再放大 2× 就是 8000×6000 ≈ 144MB / 张，
+# 6 路并发叠起来接近 1GB，大批量处理时容易把机器拖垮。下面两个上限把单张占用封住：
+#   QR_MAX_SOURCE_PIXELS —— 原图自身超预算就先等比降采样（超大照片 / 扫描件）；
+#   QR_MAX_SCALE_PIXELS  —— 放大后位图的像素预算，据此推导最多放大几倍。
+# 按此规则，小图仍会放大到 4×（与原分级几乎一致），大图则不再做无谓放大。
+QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
+QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.9.0"
-GITHUB_REPO_OWNER = "jianRY"
-GITHUB_REPO_NAME = "invoice-qr-tool"
-GITHUB_LATEST_RELEASE_URL = (
-    f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
-)
+__VERSION__ = "4.10.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -100,10 +117,10 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 6. 可选：处理完成后汇总发票（生成 Excel）。对「PDF」文件夹内所有发票 PDF，
    提取「交款人 / 票据号码 / 开票日期 / 金额合计（小写）/ 医保统筹基金支付」，
    以及「大病保险支付」「医疗救助支付」两类支付栏目（识别到才输出），
-   汇总为「PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx」；金额类列均为纯数字（无千分位、
-   可直接求和与二次计算）。
-   「是否重复」列不再只标「是」，而是**互指行号**（如「与第3、5行重复」），
-   同一票号各有几张、分别在哪几行一眼可见。
+   汇总为「PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx」；最左侧为「序号」列（1、2、3…，
+   配合文件名一眼看出是第几份），金额类列均为纯数字（无千分位、可直接求和与二次计算）。
+   「是否重复」列不再只标「是」，而是**互指序号**（如「与序号3、5重复」），
+   同一票号各有几张、分别是第几份一眼可见（编号与最左「序号」列一致）。
    表格右侧是两块汇总：
    - 左块「统计（剔重后）」：票据张数 / 合计总金额 / 合计总统筹金额 /
      〔合计大病保险支付〕/〔合计医疗救助支付〕/ 可赔付金额
@@ -190,7 +207,8 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 二维码识别使用 zxing-cpp，对截图 / 小二维码会自动多尺度放大，比 OpenCV 自带更稳。
 - 部分发票平台（如 jsczt.cn）打开后是一个展示页，软件会自动提取页面隐藏参数并提交下载接口获取 PDF。
 - 默认 6 路并发。同一平台短时间内并发请求过多可能被限流，若出现较多「未下载」，
-  等几分钟再次点「开始处理」即可（已下载的会自动跳过同名文件、未识别的原图也还在）。
+  等几分钟再次点「开始处理」即可：**已下载且完好的 PDF 会直接复用、不再重新下载**
+  （中途「停止」后再点「开始处理」也是接着跑，不必从头再下一遍），未识别的原图也还在。
 - 「汇总发票」这一步保持单线程：它用 pdfplumber 解析 PDF，属纯 Python 计算，
   并发实测没有收益（1.0×）。
 - 单文件 EXE，无需安装，双击即用。
@@ -198,6 +216,39 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-18  v4.10.0
+- **汇总表新增「序号」列**（放在最左侧）：1、2、3… 与明细行一一对应，配合「文件名」
+  一眼看出是第几份票据。底部「合计」行写在「文件名」列，序号列留空。
+- **「是否重复」列改为互指序号**：如「与序号3、5重复」，编号与最左「序号」列一致
+  （v4.9.0 用的是 Excel 行号，与新的序号列差 2，容易找错行，故一并对齐）。
+- **修复：重跑会全量重新下载** —— 使用说明里一直写着「已下载的会自动跳过同名文件」，
+  但代码里其实每次都会重下一遍。现在真的会复用：文件存在、且确认是完好的 PDF（校验过
+  文件头）才跳过；已经转好的图片也不再重复渲染。结束统计里会多一行「已存在，跳过下载」。
+  中途点过「停止」再点「开始处理」，就能接着处理剩下的，不必再等一遍下载。
+- **修复：处理任务遇上异常会让界面永久卡在「处理中」** —— 文件夹不可读、磁盘满、
+  网络盘掉线等异常原先会让工作线程静默死亡：不复位按钮、不报错，只能重启软件。
+  现在无论发生什么都会正常收尾，并在日志里说明原因。
+- **修复：检查更新存在跨线程操作界面的隐患** —— 检查更新跑在后台线程里，却在其中直接
+  操作窗口（Tkinter 只允许主线程调用），偶发卡死。现改为「后台线程只取版本号，
+  界面动作统一交回主线程执行」，并顺带避免「检查途中用户已开始处理任务还弹更新框」。
+- **加固更新下载**：校验实际下载字节数与 Content-Length 一致、且文件头为 MZ
+  （可执行文件标志），避免把半截文件或拦截页当成新版本装上去；更新线程加兜底，
+  出错也能正常收尾、不会留下关不掉的进度框。
+- 修复：个别票据下载失败时未关闭响应，连接不回连接池，并发重试几轮后请求明显变慢。
+- 修复：文件夹名带方括号（如「2026 发票[1]」）时，汇总会静默跳过（通配符把 [ ] 当字符类）。
+- **修复：点「停止」后进度条会跳满 100%** —— 明明只跑了一半，看起来像整批都处理完了。
+  现在停在真正处理到的位置，并用琥珀色与「已完成」的蓝色区分开；文件夹里没有可处理的图片时，
+  进度条也不再显示成跑满，而是显示「没有需要处理的图片」。
+- **大批量处理更省内存**：二维码识别对小图会逐级放大重试，而 4000×3000 的照片再放大 2 倍，
+  单张位图就要 144MB，6 路并发叠起来接近 1GB。现在按「放大后位图的像素预算」决定放大到几倍
+  —— 小图仍放大到 4 倍（识别能力不变），大图不再做无谓放大，单张占用封顶约 36MB；
+  超大扫描件则先等比降采样再识别，内存峰值不再随图片尺寸失控。
+- 内部重构（不影响功能与输出）：把发票汇总、网络下载、自动更新三块逻辑从主程序里拆成
+  独立模块（iqr_summary / iqr_net / iqr_update），主程序只留界面与流程编排；
+  重复的「响应关闭」与「重名去重」逻辑各合并为一处；发票字段查找改为按页缓存，
+  同一页文本不再被 8 个字段各扫一遍（规范化次数约降为原来的 1/8）。
+- 清理：移除未被调用的死代码与重复导入。
 
 2026-09-18  v4.9.0
 - **汇总表右侧统计区重构为左右两块**（原先是一竖列到底）：
@@ -446,152 +497,6 @@ CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 """
 
 
-
-def _parse_version(tag: str) -> tuple:
-    """把 'v3.0' / '3.0.1' / 'V3' 这类版本号解析成可比较的元组。
-
-    只取前 3 段数字；缺失段补 0。非数字字符全部跳过。"""
-    digits = re.findall(r"\d+", tag or "")
-    nums = [int(x) for x in digits[:3]]
-    while len(nums) < 3:
-        nums.append(0)
-    return tuple(nums)
-
-
-def get_latest_release():
-    """查询 GitHub 最新 Release，返回 (version, download_url, notes) 或 None。
-
-    仅读取公开仓库的 Release 列表，无需任何鉴权 token。
-    发布附件必须命名为 InvoiceQRDownloader_<版本>.exe（ASCII，避免中文名被剥离）。
-    """
-    headers = {"User-Agent": "InvoiceQRDownloader", "Accept": "application/vnd.github+json"}
-    try:
-        resp = requests.get(GITHUB_LATEST_RELEASE_URL, headers=headers, timeout=15)
-    except Exception:
-        return None
-    if resp.status_code != 200:
-        return None
-
-    data = resp.json()
-    tag = data.get("tag_name", "")
-    version = _parse_version(tag)
-    notes = data.get("body", "") or ""
-    download_url = None
-
-    for asset in data.get("assets", []):
-        name = asset.get("name", "")
-        # 只匹配 EXE 主程序附件；按版本号匹配，避免误抓旧版
-        if name.lower().endswith(".exe") and re.sub(r"\W", "", name).lower().startswith(
-            "invoiceqrdownloader"
-        ):
-            if _parse_version(name) == version:
-                download_url = asset.get("browser_download_url")
-                break
-    if not download_url:
-        # 兜底：取第一个 exe 附件
-        for asset in data.get("assets", []):
-            if asset.get("name", "").lower().endswith(".exe"):
-                download_url = asset.get("browser_download_url")
-                break
-
-    if not download_url:
-        return None
-    return version, download_url, notes
-
-
-class _UpdateCancelled(Exception):
-    """用户主动取消更新。
-
-    单独用一个异常类型，是为了让它能穿过 `_download_file` 的兜底 except
-    （那里会把网络类异常统一当作「下载失败」返回 False，取消不能被混为一谈）。"""
-
-
-def _abort_response(resp):
-    """彻底切断一个流式响应。
-
-    ⚠️ 必须**先关原始 socket** 再 close()：requests 在响应体未读尽时调用
-    close()，会尝试先从 socket 读取剩余数据来“补全”，那一步会阻塞住，
-    表现为「点了取消却迟迟不返回」。先 raw.close() 就绕开了这条补全路径。
-    """
-    if resp is None:
-        return
-    try:
-        if getattr(resp, "raw", None) is not None:
-            resp.raw.close()
-    except Exception:
-        pass
-    try:
-        resp.close()
-    except Exception:
-        pass
-
-
-def _download_file(url: str, dest: str, progress_cb=None, cancel=None) -> bool:
-    """带进度回调的下载；返回是否成功。
-
-    cancel: threading.Event；置位则立刻断开连接，并抛出 _UpdateCancelled。
-            半截文件的清理由调用方在最外层 finally 统一负责（见 perform_update），
-            这样无论内部走哪条异常路径，都不会把 .part 留在磁盘上。
-    """
-    headers = {"User-Agent": "InvoiceQRDownloader"}
-    resp = None
-    abort = False
-    try:
-        resp = requests.get(url, headers=headers, stream=True, timeout=60)
-        resp.raise_for_status()
-        total = int(resp.headers.get("Content-Length", 0)) or 0
-        written = 0
-        f = open(dest, "wb")
-        try:
-            for chunk in resp.iter_content(chunk_size=256 * 1024):
-                if cancel is not None and cancel.is_set():
-                    abort = True
-                    raise _UpdateCancelled()
-                if not chunk:
-                    continue
-                f.write(chunk)
-                written += len(chunk)
-                if progress_cb and total:
-                    progress_cb(written, total)
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
-        return True
-    except _UpdateCancelled:
-        abort = True
-        raise
-    except Exception:
-        # 网络类异常统一视为「下载失败」，交由调用方清理 .part
-        abort = True
-        return False
-    finally:
-        if abort:
-            _abort_response(resp)   # 立刻断开，不等连接池回收
-
-
-def _derive_base_name(exe_path: str) -> str:
-    """从当前 exe 文件名推导「基础名」，去掉 .exe 以及末尾已有的 _vX.Y 版本段。
-
-    例：发票二维码工具.exe -> 发票二维码工具；发票二维码工具_v3.4.exe -> 发票二维码工具。
-    """
-    name = os.path.basename(exe_path)
-    if name.lower().endswith(".exe"):
-        name = name[:-4]
-    # 去掉末尾可能的 _v 版本段（如 _v3.4 / _v3.4.1）
-    name = re.sub(r"_v\d+(?:\.\d+)*$", "", name, flags=re.IGNORECASE)
-    return name or "发票二维码工具"
-
-
-def _version_str(version: tuple) -> str:
-    """把版本元组格式化成三段式字符串。 (4,7,0)->'4.7.0'；(4,6,1)->'4.6.1'。"""
-    parts = [str(x) for x in version][:3]
-    while len(parts) < 3:
-        parts.append("0")
-    return ".".join(parts)
-
-
 def _resource_path(relative: str) -> str:
     """获取打包后 / 开发时资源文件的绝对路径（用于图标等）。"""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -640,6 +545,10 @@ def apply_window_icon(win) -> None:
         user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
                                         ctypes.c_void_p, ctypes.c_void_p]
         user32.SendMessageW.restype = ctypes.c_void_p
+        # ⚠️ 必须显式声明 argtypes / restype：ctypes 默认把返回值当 c_int，
+        #    64 位下窗口句柄一旦超过 2^31 就被截断成无效句柄，图标会静默设置失败。
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
         win.update_idletasks()
         hwnd = user32.GetAncestor(win.winfo_id(), 2)   # GA_ROOT = 2
         if not hwnd:
@@ -654,194 +563,6 @@ def apply_window_icon(win) -> None:
         pass
 
 
-def send_to_recycle_bin(path: str) -> bool:
-    """把文件移动到回收站（而非彻底删除），便于误删后恢复。返回是否成功。
-
-    使用 Windows Shell 的 SHFileOperation 并带 FOF_ALLOWUNDO 标志，即“删除到回收站”。
-    非 Windows 平台或操作失败均返回 False（调用方据此决定是否保留旧文件）。
-    """
-    if not os.path.exists(path):
-        return True
-    if sys.platform != "win32":
-        try:
-            os.remove(path)
-            return True
-        except Exception:
-            return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        FO_DELETE = 0x0003
-        FOF_ALLOWUNDO = 0x0040
-        FOF_NOCONFIRMATION = 0x0010
-        FOF_SILENT = 0x0004
-        FOF_NOERRORUI = 0x0400
-
-        class SHFILEOPSTRUCTW(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", wintypes.HWND),
-                ("wFunc", wintypes.UINT),
-                ("pFrom", wintypes.LPCWSTR),
-                ("pTo", wintypes.LPCWSTR),
-                ("fFlags", wintypes.UINT),
-                ("fAnyOperationsAborted", wintypes.BOOL),
-                ("hNameMappings", wintypes.LPVOID),
-                ("lpszProgressTitle", wintypes.LPCWSTR),
-            ]
-
-        from_buf = ctypes.create_unicode_buffer(path + "\0")
-        op = SHFILEOPSTRUCTW()
-        op.hwnd = 0
-        op.wFunc = FO_DELETE
-        op.pFrom = ctypes.cast(from_buf, wintypes.LPCWSTR)
-        op.pTo = None
-        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-        op.fAnyOperationsAborted = 0
-        op.hNameMappings = None
-        op.lpszProgressTitle = None
-        res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-        # 某些环境下 SHFileOperation 会返回非 0（如 fAnyOperationsAborted），
-        # 但文件实际已被移入回收站 / 删除。以“原路径是否已不存在”作为最终成功判据。
-        return res == 0 or not os.path.exists(path)
-    except Exception:
-        return False
-
-
-def perform_update(download_url: str, latest_version: tuple, on_event=None,
-                   cancel=None) -> bool:
-    """下载 GitHub 最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
-    并把旧的 EXE 移动到回收站。
-
-    流程（cancel 只在能干净收尾的阶段生效）：
-      ① 下载 → 可取消：立刻断开、删除半截 .part，等于什么都没发生；
-      ② 下载完成后的落盘 / 原子移动（约 1~2 秒内）→ **不可取消**，
-         此时打断可能留下损坏的 exe，故只提示「正在保存，请稍候」；
-      ③ 新版本已启动 → 既成事实，无法回退。
-
-    参数：
-      cancel: threading.Event；置位表示用户点了「取消更新」。
-    返回：是否成功触发替换（取消 / 失败均返回 False）。
-    """
-    def emit(ev):
-        if on_event:
-            on_event(ev)
-
-    def _cancelled() -> bool:
-        return cancel is not None and cancel.is_set()
-
-    emit({"type": "stage", "text": "正在下载新版本…"})
-    tmp_dir = tempfile.gettempdir()
-    part = os.path.join(tmp_dir, "InvoiceQRDownloader_update.part")
-    try:
-        if os.path.exists(part):
-            os.remove(part)
-    except Exception:
-        pass
-
-    # 计算下载速度（基于相邻两次进度回调的时间差）
-    _last_t = [time.time()]
-    _last_w = [0]
-
-    def _prog(written, total):
-        now = time.time()
-        dt = now - _last_t[0]
-        if dt <= 0:
-            dt = 0.001
-        speed = (written - _last_w[0]) / dt
-        _last_t[0] = now
-        _last_w[0] = written
-        emit({"type": "progress", "written": written, "total": total, "speed": speed})
-
-    def _cleanup_part():
-        """删除半截 .part（取消 / 下载失败共用；删除失败不影响主流程）。"""
-        try:
-            if os.path.exists(part):
-                os.remove(part)
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _emit_cancelled(extra):
-        _cleanup_part()
-        emit({"type": "detail", "text": extra})
-        emit({"type": "detail", "text": "当前版本保持不变，软件可继续正常使用。"})
-        emit({"type": "cancelled"})
-        emit({"type": "done", "ok": False})
-
-    # ---- ① 下载（可取消）----
-    try:
-        if not _download_file(download_url, part, progress_cb=_prog, cancel=cancel):
-            _cleanup_part()
-            emit({"type": "detail", "text": "下载失败：无法获取更新文件，请稍后重试或手动更新。"})
-            emit({"type": "done", "ok": False})
-            return False
-    except _UpdateCancelled:
-        _emit_cancelled("已取消更新：下载已中断，临时文件已清理。")
-        return False
-
-    if _cancelled():
-        # 极端情形：刚好在下载结束时点取消，同样干净收尾
-        _emit_cancelled("已取消更新：临时文件已清理。")
-        return False
-
-    # ---- ② 落盘（临界区，不可取消）----
-    size_mb = os.path.getsize(part) / 1048576
-    emit({"type": "detail", "text": f"下载完成（{size_mb:.1f} MB），正在保存到原目录…"})
-    emit({"type": "stage", "text": "下载完成，正在保存新版本（此步请稍候，无法取消）…"})
-    emit({"type": "lock"})   # 通知 UI 禁用「取消更新」
-
-    try:
-        current_exe = sys.executable  # 当前 EXE 自身路径（打包后）
-        target_dir = os.path.dirname(current_exe)
-        base = _derive_base_name(current_exe)
-        ver = _version_str(latest_version)
-        new_exe = os.path.join(target_dir, f"{base}_v{ver}.exe")
-
-        # 若同名新文件已存在（理论上应为更高版本），先移除再落入
-        if os.path.exists(new_exe):
-            try:
-                os.remove(new_exe)
-            except Exception:
-                pass
-
-        # 同盘原子移动（比跨盘 copy 快且不会残留半截文件）；跨盘则回退到 move
-        try:
-            os.replace(part, new_exe)
-        except Exception:
-            import shutil
-            shutil.move(part, new_exe)
-
-        emit({"type": "detail",
-              "text": f"新版本已保存为：{os.path.basename(new_exe)}"})
-        emit({"type": "detail",
-              "text": "旧版本将被移入回收站；软件即将切换到新版本…"})
-        emit({"type": "done", "ok": True})
-
-        # 启动新版本并把“当前（旧）exe 路径”交给它回收；随后退出旧进程，
-        # 交由新进程在旧进程释放文件后把旧 exe 移入回收站。
-        try:
-            subprocess.Popen(
-                [new_exe, "--recycle-old", current_exe],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except Exception as e:
-            emit({"type": "detail",
-                  "text": f"启动新版本失败：{e}，旧版本仍保留，可手动打开新文件。"})
-            emit({"type": "detail",
-                  "text": f"新版本文件已保存在：{new_exe}"})
-            emit({"type": "done", "ok": False})
-            return False
-    except Exception as e:
-        emit({"type": "detail", "text": f"保存新版本失败：{e}"})
-        emit({"type": "done", "ok": False})
-        return False
-
-
 class UpdateProgressDialog:
     """更新进度框：展示阶段、进度条、下载速度、已下载大小与详细日志。
 
@@ -849,8 +570,9 @@ class UpdateProgressDialog:
     当前版本不受影响；进入「保存新版本」的临界区后不可取消（约 1~2 秒）。
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent, on_success=None):
         self.parent = parent
+        self.on_success = on_success     # 更新成功、切换新版本前由主线程调用
         self.queue = queue.Queue()
         self._closed = False
         self.cancel = threading.Event()   # 置位 = 用户请求取消
@@ -971,6 +693,15 @@ class UpdateProgressDialog:
         except Exception:
             pass
 
+    def _switch(self):
+        """更新成功：关掉进度框，再把「切换到新版本」交给调用方（主线程内执行）。"""
+        self._close()
+        if self.on_success:
+            try:
+                self.on_success()
+            except Exception:
+                pass
+
     def _poll(self):
         try:
             while True:
@@ -1015,6 +746,13 @@ class UpdateProgressDialog:
             if ok:
                 self.stage_var.set("更新完成，正在切换到新版本…")
                 self._append("更新完成，即将切换到新版本。")
+                if self.on_success is not None:
+                    # 先让进度框显示约 1 秒再切换。⚠️ 必须由**主线程**排定（Tkinter 只能在
+                    # 主线程调用）：原先是在下载线程里直接 root.after(...)，属跨线程碰 Tk。
+                    try:
+                        self.win.after(1000, self._switch)
+                    except tk.TclError:
+                        pass
             elif cancelled:
                 self._finish_cancelled()
             else:
@@ -1038,17 +776,20 @@ def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
 
     取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
     """
-    dlg = UpdateProgressDialog(root)
+    # 「更新成功后退出主程序」由进度框在主线程里回调完成（见 UpdateProgressDialog._switch），
+    # 不要在下载线程里直接碰 Tk。
+    dlg = UpdateProgressDialog(root, on_success=root.destroy)
 
     def _worker():
         def on_event(ev):
-            dlg.emit(**ev)
-        ok = perform_update(download_url, version, on_event=on_event,
-                            cancel=dlg.cancel)
-        if ok:
-            # 让进度框显示“更新完成”约 1 秒，再关闭主程序交给新版本接管
-            root.after(1000, lambda: (dlg._close(), root.destroy()))
-        # 取消 / 失败：什么都不做，主程序与进度框保持可用
+            dlg.emit(**ev)          # emit 只入队，由主线程 _poll 消费
+        try:
+            perform_update(download_url, version, on_event=on_event, cancel=dlg.cancel)
+        except Exception as e:
+            # 兜底：工作线程异常退出就再没人报 done，进度框会卡在「不可关闭」状态
+            dlg.emit({"type": "detail", "text": f"更新过程出错：{e}"})
+            dlg.emit({"type": "done", "ok": False})
+        # 成功 / 取消 / 失败：界面收尾一律由主线程根据事件完成
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1057,6 +798,18 @@ def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
 _update_dialog_open = threading.Event()
 # 处理任务是否正在进行（进行中就不再弹更新提示，免得打断用户）
 _PROCESSING = threading.Event()
+
+# 后台线程 → 主线程的回调队列（见 _ui_post / InvoiceQrToolApp._pump_ui）
+_UI_QUEUE: "queue.Queue" = queue.Queue()
+
+
+def _ui_post(root, fn):
+    """把回调排到**主线程**执行（后台线程调用，本身不碰 Tk）。
+
+    ⚠️ Tkinter 只能在创建它的线程（主线程）里调用。更新检查跑在后台线程，绝不能直接
+    ``root.after`` / ``messagebox`` —— 那属于跨线程操作 Tk，可能偶发卡死或崩溃。
+    """
+    _UI_QUEUE.put(fn)
 
 
 def _begin_update_check() -> bool:
@@ -1071,80 +824,63 @@ def _end_update_check():
     _update_dialog_open.clear()
 
 
-def check_and_prompt_update(root: tk.Tk):
-    """后台检查更新，若有新版本则弹窗询问是否更新。供 UI 按钮调用。"""
-    if not _begin_update_check():
-        return
-    scheduled = False
+def _handle_update_result(root: tk.Tk, result, manual: bool):
+    """**主线程**：按检查结果显示提示 / 询问是否更新，最后释放检查锁。"""
     try:
-        result = get_latest_release()
         if not result:
-            root.after(0, lambda: messagebox.showinfo(
-                "检查更新", "暂时无法连接到更新服务器（或当前已是最新）。"))
+            if manual:
+                messagebox.showinfo(
+                    "检查更新", "暂时无法连接到更新服务器（或当前已是最新）。")
             return
         version, download_url, notes = result
         if version <= _parse_version(__VERSION__):
-            root.after(0, lambda: messagebox.showinfo(
-                "检查更新", f"当前已是最新版本 v{__VERSION__}。"))
+            if manual:
+                messagebox.showinfo("检查更新", f"当前已是最新版本 v{__VERSION__}。")
             return
-
+        if not manual and _PROCESSING.is_set():
+            # 等网络返回这段时间里用户可能已经点了「开始处理」，那就别打断他了
+            return
         note_text = notes.strip() or "（无更新说明）"
-
-        def _ask():
-            try:
-                ask = messagebox.askyesno(
-                    "发现新版本",
-                    f"发现新版本 v{'.'.join(map(str, version))}，当前为 v{__VERSION__}。\n\n"
-                    f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
-                )
-                if ask:
-                    _start_update_flow(root, download_url, version)
-            finally:
-                _end_update_check()
-
-        root.after(0, _ask)
-        scheduled = True
+        ok = messagebox.askyesno(
+            "发现新版本",
+            f"发现新版本 v{'.'.join(map(str, version))}，当前为 v{__VERSION__}。\n\n"
+            f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
+        )
+        if ok:
+            _start_update_flow(root, download_url, version)
     finally:
-        # 只有确实排定了弹窗时才由 _ask 负责释放，否则这里立刻释放
-        if not scheduled:
-            _end_update_check()
+        _end_update_check()
+
+
+def _check_update_async(root: tk.Tk, manual: bool = False):
+    """后台线程：只负责「取版本号」，界面动作交回主线程。
+
+    可从任意线程调用（内部自己起线程），手动 / 静默两种模式共用一个实现。
+    """
+    if manual:
+        if not _begin_update_check():
+            return
+    elif _PROCESSING.is_set() or not _begin_update_check():
+        return
+
+    def _worker():
+        try:
+            result = get_latest_release()
+        except Exception:
+            result = None
+        _ui_post(root, lambda: _handle_update_result(root, result, manual))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def check_and_prompt_update(root: tk.Tk):
+    """检查更新，若有新版本则弹窗询问是否更新。供 UI 按钮调用。"""
+    _check_update_async(root, manual=True)
 
 
 def _silent_startup_check(root: tk.Tk):
     """启动后静默检查更新；发现新版本且用户确认则更新。"""
-    if _PROCESSING.is_set():
-        return
-    if not _begin_update_check():
-        return
-    scheduled = False
-    try:
-        result = get_latest_release()
-        if not result:
-            return
-        version, download_url, notes = result
-        if version <= _parse_version(__VERSION__):
-            return
-
-        def _ask():
-            try:
-                note_text = notes.strip() or "（无更新说明）"
-                ok = messagebox.askyesno(
-                    "发现新版本",
-                    f"发现新版本 v{'.'.join(map(str, version))}，当前为 v{__VERSION__}。\n\n"
-                    f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
-                )
-                if ok:
-                    _start_update_flow(root, download_url, version)
-            finally:
-                _end_update_check()
-
-        root.after(0, _ask)
-        scheduled = True
-    except Exception:
-        pass
-    finally:
-        if not scheduled:
-            _end_update_check()
+    _check_update_async(root, manual=False)
 
 
 def detect_qr_codes(image_path: str):
@@ -1163,18 +899,26 @@ def detect_qr_codes(image_path: str):
     if img is None:
         return []
 
+    h, w = img.shape[:2]
+    # ① 原图本身就超预算时先等比降采样。
+    # zxing 对小二维码靠「放大重试」，放大后的位图是实体内存（宽×高×3 字节），
+    # 而超大扫描件/照片单张原图就有几百 MB；缩到预算内再识别，二维码本身仍然够大。
+    if h * w > QR_MAX_SOURCE_PIXELS:
+        k = (QR_MAX_SOURCE_PIXELS / float(h * w)) ** 0.5
+        img = cv2.resize(
+            img, (max(1, int(w * k)), max(1, int(h * k))),
+            interpolation=cv2.INTER_AREA,
+        )
+        h, w = img.shape[:2]
+
     codes = []
 
     # 1. zxing-cpp 识别能力更强，先尝试；对小二维码会自动多尺度放大重试
     if zxingcpp is not None:
-        h, w = img.shape[:2]
-        max_dim = max(h, w)
-        if max_dim < 800:
-            scales = [1, 2, 3, 4]
-        elif max_dim < 1600:
-            scales = [1, 2, 3]
-        else:
-            scales = [1, 2]
+        # ② 放大到几倍，由「放大后位图的像素预算」推导，而不是只看原图长边：
+        #    小图照样能放大到 4×，大图则不再无谓放大，单张占用有上限。
+        scales = [s for s in (1, 2, 3, 4)
+                  if h * w * s * s <= QR_MAX_SCALE_PIXELS] or [1]
 
         for scale in scales:
             if scale == 1:
@@ -1224,45 +968,19 @@ def detect_qr_codes(image_path: str):
 
 
 def is_url(text: str) -> str | None:
-    """若文本包含 URL，返回提取到的完整 URL；否则返回 None"""
+    """若文本包含 URL，返回提取到的完整 URL（已削掉尾随中文标点）；否则返回 None"""
     match = URL_RE.search(text)
-    return match.group(0) if match else None
-
-
-# ---------------------------------------------------------------- 并发基础设施
-
-
-class CancelToken:
-    """跨线程的「停止」标志。
-
-    主线程点「停止」时调用 cancel()；各工作线程在开始处理下一张图片前检查 cancelled，
-    尚未开始的任务会被快速取消。已经发出的网络请求无法中途打断，会自然收尾（≤ 超时时间）。
-    """
-
-    def __init__(self):
-        self._event = threading.Event()
-
-    def cancel(self):
-        self._event.set()
-
-    @property
-    def cancelled(self) -> bool:
-        return self._event.is_set()
-
-
-class PdfNotAvailable(RuntimeError):
-    """网址可达，但确实拿不到 PDF（业务性失败，重试没有意义）。"""
-
-
-class DownloadNetworkError(RuntimeError):
-    """网络类失败（超时、连接被重置等），值得重试。"""
+    if not match:
+        return None
+    url = match.group(0).rstrip(URL_TAIL_JUNK)
+    return url or None
 
 
 class _TaskCtx:
     """并发任务共享的**只读**上下文。刻意不含任何会被写入的共享状态，
     这样多个线程并发处理时就不存在统计竞态。"""
 
-    __slots__ = ("folder", "pdf_dir", "img_dir", "convert_pdf", "cancel", "log_queue")
+    __slots__ = ("folder", "pdf_dir", "img_dir", "convert_pdf", "cancel")
 
     def __init__(self, folder, pdf_dir, img_dir, convert_pdf, cancel):
         self.folder = folder
@@ -1270,47 +988,28 @@ class _TaskCtx:
         self.img_dir = img_dir
         self.convert_pdf = convert_pdf
         self.cancel = cancel if cancel is not None else CancelToken()
-        self.log_queue = None  # 需要即时输出（如「开始处理」心跳）时由 process_folder 注入
 
 
-# 每个线程复用自己的 requests.Session（连接池复用，省掉每张发票重复的 TLS 握手）。
-# requests.Session 并非线程安全，所以按线程隔离，而不是全局共享同一个。
-_thread_local = threading.local()
-_sessions_lock = threading.Lock()
-_all_sessions: list = []
+def _next_free(used: set, first: str, alt: str | None = None, make=None) -> str:
+    """在 ``used``（小写名字集合）中取一个未被占用的名字，并登记到 ``used``。
 
+    先试 ``first``；冲突且给了 ``alt`` 就改试 ``alt``；仍然冲突则依次用 ``make(i)``
+    （i 从 2 起）生成候选，直到不冲突。默认在命中候选后追加 ``_i``。
 
-def _get_session() -> requests.Session:
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=DEFAULT_WORKERS * 2,
-            pool_maxsize=DEFAULT_WORKERS * 2,
-            max_retries=0,  # 重试由 download_pdf 自己控制，避免双重重试放大请求量
-        )
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        _thread_local.session = session
-        with _sessions_lock:
-            _all_sessions.append(session)
-    return session
-
-
-def close_all_sessions():
-    """任务结束后关闭各线程的 Session，释放连接。
-
-    （关闭后的 Session 仍可继续使用，requests 会在需要时重建连接池，
-    所以这里不需要额外清理线程局部变量。）
+    编号放在哪儿由调用方决定，所以这个内核能同时服务两种场景：
+      - ``_unique_out_bases``：编号加在末尾（``a_jpg`` → ``a_jpg_2``）；
+      - ``_unique_path``：编号插在扩展名之前（``x.jpg`` → ``x_2.jpg``）。
     """
-    with _sessions_lock:
-        sessions = list(_all_sessions)
-        _all_sessions.clear()
-    for s in sessions:
-        try:
-            s.close()
-        except Exception:
-            pass
+    cand = first
+    if cand.lower() in used and alt is not None:
+        cand = alt
+    if cand.lower() in used:
+        base, i = cand, 1
+        while cand.lower() in used:
+            i += 1
+            cand = make(i) if make is not None else f"{base}_{i}"
+    used.add(cand.lower())
+    return cand
 
 
 def _unique_out_bases(files: list) -> dict:
@@ -1320,150 +1019,13 @@ def _unique_out_bases(files: list) -> dict:
     `PDF/a.pdf`。串行处理时是"后覆盖前"，并发时会变成**两个线程同时写同一个文件 → 文件损坏**。
     这里预先给冲突的名字追加扩展名（再冲突就加序号）来消解。
     """
-    used = set()
+    used: set = set()
     mapping = {}
     for fname in files:
         stem, ext = os.path.splitext(fname)
-        candidate = stem
-        if candidate.lower() in used:
-            candidate = f"{stem}_{ext.lstrip('.').lower()}"
-        n = 2
-        while candidate.lower() in used:
-            candidate = f"{stem}_{ext.lstrip('.').lower()}_{n}"
-            n += 1
-        used.add(candidate.lower())
-        mapping[fname] = candidate
+        tag = ext.lstrip(".").lower()
+        mapping[fname] = _next_free(used, stem, alt=f"{stem}_{tag}")
     return mapping
-
-
-def _looks_like_pdf(response: requests.Response) -> bool:
-    """判断响应体是不是 PDF。
-
-    优先看 Content-Type，兜底再看开头 4 个字节。
-    ⚠️ 这里**不能**用 `response.content`：stream=True 的响应一旦读 `.content`，
-    会把整个响应体一次性拉进内存，白耗内存、也失去了流式下载的意义。
-    `raw.peek()` 只取缓冲区里已有的前几个字节，不会消费 body。
-    """
-    if "pdf" in response.headers.get("Content-Type", "").lower():
-        return True
-    try:
-        head = response.raw.peek(5)
-    except Exception:
-        return False
-    return head.lstrip()[:4] == b"%PDF"
-
-
-def _save_response(response: requests.Response, save_path: str) -> None:
-    """流式写入目标文件。
-
-    先写 `<目标>.part` 再 `os.replace` 原子替换：这样下载中途失败时不会在「PDF」目录里
-    留下半截的损坏 PDF（并发时尤其重要，半截文件很容易被误当成功结果）。
-    """
-    tmp_path = save_path + ".part"
-    try:
-        with open(tmp_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if chunk:
-                    f.write(chunk)
-        os.replace(tmp_path, save_path)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        raise
-
-
-def _download_once(url: str, save_path: str, timeout: int, session: requests.Session) -> None:
-    """单次下载尝试。
-
-    失败时区分两类，交给上层决定要不要重试：
-    - DownloadNetworkError：网络类问题（超时 / 连接被重置等）→ 值得重试；
-    - PdfNotAvailable   ：网址能打开但确实拿不到 PDF → 重试无意义。
-    """
-    from urllib.parse import urljoin
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    try:
-        resp = session.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise DownloadNetworkError(f"访问网址失败：{e}") from e
-
-    if _looks_like_pdf(resp):
-        _save_response(resp, save_path)
-        return
-
-    # 若是 HTML 页面，尝试找隐藏表单域并提交下载
-    ct = resp.headers.get("Content-Type", "").lower()
-    if "html" in ct:
-        try:
-            html = resp.text
-        except requests.RequestException as e:
-            raise DownloadNetworkError(f"读取页面内容失败：{e}") from e
-
-        hidden_inputs = re.findall(r"<input[^>]+type=[\"']hidden[\"'][^>]*>", html, flags=re.IGNORECASE)
-        fields = {}
-        for tag in hidden_inputs:
-            name_match = re.search("name=['\"]([^'\"]+)['\"]", tag, flags=re.IGNORECASE)
-            value_match = re.search("value=['\"]([^'\"]*)['\"]", tag, flags=re.IGNORECASE)
-            if name_match:
-                fields[name_match.group(1)] = value_match.group(1) if value_match else ""
-
-        if "idBase" in fields:
-            download_url = urljoin(resp.url, "/download")
-            try:
-                dl_resp = session.post(
-                    download_url, data=fields, headers=headers, timeout=timeout, stream=True
-                )
-                dl_resp.raise_for_status()
-            except requests.RequestException as e:
-                raise DownloadNetworkError(f"提交下载接口失败：{e}") from e
-
-            if _looks_like_pdf(dl_resp):
-                _save_response(dl_resp, save_path)
-                return
-            raise PdfNotAvailable(f"下载接口返回的不是 PDF：{dl_resp.text[:200]}")
-
-    raise PdfNotAvailable("该网址没有直接返回 PDF，也未找到可下载的隐藏表单")
-
-
-def download_pdf(
-    url: str,
-    save_path: str,
-    timeout: int = 60,
-    session: requests.Session | None = None,
-    retries: int = DOWNLOAD_RETRIES,
-) -> None:
-    """下载 URL 指向的内容并保存为 PDF。
-
-    支持两种常见情况：
-    1. URL 直接返回 PDF 流；
-    2. URL 返回发票展示页，页面里包含 name='idBase' 等隐藏域，
-       此时自动提取并 POST 到 /download 获取 PDF。
-
-    网络类失败会按 RETRY_BACKOFF 指数退避重试（默认 2 次）：一次网络抖动不该让发票
-    被误判成「未下载」而要求人工重跑。「网址可达但没有 PDF」属业务性失败，不重试。
-    """
-    sess = session if session is not None else _get_session()
-    last_err: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            _download_once(url, save_path, timeout, sess)
-            return
-        except DownloadNetworkError as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-    raise last_err if last_err is not None else PdfNotAvailable("下载失败")
 
 
 def convert_pdf_to_images(
@@ -1512,597 +1074,9 @@ def convert_pdf_to_images(
     return generated
 
 
-# =====================================================================
-# 发票汇总模块（来自“汇总票据”会话的 invoice_summary.py，集成到此工具）
-# 针对江苏省医疗门诊收费票据 / 电子票据，提取关键字段并汇总到 Excel。
-# =====================================================================
-
-def _norm_colon(s: str) -> str:
-    """把全角冒号统一成半角，便于匹配标签。"""
-    return s.replace("：", ":")
-
-
-def _extract_field(words, label, gather_line=False):
-    """在单页 words 中查找包含 label 的词，返回其后的取值。"""
-    labeln = _norm_colon(label)
-    for w in words:
-        tn = _norm_colon(w["text"])
-        idx = tn.find(labeln)
-        if idx != -1:
-            val = tn[idx + len(labeln):].strip()
-            if gather_line:
-                line_words = [x for x in words
-                              if abs(x["top"] - w["top"]) < 3 and x["x0"] > w["x0"]]
-                line_words.sort(key=lambda x: x["x0"])
-                val = (val + "".join(x["text"] for x in line_words)).strip()
-            return val
-    return None
-
-
-def _field_search(pages_words, candidates):
-    """跨页查找字段。candidates: [(label, gather_line), ...]。"""
-    for words in pages_words:
-        for label, gather in candidates:
-            v = _extract_field(words, label, gather)
-            if v:
-                return v
-    return None
-
-
-def _normalize_date(s):
-    if not s:
-        return ""
-    s = s.strip()
-    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", s)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    return s
-
-
-def _extract_number(s):
-    if not s:
-        return None
-    txt = str(s).replace(",", "").replace("，", "")  # 去除千分位逗号（中英文）
-    m = re.search(r"-?\d+(?:\.\d+)?", txt)
-    return m.group(0) if m else None
-
-
-def _to_num(s):
-    """把金额/统筹字符串转成 float（写入 Excel 后即为数字，可被 SUM 计算）。
-
-    支持千位分隔符（英文逗号与中文逗号），例如 "1,234.56" / "1，234.56"
-    会正确解析为 1234.56（之前遇到逗号会把金额截断，只识别到 "1"）。
-    返回 float 或 None（缺失/无法解析时）。数字一律非负，便于求和统计。
-    """
-    if s is None:
-        return None
-    if isinstance(s, (int, float)):
-        return float(s)
-    txt = str(s).replace(",", "").replace("，", "")  # 去除千分位逗号（中英文）
-    m = re.search(r"-?\d+(?:\.\d+)?", txt)
-    if not m:
-        return None
-    try:
-        return float(m.group(0))
-    except ValueError:
-        return None
-
-
-# ---- 中文大写金额解析（小写解析失败时的兜底/校验）----
-_CN_DIGITS = {
-    "零": 0, "〇": 0, "一": 1, "壹": 1, "二": 2, "贰": 2, "两": 2,
-    "三": 3, "叁": 3, "四": 4, "肆": 4, "五": 5, "伍": 5, "六": 6,
-    "陆": 6, "七": 7, "柒": 7, "八": 8, "捌": 8, "九": 9, "玖": 9,
-}
-_CN_UNITS = {
-    "十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000,
-    "万": 10000, "萬": 10000, "亿": 100000000,
-}
-
-
-def _cn_section_to_num(s: str) -> int:
-    """解析不含「万/亿」的中文数字段为整数。"""
-    total = 0
-    section = 0
-    number = 0
-    for ch in s:
-        if ch in _CN_DIGITS:
-            number = _CN_DIGITS[ch]
-        elif ch in _CN_UNITS:
-            unit = _CN_UNITS[ch]
-            if unit >= 10000:
-                section = (section + number) * unit
-                total += section
-                section = 0
-                number = 0
-            else:
-                section += number * unit
-                number = 0
-    total += section + number
-    return total
-
-
-def _cn_capital_to_num(text):
-    """把「金额合计（大写）」的中文大写金额解析为 float。
-    仅用作小写金额解析失败时的兜底；无法解析返回 None。"""
-    if not text:
-        return None
-    t = text.replace(" ", "").replace("整", "").replace("正", "")
-    int_part = t
-    dec_part = ""
-    m = re.search(r"[元圆]", t)
-    if m:
-        int_part = t[:m.start()]
-        dec_part = t[m.end():]
-    dec_val = 0.0
-    jiao = re.search(r"([零壹贰叁肆伍陆柒捌玖一二三四五六七八九])角", dec_part)
-    if jiao:
-        dec_val += _CN_DIGITS.get(jiao.group(1), 0) * 0.1
-    fen = re.search(r"([零壹贰叁肆伍陆柒捌玖一二三四五六七八九])分", dec_part)
-    if fen:
-        dec_val += _CN_DIGITS.get(fen.group(1), 0) * 0.01
-    if dec_val == 0.0 and dec_part:
-        dm = re.search(r"\d+", dec_part)
-        if dm:
-            dec_val = float(dm.group(0)) / 100.0
-    int_val = _cn_section_to_num(int_part)
-    if int_val == 0 and dec_val == 0.0:
-        return None
-    return int_val + dec_val
-
-
-def parse_invoice(pdf_path):
-    """解析单个 PDF，返回 (字段字典, 错误信息或 None)。"""
-    import pdfplumber  # 懒加载：仅在汇总时才需要
-
-    fields = {
-        "交款人": None,
-        "票据号码": None,
-        "开票日期": None,
-        "金额合计（小写）": None,
-        "医保统筹基金支付": None,
-        "大病保险支付": None,
-        "医疗救助支付": None,
-    }
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pages_words = [page.extract_words() for page in pdf.pages]
-    except Exception as e:
-        return fields, f"打开失败: {e}"
-
-    fields["交款人"] = _field_search(pages_words, [("交款人：", False)])
-    fields["票据号码"] = _field_search(
-        pages_words, [("票据号码：", False), ("所属电子票据号码:", False)])
-    raw_date = _field_search(pages_words, [("开票日期：", True)])
-    fields["开票日期"] = _normalize_date(raw_date) if raw_date else None
-    raw_amount = _field_search(pages_words, [("小写", False)])
-    lower = _to_num(raw_amount) if raw_amount else None
-    # 小写解析失败时，用「金额合计（大写）」兜底，避免金额漏识别
-    if lower is None:
-        raw_upper = _field_search(pages_words, [("大写", False)])
-        upper = _cn_capital_to_num(raw_upper) if raw_upper else None
-        if upper is not None:
-            lower = upper
-    fields["金额合计（小写）"] = lower
-    fields["医保统筹基金支付"] = _to_num(
-        _field_search(pages_words, [("医保统筹基金支付：", False)]))
-    # 大病保险支付：与「医保统筹基金支付」同属票据右下角的基金支付区，
-    # 版式与取值规则一致，故用同样的方式识别（全角/半角冒号由 _norm_colon 统一）。
-    # 识别到该栏（含 0.00）即记为数值；整份票据没有这一栏时为 None，
-    # 汇总表据此决定是否输出该列 —— 没识别到就整体忽略，不留空列。
-    fields["大病保险支付"] = _to_num(
-        _field_search(pages_words, [("大病保险支付：", False)]))
-    # 医疗救助支付：同区块、同版式，同样处理（识别到 0.00 也算"有这一类目"）
-    fields["医疗救助支付"] = _to_num(
-        _field_search(pages_words, [("医疗救助支付：", False)]))
-
-    return fields, None
-
-
-# ---- 汇总表列定义 ----
-# 固定列：无论票据有无该类目都会输出
-_SUMMARY_BASE_FIELDS = ["文件名", "交款人", "票据号码", "开票日期",
-                        "金额合计（小写）", "医保统筹基金支付"]
-# 条件列：**识别到该类目才输出**（本批票据一张都没识别到 → 该列连同其汇总项整体省略）。
-# 顺序即列序。将来再加新类目：这里加个名字 + parse_invoice 里取值即可，其余全自动。
-_SUMMARY_COND_FIELDS = ["大病保险支付", "医疗救助支付"]
-# 参与「可赔付金额」扣减的支付类字段：凡出现在表里的都要从合计总金额中减去
-# （这些钱由医保基金 / 商业保险 / 医疗救助支付，患者并未实际支出）
-_DEDUCT_FIELDS = ["医保统筹基金支付", "大病保险支付", "医疗救助支付"]
-_SUMMARY_ALL_FIELDS = _SUMMARY_BASE_FIELDS + _SUMMARY_COND_FIELDS
-_AMOUNT_FIELD = "金额合计（小写）"
-_POOL_FIELD = "医保统筹基金支付"
-_TICKET_FIELD = "票据号码"
-_AUX_TAG = "重复份"        # 辅助列标记值：同一票据号第 2 张及以后
-_AUX_FIRST = "首份"        # 辅助列标记值：该票号的首张（空票号也算首份，不算重复）
-_AUX_HEADER = "首份/重复份标记（辅助列，不参与展示）"
-
-
-def _total_label(field):
-    """统计区「合计 XX」的显示名（统筹沿用历史叫法「合计总统筹金额」）。"""
-    return "合计总统筹金额" if field == _POOL_FIELD else "合计" + field
-
-
-def _dup_label(field):
-    """统计区「重复票据」类项目的显示名。"""
-    return "重复票据统筹合计" if field == _POOL_FIELD else "重复票据" + field + "合计"
-
-
-def _inject_formula_cache(xlsx_path, values):
-    """把公式的计算结果写回单元格缓存值 ``<v>``（**公式本身保留**）。
-
-    背景：openpyxl 只写公式、不计算结果，单元格里留的是空 ``<v />``。Excel / WPS 打开会
-    重算，所以本机看着正常；但**不重算公式的查看器**（腾讯文档在线预览、部分网盘预览、
-    ``pandas.read_excel`` / ``openpyxl(data_only=True)``）读到的是空值 —— 统计栏显示 0
-    或空白，看着像算错了。这里按公式语义把结果写回，任何查看器都能直接看到数值。
-
-    ``values``：``{单元格引用（如 "L2"）: (值, 是否文本)}``；返回命中的单元格数。
-    """
-    import zipfile
-    from xml.sax.saxutils import escape
-
-    if not values:
-        return 0
-
-    sheet = "xl/worksheets/sheet1.xml"
-    # ⚠️ 匹配一个完整单元格时，必须兼顾自闭合空单元格：若写成
-    #    '<c [^>]*r="..."[^>]*>.*?</c>'，遇到 <c r="D18" s="9"/> 时 `>` 会匹配到它自己的
-    #    `>`，随后 `.*?</c>` 一路吞掉**紧跟其后的那个单元格**，导致后者漏注入。
-    cell_re = re.compile(r"<c\b[^>]*?(?:/>|>.*?</c>)", re.S)
-    ref_re = re.compile(r'\br="([A-Z]+)(\d+)"')
-    empty_v = re.compile(r"<v\s*/>|<v>\s*</v>")
-
-    def _num_str(v):
-        if isinstance(v, bool):
-            return "1" if v else "0"
-        if isinstance(v, int):
-            return str(v)
-        s = ("%.10f" % float(v)).rstrip("0").rstrip(".")
-        return s or "0"
-
-    def _patch(m):
-        cell = m.group(0)
-        rm = ref_re.search(cell)
-        if not rm:
-            return cell
-        ref = rm.group(1) + rm.group(2)
-        if ref not in values:
-            return cell
-        val, is_text = values[ref]
-        text = str(val) if is_text else _num_str(val)
-        head, sep, body = cell.partition(">")
-        if is_text and ' t="' not in head:
-            head = head.replace("<c ", '<c t="str" ', 1)
-        body, n = empty_v.subn("<v>%s</v>" % escape(text), body)
-        if n == 0:                       # 本来就没有 <v>，补在 </c> 之前
-            body = body.replace("</c>", "<v>%s</v></c>" % escape(text))
-        return head + sep + body
-
-    zin = zipfile.ZipFile(xlsx_path, "r")
-    try:
-        items = [(it, zin.read(it.filename)) for it in zin.infolist()]
-    finally:
-        zin.close()
-
-    hit = 0
-    out = []
-    for it, data in items:
-        if it.filename == sheet:
-            xml = data.decode("utf-8")
-            hit = sum(1 for ref in values if ('r="%s"' % ref) in xml)
-            data = cell_re.sub(_patch, xml).encode("utf-8")
-        out.append((it, data))
-
-    # ⚠️ 直接覆写目标文件。不要用「临时文件 + os.replace」：目标被 Office / 预览器打开时，
-    #    os.replace 需要目标文件的 DELETE 权限 → PermissionError(WinError 5)；
-    #    而普通写入（截断重写）是放行的（openpyxl 的 wb.save 就是这么保存的）。
-    zout = zipfile.ZipFile(xlsx_path, "w", zipfile.ZIP_DEFLATED)
-    try:
-        for it, data in out:
-            zout.writestr(it, data)
-    finally:
-        zout.close()
-    return hit
-
-
-def _write_summary_excel(rows, out_path, include_cond=()):
-    """把解析结果写成汇总 Excel。
-
-    rows：``[{"字段名": 值, ...}, ...]``，值为 None 表示该票据没有这一栏。
-    include_cond：需要输出的条件列集合（未识别到的条件列整体省略）。
-    """
-    # 懒加载 openpyxl：仅在真正写 Excel 时才导入，缩短启动时间
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    _SUMMARY_FILL = PatternFill("solid", fgColor="1F4E78")
-    _SUMMARY_FONT = Font(bold=True, color="FFFFFF", size=11)
-    _SUMMARY_THIN = Side(style="thin", color="BFBFBF")
-    _SUMMARY_BORDER = Border(left=_SUMMARY_THIN, right=_SUMMARY_THIN,
-                              top=_SUMMARY_THIN, bottom=_SUMMARY_THIN)
-    _SUMMARY_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    # 金额显示格式：不用千分位分隔（避免外部工具解析 / 二次计算出错），仅保留两位小数
-    _MONEY_FMT = "0.00"
-
-    # ---- 列布局（全部按列名定位，增删列都不需要改硬编码列号）----
-    #   明细列 … | 是否重复 | 间隔 | 左块「统计（剔重后）」标签/数值 | 间隔
-    #            | 右块「重复票据」标签/数值 | 辅助列（隐藏）
-    headers = list(_SUMMARY_BASE_FIELDS)
-    headers += [f for f in _SUMMARY_COND_FIELDS if f in include_cond]
-    headers.append("是否重复")
-    data_fields = headers[:-1]                      # 明细列（不含「是否重复」）
-    ncols = len(headers)
-    col_of = {name: i + 1 for i, name in enumerate(headers)}
-    col_letter = {name: get_column_letter(c) for name, c in col_of.items()}
-    # 金额类列（金额合计 + 各支付列）：写数字、套两位小数格式、合计行求和
-    _TEXT_FIELDS = ("文件名", "交款人", "票据号码", "开票日期")
-    money_fields = [f for f in data_fields if f not in _TEXT_FIELDS]
-    deduct_fields = [f for f in _DEDUCT_FIELDS if f in col_of]
-    # 两个统计块 + 隐藏在它们右侧的辅助列，列号全部由数据列数推算
-    stat_label_col, stat_val_col = ncols + 2, ncols + 3      # 左块「统计（剔重后）」
-    dup_label_col, dup_val_col = ncols + 5, ncols + 6        # 右块「重复票据」
-    aux_col_idx = ncols + 7                                  # 辅助列（隐藏）
-    aux_col = get_column_letter(aux_col_idx)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "发票汇总"
-
-    ws.append(headers)
-    for c in range(1, ncols + 1):
-        cell = ws.cell(row=1, column=c)
-        cell.fill = _SUMMARY_FILL
-        cell.font = _SUMMARY_FONT
-        cell.alignment = _SUMMARY_CENTER
-        cell.border = _SUMMARY_BORDER
-
-    # ---- 同票号分组与去重判定（**全部在程序侧算好**，不交给公式）----
-    # ⚠️ 千万不要退回「=IF(AND(票号<>"",COUNTIF(票号累计区间,票号)>1),"重复份","首份")」：
-    #    票号通常是 19 位纯数字，而 Excel / WPS / 腾讯文档的 SUMIF / COUNTIF 会把
-    #    「长得像数字的文本」内部转成数字再比较，双精度浮点只有 15~16 位有效数字 ——
-    #    同前缀的票号会全部塌陷成同一个值、被当成同一张票（实测 16 行 19 位票号里
-    #    15 行被判「重复份」，「票据张数」由 13 错成 1）。放在这里用 Counter 判定，
-    #    既准确，又天然与「是否重复」列口径一致。
-    _ticket_counts = Counter()
-    for r in rows:
-        tn = r.get(_TICKET_FIELD)
-        if tn:
-            _ticket_counts[tn] += 1
-
-    # 同票号各自的明细行号（Excel 行号 = 明细序号 + 2，第 1 行是表头），用于互指文案
-    _dup_group_rows = {}
-    for i, r in enumerate(rows):
-        tn = r.get(_TICKET_FIELD)
-        if tn and _ticket_counts[tn] >= 2:
-            _dup_group_rows.setdefault(tn, []).append(i + 2)
-
-    # 每行的「首份 / 重复份」：同票号第 2 张及以后算「重复份」；
-    # 空票号（识别失败）不算重复，记「首份」，保证 首份数 + 重复份数 = 明细总行数。
-    _seen_ticket = Counter()
-    aux_flags = []
-    for r in rows:
-        tn = r.get(_TICKET_FIELD)
-        _seen_ticket[tn] += 1
-        aux_flags.append(_AUX_TAG if (tn and _seen_ticket[tn] > 1) else _AUX_FIRST)
-
-    for i, r in enumerate(rows):
-        tn = r.get(_TICKET_FIELD)
-        # 「是否重复」列：不再只标「是」，改为**互指行号**，一眼能看出与哪几行是同一张票
-        if tn and _ticket_counts[tn] >= 2:
-            others = [x for x in _dup_group_rows[tn] if x != i + 2]
-            dup = "与第" + "、".join(str(x) for x in others) + "行重复"
-        else:
-            dup = ""
-        values = []
-        for f in data_fields:
-            v = r.get(f)
-            values.append(v if v is not None else "")
-        ws.append(values + [dup])
-        row_idx = ws.max_row
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=row_idx, column=c)
-            cell.border = _SUMMARY_BORDER
-            cell.alignment = _SUMMARY_CENTER
-        # 金额列写入的是数字，套两位小数金额格式；
-        # 空字符串（解析失败/缺失）保持为空，不影响求和。
-        for f in money_fields:
-            v = ws.cell(row=row_idx, column=col_of[f]).value
-            if isinstance(v, (int, float)):
-                ws.cell(row=row_idx, column=col_of[f]).number_format = _MONEY_FMT
-        # 辅助列：写**文本字面量**（不是公式），供两个统计块的 SUMIF / COUNTIF 使用。
-        # 多张同号票据里只有「重复份」计入「重复票据…合计」；
-        # 首张已计入「统计（剔重后）」各项，明细行本身全部保留、不做删改。
-        ws.cell(row=row_idx, column=aux_col_idx, value=aux_flags[i])
-
-    last = ws.max_row
-    if last >= 2:
-        # 合计行：各金额列分别求和
-        total_row = [""] * ncols
-        total_row[0] = "合计"
-        for f in money_fields:
-            L = col_letter[f]
-            total_row[col_of[f] - 1] = f"=SUM({L}2:{L}{last})"
-        ws.append(total_row)
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=ws.max_row, column=c)
-            cell.font = Font(bold=True)
-            cell.border = _SUMMARY_BORDER
-            cell.alignment = _SUMMARY_CENTER
-            cell.fill = PatternFill("solid", fgColor="DDEBF7")
-        for f in money_fields:
-            ws.cell(row=ws.max_row, column=col_of[f]).number_format = _MONEY_FMT
-
-    # ---- 两个统计块（列号由数据列数推算；行号先按标签顺序算好，再拼公式）----
-    stat_vcol = get_column_letter(stat_val_col)
-    dup_vcol = get_column_letter(dup_val_col)
-    stat_first_row = 2                                # 第 1 行是块标题，数据从第 2 行起
-    amount_col = col_letter[_AMOUNT_FIELD]
-    aux_rng = f"{aux_col}2:{aux_col}{last}"           # 辅助列（仅数据行区间）
-    first_crit = f'"{_AUX_FIRST}"'
-    tag_crit = f'"{_AUX_TAG}"'
-
-    # 左块「统计（剔重后）」：**每一项都只统计「首份」** —— 即剔除重复票据之后的口径。
-    left_labels = (["票据张数", "合计总金额"]
-                   + [_total_label(f) for f in deduct_fields]
-                   + ["可赔付金额"])
-    left_row = {lab: stat_first_row + i for i, lab in enumerate(left_labels)}
-    # 可赔付金额 = 合计总金额 − 各支付类合计（统筹 / 大病保险 / 医疗救助 …
-    # 这些钱由基金 / 保险 / 救助支付，患者并未实际支出）
-    deduct_cells = [f"{stat_vcol}{left_row[_total_label(f)]}" for f in deduct_fields]
-    left_items = [
-        ("票据张数", f"=COUNTIF({aux_rng},{first_crit})"),
-        ("合计总金额",
-         f"=SUMIF({aux_rng},{first_crit},{amount_col}2:{amount_col}{last})"),
-    ]
-    for f in deduct_fields:
-        L = col_letter[f]
-        left_items.append(
-            (_total_label(f), f"=SUMIF({aux_rng},{first_crit},{L}2:{L}{last})"))
-    left_items.append(
-        ("可赔付金额",
-         f"={stat_vcol}{left_row['合计总金额']}-" + "-".join(deduct_cells)))
-
-    # 右块「重复票据」：只累计「重复份」（同票号第 2 张及以后），首张不重复计入
-    right_items = [
-        ("重复票据张数", f"=COUNTIF({aux_rng},{tag_crit})"),
-        ("重复票据金额合计",
-         f"=SUMIF({aux_rng},{tag_crit},{amount_col}2:{amount_col}{last})"),
-    ]
-    for f in deduct_fields:
-        L = col_letter[f]
-        right_items.append(
-            (_dup_label(f), f"=SUMIF({aux_rng},{tag_crit},{L}2:{L}{last})"))
-
-    count_labels = ("票据张数", "重复票据张数")
-    for lcol, vcol, title, items in (
-            (stat_label_col, stat_val_col, "统计（剔重后）", left_items),
-            (dup_label_col, dup_val_col, "重复票据", right_items)):
-        for col, text in ((lcol, title), (vcol, "数值")):
-            tc = ws.cell(row=1, column=col, value=text)
-            tc.fill = _SUMMARY_FILL
-            tc.font = _SUMMARY_FONT
-            tc.alignment = _SUMMARY_CENTER
-            tc.border = _SUMMARY_BORDER
-        for i, (label, formula) in enumerate(items):
-            rrow = stat_first_row + i
-            lc = ws.cell(row=rrow, column=lcol, value=label)
-            lc.font = Font(bold=True, color="1F4E78")
-            lc.alignment = Alignment(horizontal="left", vertical="center")
-            lc.border = _SUMMARY_BORDER
-            vc = ws.cell(row=rrow, column=vcol, value=formula)
-            vc.font = Font(bold=True)
-            vc.alignment = _SUMMARY_CENTER
-            vc.border = _SUMMARY_BORDER
-            vc.number_format = "0" if label in count_labels else _MONEY_FMT
-
-    # 辅助列表头 + 隐藏（只为两块统计的 SUMIF / COUNTIF 服务，不影响阅读）
-    ac = ws.cell(row=1, column=aux_col_idx, value=_AUX_HEADER)
-    ac.font = Font(size=9, color="808080")
-
-    widths = [26, 14, 18, 14, 16, 18]
-    widths += [18] * (len(headers) - len(_SUMMARY_BASE_FIELDS) - 1)  # 条件列
-    # 是否重复 | 间隔 | 左块标签 | 左块数值 | 间隔 | 右块标签 | 右块数值 | 辅助列
-    widths += [12, 3, 30, 18, 3, 26, 18, 10]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.column_dimensions[aux_col].hidden = True
-    ws.freeze_panes = "A2"
-
-    # ---- 把公式结果写回缓存值（openpyxl 不算公式，详见 _inject_formula_cache）----
-    def _col_sum(rs, field):
-        """按列求和：跳过空串 / None（解析失败或该票没有这一栏）。"""
-        return sum(v for v in (r.get(field) for r in rs)
-                   if isinstance(v, (int, float)))
-
-    first_rows = [r for r, fl in zip(rows, aux_flags) if fl == _AUX_FIRST]
-    tag_rows = [r for r, fl in zip(rows, aux_flags) if fl == _AUX_TAG]
-    first_amount = _col_sum(first_rows, _AMOUNT_FIELD)
-    first_deduct = {f: _col_sum(first_rows, f) for f in deduct_fields}
-    tag_amount = _col_sum(tag_rows, _AMOUNT_FIELD)
-    tag_deduct = {f: _col_sum(tag_rows, f) for f in deduct_fields}
-
-    cache = {}
-    left_values = ([len(first_rows), first_amount]
-                   + [first_deduct[f] for f in deduct_fields]
-                   + [first_amount - sum(first_deduct.values())])
-    for i, v in enumerate(left_values):
-        cache[f"{stat_vcol}{stat_first_row + i}"] = (
-            round(v, 2) if isinstance(v, float) else v, False)
-    right_values = [len(tag_rows), tag_amount] + [tag_deduct[f] for f in deduct_fields]
-    for i, v in enumerate(right_values):
-        cache[f"{dup_vcol}{stat_first_row + i}"] = (
-            round(v, 2) if isinstance(v, float) else v, False)
-    if last >= 2:                                     # 合计行照旧：明细列全部求和（不剔重）
-        total_row_idx = last + 1
-        cache[f"{amount_col}{total_row_idx}"] = (
-            round(_col_sum(rows, _AMOUNT_FIELD), 2), False)
-        for f in deduct_fields:
-            cache[f"{col_letter[f]}{total_row_idx}"] = (round(_col_sum(rows, f), 2), False)
-
-    wb.save(out_path)
-    _inject_formula_cache(out_path, cache)
-
-
-def summarize_invoices(pdf_folder: str, log=print):
-    """汇总 pdf_folder 内（含子目录）的所有 PDF 发票，输出 Excel。
-
-    返回生成的 Excel 路径；无 PDF 或出错返回 None。
-    """
-    pdf_files = sorted(
-        glob.glob(os.path.join(pdf_folder, "**", "*.pdf"), recursive=True),
-        key=str.lower,
-    )
-    pdf_files = [f for f in pdf_files
-                 if not os.path.basename(f).startswith("发票汇总_")]
-
-    if not pdf_files:
-        log("未找到可汇总的 PDF 文件，跳过汇总。")
-        return None
-
-    log(f"开始汇总：找到 {len(pdf_files)} 个 PDF 发票。")
-    rows = []
-    ok = 0
-    for f in pdf_files:
-        name = os.path.basename(f)
-        fields, err = parse_invoice(f)
-        if err:
-            log(f"  [跳过] {name}：{err}")
-            rows.append({"文件名": name, "交款人": "解析失败"})
-            continue
-        row = {"文件名": name}
-        for fld in _SUMMARY_BASE_FIELDS[1:] + list(_SUMMARY_COND_FIELDS):
-            v = fields.get(fld)
-            row[fld] = v if v is not None else ""
-        rows.append(row)
-        ok += 1
-        log(f"  [OK] {name}  交款人={fields['交款人']}  "
-            f"票据号={fields['票据号码']}  金额={fields['金额合计（小写）']}")
-
-    # 条件列：本批票据至少有一张识别到该类目才输出，一张都没有则整体忽略
-    include_cond = tuple(fld for fld in _SUMMARY_COND_FIELDS
-                         if any(r.get(fld) not in (None, "") for r in rows))
-
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(pdf_folder, f"发票汇总_{ts}.xlsx")
-    _write_summary_excel(rows, out_path, include_cond=include_cond)
-    log(f"汇总完成：成功 {ok} / 共 {len(pdf_files)} 个。")
-    if include_cond:
-        for fld in include_cond:
-            n = sum(1 for r in rows if r.get(fld) not in (None, ""))
-            log(f"识别到「{fld}」的票据 {n} / {ok} 张，已输出该列及其汇总。")
-    else:
-        log("本批票据未识别到任何条件类支付栏目，汇总表不输出相应列。")
-    log(f"已导出：{out_path}")
-    return out_path
-
-
-
 _KIND_LABEL = {
     "success": "✓ 已下载 PDF",
+    "skipped": "✓ 已存在（跳过下载）",
     "no_pdf": "⚠ 识别到网址但未下载",
     "unrecognized": "✗ 未识别到二维码",
     "other": "· 其它情况（二维码非网址）",
@@ -2129,6 +1103,22 @@ def _copy_to_unrecognized(folder: str, fpath: str, fname: str, prefix: str):
     except Exception as e:
         return None, [f"  -> 复制失败：{e}"]
     return dest, [f"  -> 已复制到「未识别」：{new_name}"]
+
+
+def _is_valid_pdf_file(path: str) -> bool:
+    """路径上是否已有一份**可复用**的 PDF（存在、非空、且确实是 PDF）。
+
+    只看「文件在不在」不够：下载中断或请求被拦截时可能留下 0 字节或一段 HTML，
+    复用它会一路错到汇总阶段，还不如重下。所以顺带看一眼 PDF 文件头
+    （规范允许 %PDF- 出现在前 1024 字节内，故不要求严格开头）。
+    """
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 5:
+            return False
+        with open(path, "rb") as fh:
+            return b"%PDF-" in fh.read(1024)
+    except OSError:
+        return False
 
 
 def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
@@ -2183,35 +1173,45 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 
     # 3) 下载 PDF（内部带网络重试；「网址确实没有 PDF」属业务性失败，不重试）
     pdf_path = os.path.join(ctx.pdf_dir, f"{out_base}.pdf")
-    try:
-        download_pdf(url, pdf_path)
-    except PdfNotAvailable as e:
-        lines.append(f"  -> 网址无可下载的 PDF（{e}）")
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-        lines.extend(msgs)
-        return finish("no_pdf")
-    except DownloadNetworkError as e:
-        lines.append(f"  -> 网络失败，重试后仍未成功（{e}）")
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-        lines.extend(msgs)
-        return finish("no_pdf")
-    except Exception as e:
-        lines.append(f"  -> 下载失败（{e}）")
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-        lines.extend(msgs)
-        return finish("no_pdf")
-
-    lines.append(f"  -> 已下载 PDF：{os.path.basename(pdf_path)}")
-
-    # 4) 可选：PDF 转 JPG
-    if ctx.convert_pdf and ctx.img_dir:
+    already = _is_valid_pdf_file(pdf_path)
+    if already:
+        # 这一份上次已经下过（中途「停止」后再跑、隔天补几张再跑都会碰到）：
+        # 直接复用，不再请求一次。同一平台短时间内并发请求多了容易被限流，
+        # 全量重下既慢又容易让本来正常的票据变成「未下载」。
+        lines.append(f"  -> 已存在 PDF，跳过下载：{os.path.basename(pdf_path)}")
+    else:
         try:
-            for img_path in convert_pdf_to_images(pdf_path, ctx.img_dir, out_base):
-                lines.append(f"  -> 已生成图片：{os.path.basename(img_path)}")
+            download_pdf(url, pdf_path)
+        except PdfNotAvailable as e:
+            lines.append(f"  -> 网址无可下载的 PDF（{e}）")
+            _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
+            lines.extend(msgs)
+            return finish("no_pdf")
+        except DownloadNetworkError as e:
+            lines.append(f"  -> 网络失败，重试后仍未成功（{e}）")
+            _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
+            lines.extend(msgs)
+            return finish("no_pdf")
         except Exception as e:
-            lines.append(f"  -> PDF 转图片失败：{e}")
+            lines.append(f"  -> 下载失败（{e}）")
+            _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
+            lines.extend(msgs)
+            return finish("no_pdf")
+        lines.append(f"  -> 已下载 PDF：{os.path.basename(pdf_path)}")
 
-    return finish("success")
+    # 4) 可选：PDF 转 JPG（这一份如果已经转出过图片，也不再重复渲染一遍）
+    if ctx.convert_pdf and ctx.img_dir:
+        first_img = os.path.join(ctx.img_dir, f"{out_base}_第1页.jpg")
+        if already and os.path.exists(first_img):
+            lines.append("  -> 图片已存在，跳过转换")
+        else:
+            try:
+                for img_path in convert_pdf_to_images(pdf_path, ctx.img_dir, out_base):
+                    lines.append(f"  -> 已生成图片：{os.path.basename(img_path)}")
+            except Exception as e:
+                lines.append(f"  -> PDF 转图片失败：{e}")
+
+    return finish("skipped" if already else "success")
 
 
 # =====================================================================
@@ -2221,20 +1221,15 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 #   全为图片时完全跳过，保持原有行为不变。
 # =====================================================================
 
-def _unique_path(dest_dir: str, name: str, used: set) -> str:
-    """在 dest_dir 下为 name 找一个不与 used 冲突的文件名（大小写不敏感）。
+def _unique_path(name: str, used: set) -> str:
+    """在 used（已占用的文件名小写集合）中为 name 取一个不冲突的文件名。
 
-    used 为「已占用的文件名小写集合」，命中则在名字尾部追加 _2、_3…
+    used 里存的是**完整文件名**（与 ``_unique_out_bases`` 存基名不同）：这样
+    `a.jpg` 与 `a.png` 能共存，只有真正同名才让位。命中则在扩展名之前追加序号
     （如 原文件名_1.jpg 已被原图片占用 → 原文件名_1_2.jpg）。
     """
     stem, ext = os.path.splitext(name)
-    cand = name
-    i = 1
-    while cand.lower() in used:
-        i += 1
-        cand = f"{stem}_{i}{ext}"
-    used.add(cand.lower())
-    return cand
+    return _next_free(used, name, make=lambda i: f"{stem}_{i}{ext}")
 
 
 def prepare_target_folder(
@@ -2312,7 +1307,7 @@ def prepare_target_folder(
             info["skipped"] = True
             log("前置转换：已请求停止，剩余图片未复制。")
             break
-        dest_name = _unique_path(target, name, used)
+        dest_name = _unique_path(name, used)
         try:
             shutil.copy2(os.path.join(folder, name), os.path.join(target, dest_name))
             info["copied_images"] += 1
@@ -2353,6 +1348,35 @@ def prepare_target_folder(
 
 
 def process_folder(
+    folder: str,
+    open_after: bool,
+    convert_pdf: bool,
+    summarize: bool,
+    log_queue: queue.Queue,
+    cancel: "CancelToken | None" = None,
+    workers: int = DEFAULT_WORKERS,
+    preconvert: bool = True,
+):
+    """处理整个文件夹（对外入口，见下方 _process_folder_impl）。
+
+    ⚠️ 这里必须保证「无论发生什么，最后一定有 ("done",) 入队」：界面靠它复位按钮与
+    状态，漏一次就永久卡在「处理中…」，只能重启软件（打包后没有控制台，异常也看不见）。
+    所以把兜底放在最外层，业务逻辑全在 _process_folder_impl 里。
+    """
+    try:
+        _process_folder_impl(
+            folder, open_after, convert_pdf, summarize, log_queue,
+            cancel=cancel, workers=workers, preconvert=preconvert,
+        )
+    except Exception as e:
+        try:
+            log_queue.put(("log", f"处理过程出现未预期的错误，本次任务已中止：{e}"))
+            log_queue.put(("done",))
+        except Exception:
+            pass
+
+
+def _process_folder_impl(
     folder: str,
     open_after: bool,
     convert_pdf: bool,
@@ -2415,7 +1439,7 @@ def process_folder(
         progress(0, 0)
         log("没有需要处理的图片。")
         log_queue.put(("stats", {
-            "total": 0, "success": 0, "no_pdf": 0, "unrecognized": 0,
+            "total": 0, "success": 0, "skipped": 0, "no_pdf": 0, "unrecognized": 0,
             "other": 0, "error": 0, "cancelled": 0,
             "workers": workers, "elapsed": 0.0,
         }))
@@ -2425,7 +1449,6 @@ def process_folder(
     # 输出基名唯一化：避免 a.jpg 与 a.png 同时写同一个 a.pdf（并发下会写坏文件）
     out_bases = _unique_out_bases(files)
     ctx = _TaskCtx(folder, pdf_dir, img_dir, convert_pdf, cancel)
-    ctx.log_queue = log_queue
 
     log(f"开始处理：{total} 张图片，{workers} 路并发。")
     # 起始进度归零：旧版是在「开始处理第 N 张之前」就上报 N，
@@ -2495,6 +1518,7 @@ def process_folder(
     stats = {
         "total": total,
         "success": kind_count["success"],
+        "skipped": kind_count["skipped"],
         "no_pdf": kind_count["no_pdf"],
         "unrecognized": kind_count["unrecognized"],
         "other": kind_count["other"],
@@ -2518,6 +1542,8 @@ def process_folder(
         f"✗ 未识别到二维码（复制到未识别/，未识别-）：{stats['unrecognized']} 张",
         f"· 其它情况（复制到未识别/，其它-）：{stats['other']} 张",
     ]
+    if stats["skipped"]:
+        summary.insert(3, f"✓ 已存在 PDF 直接复用（未重新下载）：{stats['skipped']} 张")
     if stats["error"]:
         summary.append(f"✗ 处理出错（详见上方日志）：{stats['error']} 张")
     if stats["cancelled"]:
@@ -2557,26 +1583,34 @@ def process_folder(
 class _FlatProgressBar(tk.Canvas):
     """扁平进度条：浅灰轨道 + 细边框 + 蓝色填充，与整体界面风格保持一致。
 
-    系统默认进度条在 Windows 上是绿色渐变，跟这套扁平浅色界面不搭，故自绘。"""
+    系统默认进度条在 Windows 上是绿色渐变，跟这套扁平浅色界面不搭，故自绘。
+    「停止」是未完成态，填充改用琥珀色，与跑满的蓝色一眼可辨。"""
 
     TRACK = "#EDEFF2"
     BORDER = "#D6DBE1"
     FILL = "#2563EB"
+    FILL_STOPPED = "#F59E0B"
 
     def __init__(self, master, height: int = 20, **kw):
         super().__init__(
             master, height=height, bg=self.TRACK, highlightthickness=0, bd=0, **kw
         )
         self._value = 0.0
+        self._stopped = False
         self.bind("<Configure>", lambda _e: self._redraw())
 
-    def set_value(self, pct: float):
+    def set_value(self, pct: float, stopped: bool = False):
+        """设置进度（0~100）。stopped=True 表示这是「已停止」时的残留进度，用琥珀色。"""
         try:
             pct = float(pct)
         except (TypeError, ValueError):
             pct = 0.0
         self._value = max(0.0, min(100.0, pct))
+        self._stopped = bool(stopped)
         self._redraw()
+
+    def reset(self):
+        self.set_value(0)
 
     def _redraw(self):
         self.delete("all")
@@ -2589,11 +1623,16 @@ class _FlatProgressBar(tk.Canvas):
         fill_w = (w - 2) * self._value / 100.0
         if fill_w >= 1:
             self.create_rectangle(
-                1, 1, 1 + fill_w, h - 2, outline="", fill=self.FILL
+                1, 1, 1 + fill_w, h - 2, outline="",
+                fill=self.FILL_STOPPED if self._stopped else self.FILL,
             )
 
 
 class InvoiceQrToolApp:
+    # 日志区保留的最大行数：上千张图的长任务（每张 2~4 行 + 每 3 秒心跳）会堆到几万行，
+    # 滚动越来越卡、也白占内存。超过就裁掉最早的，只留最近的这些行。
+    _LOG_MAX_LINES = 5000
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"发票二维码识别下载工具 v{__VERSION__}")
@@ -2611,9 +1650,11 @@ class InvoiceQrToolApp:
         self.last_stats: dict | None = None
         self.cancel_token: CancelToken | None = None
         self._busy = False
+        self._log_written = 0        # 距上次裁剪日志已写多少行（见 _log）
 
         self._build_ui()
         self._poll_log()
+        self._pump_ui()
         # 关闭窗口时若任务还在跑，先让用户确认（避免误关导致半途而废）
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # 启动后静默检查更新（仅发现新版本时弹窗，无网络/无更新时不打扰）
@@ -2725,7 +1766,7 @@ class InvoiceQrToolApp:
         self.progress = _FlatProgressBar(frame_progress, height=20)
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress_var = tk.StringVar(
-            value=f"进度：0 / 0 份 · {DEFAULT_WORKERS} 路并发"
+            value=f"就绪（{DEFAULT_WORKERS} 路并发）"
         )
         ttk.Label(
             frame_progress, textvariable=self.progress_var, width=24, anchor=tk.E
@@ -2753,9 +1794,8 @@ class InvoiceQrToolApp:
             self._log("处理任务进行中，暂不检查更新（避免打断当前任务）。")
             return
         self._log("正在检查更新…")
-        threading.Thread(
-            target=check_and_prompt_update, args=(self.root,), daemon=True
-        ).start()
+        # 网络请求与弹窗都在内部处理（主线程调用，内部自行起后台线程）
+        check_and_prompt_update(self.root)
 
     def _show_help(self):
         win = tk.Toplevel(self.root)
@@ -2778,11 +1818,22 @@ class InvoiceQrToolApp:
         self.txt_log.configure(state=tk.NORMAL)
         self.txt_log.delete("1.0", tk.END)
         self.txt_log.configure(state=tk.DISABLED)
+        self._log_written = 0
 
     def _log(self, msg: str):
         now = time.strftime("%H:%M:%S")
         self.txt_log.configure(state=tk.NORMAL)
         self.txt_log.insert(tk.END, f"[{now}] {msg}\n")
+        # 每写满一批就检查一次总行数（不逐行查，省开销），超限裁掉最早的部分
+        self._log_written += 1
+        if self._log_written >= 200:
+            self._log_written = 0
+            try:
+                total = int(self.txt_log.index("end-1c").split(".")[0])
+                if total > self._LOG_MAX_LINES:
+                    self.txt_log.delete("1.0", f"{total - self._LOG_MAX_LINES}.0")
+            except Exception:
+                pass
         self.txt_log.see(tk.END)
         self.txt_log.configure(state=tk.DISABLED)
 
@@ -2801,10 +1852,9 @@ class InvoiceQrToolApp:
                             f"进度：{current} / {total} 份 · {workers} 路并发"
                         )
                     else:
-                        self.progress.set_value(100)
-                        self.progress_var.set(
-                            f"进度：0 / 0 份 · {DEFAULT_WORKERS} 路并发"
-                        )
+                        # total == 0：文件夹里没有可处理的图片，不是「跑完了」
+                        self.progress.reset()
+                        self.progress_var.set("没有需要处理的图片")
                 elif item[0] == "stats":
                     self.last_stats = item[1]
                 elif item[0] == "done":
@@ -2818,16 +1868,58 @@ class InvoiceQrToolApp:
         except tk.TclError:
             pass
 
+    def _pump_ui(self):
+        """主线程消费「后台线程 → 主线程」的回调队列（见 _ui_post）。
+
+        更新检查跑在后台线程，它拿到的结果必须回到主线程才能碰界面；这是那条通道的
+        消费端。放在这里是因为它和其他轮询一样依赖主线程的事件循环。
+        """
+        try:
+            while True:
+                fn = _UI_QUEUE.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(60, self._pump_ui)
+        except tk.TclError:
+            pass
+
     def _finish_task(self):
         """任务收尾：复位按钮与状态，弹出统计。"""
         self._busy = False
         self.cancel_token = None
         _PROCESSING.clear()
-        self.progress.set_value(100)
+        s = self.last_stats
+        # 「停止」不等于「完成」：进度条要停在真正处理到的位置（琥珀色），
+        # 而不是跳满 100% —— 否则用户会以为整批都跑完了。
+        stopped = bool(s and s.get("cancelled"))
+        if stopped:
+            total = s.get("total") or 0
+            done = max(0, total - (s.get("cancelled") or 0))
+            self.progress.set_value(
+                (done / total * 100) if total else 0.0, stopped=True
+            )
+            self.progress_var.set(
+                f"已停止：{done} / {total} 份（未处理 {s.get('cancelled') or 0} 份）"
+            )
+        elif s and not (s.get("total") or 0):
+            # 文件夹里没有可处理的图片：空进度 + 明确文案，别显示成跑满
+            self.progress.reset()
+            self.progress_var.set("没有需要处理的图片")
+        else:
+            self.progress.set_value(100)
+            if s:
+                self.progress_var.set(
+                    f"进度：{s['total']} / {s['total']} 份 · "
+                    f"{s.get('workers', DEFAULT_WORKERS)} 路并发"
+                )
         self.btn_start.configure(state=tk.NORMAL, text="▶  开始处理")
         self.btn_stop.configure(state=tk.DISABLED, text="■  停止")
         self._log("--- 任务结束 ---")
-        s = self.last_stats
         if s:
             self._show_stats_popup(s)
             self.last_stats = None
@@ -2843,6 +1935,8 @@ class InvoiceQrToolApp:
         )
         if s.get("error"):
             msg += f"\n处理出错（详见日志）：{s['error']} 张"
+        if s.get("skipped"):
+            msg += f"\n已存在 PDF 直接复用（未重新下载）：{s['skipped']} 张"
         cancelled = s.get("cancelled") or 0
         if cancelled:
             msg += f"\n因「停止」未处理：{cancelled} 张"
@@ -2871,7 +1965,7 @@ class InvoiceQrToolApp:
         self.btn_start.configure(state=tk.DISABLED, text="处理中…")
         self.btn_stop.configure(state=tk.NORMAL, text="■  停止")
         self.progress.set_value(0)
-        self.progress_var.set(f"进度：0 / 0 份 · {DEFAULT_WORKERS} 路并发")
+        self.progress_var.set(f"正在准备…（{DEFAULT_WORKERS} 路并发）")
         self._log(f"=== 开始处理（{DEFAULT_WORKERS} 路并发）===")
 
         self.worker_thread = threading.Thread(
@@ -2938,34 +2032,6 @@ def _cli_test(folder: str, summarize: bool = False) -> None:
             elif item[0] == "done":
                 f.write("--- 测试完成 ---\n")
                 break
-
-
-def _cleanup_legacy_update_artifacts():
-    """清理早期版本（bat / --pending / 备份机制）遗留的临时文件，避免堆积。
-
-    另外清理临时目录里的半截更新包（.part）—— 之前若更新被强杀 / 进程卡死，
-    会留下上百 MB 的无用文件且再没人管它。
-    """
-    try:
-        work_dir = os.path.dirname(sys.executable)
-        for name in ("_pending.exe", "_backup.exe", "_replace_in_progress",
-                     "_update_rolled_back", "invoiceqrdl_update.bat"):
-            p = os.path.join(work_dir, name)
-            if os.path.isfile(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    # 半截更新包：正被占用（说明有更新在进行）时删不掉，静默跳过即可
-    try:
-        part = os.path.join(tempfile.gettempdir(),
-                            "InvoiceQRDownloader_update.part")
-        if os.path.isfile(part):
-            os.remove(part)
-    except Exception:
-        pass
 
 
 def _cli_pdf2img(folder: str) -> None:

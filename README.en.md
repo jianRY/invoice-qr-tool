@@ -13,8 +13,8 @@ A single-file Windows desktop tool that **batch-processes invoice / receipt imag
 6. Same URL appears **repeatedly** → prefixed with `重复` (`Duplicate`). Can stack with `未下载`, e.g. `重复未下载原文件名`.
 7. Optional toggle: **open the folder automatically** when done.
 8. Optional toggle: **convert downloaded PDFs to images** (long edge 2000px, short edge auto), saved to `PDF/图片/` as `原名_第N页.png`.
-9. Optional toggle: **summarize invoices into Excel** when done. Currently tuned for **Jiangsu Province medical fee receipt** templates, extracting: payer, receipt number, issue date, total amount (lowercase), and medical insurance pooled-fund payment, plus **critical-illness insurance payment** / **medical assistance payment** (conditional columns, emitted only when recognized); outputs `PDF/发票汇总_时间戳.xlsx`. The `是否重复` column cross-references row numbers (e.g. 「与第3、5行重复」); to its right sit two blocks — **「统计（剔重后）」** (receipt count / total amount / pooled-fund total /〔critical-illness total〕/〔medical assistance total〕/ compensable amount, all computed **after removing duplicate receipts**, i.e. only the 1st copy of each receipt number) and **「重复票据」** (duplicate count / duplicate amount total / per-category duplicate totals, counting only the 2nd and later copies). Duplicate detection runs **inside the tool**, not through Excel formulas: receipt numbers are 15+ digits and spreadsheet `COUNTIF`/`SUMIF` coerce numeric-looking text to numbers, truncating them to 15 significant digits and misjudging every receipt as the same one (see changelog v4.9.0).
-10. A successfully recognized image whose PDF was downloaded gets a `1` prefix added to its filename (e.g. `1invoice001.jpg`), matching the other status prefixes so you can spot completed items at a glance.
+9. Optional toggle: **summarize invoices into Excel** when done. Currently tuned for **Jiangsu Province medical fee receipt** templates, extracting: payer, receipt number, issue date, total amount (lowercase), and medical insurance pooled-fund payment, plus **critical-illness insurance payment** / **medical assistance payment** (conditional columns, emitted only when recognized); outputs `PDF/发票汇总_时间戳.xlsx`. Its leftmost column is a **serial number** (序号: 1, 2, 3…), which makes it easy to tell which copy a row is; the `是否重复` column cross-references those serial numbers (e.g. 「与序号3、5重复」); to its right sit two blocks — **「统计（剔重后）」** (receipt count / total amount / pooled-fund total /〔critical-illness total〕/〔medical assistance total〕/ compensable amount, all computed **after removing duplicate receipts**, i.e. only the 1st copy of each receipt number) and **「重复票据」** (duplicate count / duplicate amount total / per-category duplicate totals, counting only the 2nd and later copies). Duplicate detection runs **inside the tool**, not through Excel formulas: receipt numbers are 15+ digits and spreadsheet `COUNTIF`/`SUMIF` coerce numeric-looking text to numbers, truncating them to 15 significant digits and misjudging every receipt as the same one (see changelog v4.9.0).
+10. Problem images are **copied** (never moved) into a `未识别` folder with a status prefix (`未下载-` / `未识别-` / `其它-`); successfully processed images keep their original filenames, and the originals are always left untouched. PDFs already downloaded are **reused instead of downloaded again** on a re-run (same for already-converted images).
 11. When processing finishes, a **results summary** popup (also written to the log) reports: total images recognized, how many downloaded a PDF, how many recognized-but-no-PDF, how many pure-digit-ignored, and how many failed to recognize (duplicates counted separately).
 
 ## Usage
@@ -70,7 +70,10 @@ Go to the repo's **Releases** page to download the latest (the repo is public, n
 ## File structure
 
 ```
-invoice_qr_tool.py          # source (tkinter GUI + processing logic)
+invoice_qr_tool.py          # main program: tkinter GUI + QR recognition + pipeline
+iqr_summary.py              # invoice field parsing and Excel summary writer
+iqr_net.py                  # session management and downloads (PDF, update package)
+iqr_update.py               # self-update: check Release -> download -> replace old exe
 README.md                   # this file (English)
 README.zh.md                # Chinese documentation
 使用说明.txt / 更新日志.txt   # bundled Chinese usage & changelog
