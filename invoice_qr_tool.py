@@ -13,7 +13,8 @@
 4. 可选任务完成后打开文件夹；
 5. 可选将下载的 PDF 转换为 JPG 图片（长边 2000px，短边自适应）；
 6. 可选任务完成后汇总发票（对 PDF 文件夹内发票 PDF 提取字段并生成 Excel，
-   金额/统筹为纯数字、无千分位，含「是否重复」列与右侧统计区汇总）。
+   金额/统筹为纯数字、无千分位；「是否重复」列互指重复行号，右侧分
+   「统计（剔重后）」与「重复票据」两块汇总）。
 
 并发模型：1~3 步由线程池并发执行（默认 6 路，见 DEFAULT_WORKERS）；
 第 6 步的汇总保持串行（pdfplumber 是纯 Python 解析，并发无收益）。
@@ -71,7 +72,7 @@ DOWNLOAD_RETRIES = 2       # 单张 PDF 下载失败后的重试次数（不含�
 RETRY_BACKOFF = 0.6        # 重试退避基数（秒）：0.6s、1.2s 递增
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.8.0"
+__VERSION__ = "4.9.0"
 GITHUB_REPO_OWNER = "jianRY"
 GITHUB_REPO_NAME = "invoice-qr-tool"
 GITHUB_LATEST_RELEASE_URL = (
@@ -100,17 +101,25 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    提取「交款人 / 票据号码 / 开票日期 / 金额合计（小写）/ 医保统筹基金支付」，
    以及「大病保险支付」「医疗救助支付」两类支付栏目（识别到才输出），
    汇总为「PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx」；金额类列均为纯数字（无千分位、
-   可直接求和与二次计算），并含「是否重复」列（同一票据号码出现≥2次则标记“是”）；
-   表格右侧统计区：票据张数 / 合计总金额 / 合计总统筹金额 /〔合计大病保险支付〕/
-   〔合计医疗救助支付〕/ 可赔付金额 / 重复票据金额合计 / 重复票据统筹合计 /
-   〔重复票据大病保险支付合计〕/〔重复票据医疗救助支付合计〕。
+   可直接求和与二次计算）。
+   「是否重复」列不再只标「是」，而是**互指行号**（如「与第3、5行重复」），
+   同一票号各有几张、分别在哪几行一眼可见。
+   表格右侧是两块汇总：
+   - 左块「统计（剔重后）」：票据张数 / 合计总金额 / 合计总统筹金额 /
+     〔合计大病保险支付〕/〔合计医疗救助支付〕/ 可赔付金额
+     —— **全部按“剔除重复票据”之后的口径统计**（同一票号只算第 1 张）。
+   - 右块「重复票据」：重复票据张数 / 重复票据金额合计 / 重复票据统筹合计 /
+     〔重复票据大病保险支付合计〕/〔重复票据医疗救助支付合计〕
+     —— 只统计**多出来的份**（同一票号第 2 张及以后），首张不重复计入。
    说明：
    - 加〔〕的项目与对应支付列一样，**仅在识别到该类目时才出现**（识别到 0.00 也算“有”该类目）；
-     本批票据若一张都没有，该列连同其汇总项整体省略，输出与旧版完全一致。
+     本批票据若一张都没有，该列连同其汇总项整体省略，输出与旧版一致。
    - 可赔付金额 = 合计总金额 − 各支付类合计之和（统筹 / 大病保险 / 医疗救助）。
-   - 「重复票据…合计」只统计**多出来的份**：同一票据号码有多张时，第 1 张已计入
-     「合计总金额」，不再计入重复合计；只有第 2 张及以后的金额才计入，避免同号票被重复累加。
-     「是否重复」列仍对同号的每一张都标“是”（判定逻辑不变），明细行也全部保留。
+   - 明细底部的「合计」行照旧对**全部**明细行求和（不剔重），方便与原始票据逐张核对；
+     左块与右块的张数之和 = 明细行数，金额之和 = 明细合计行金额。
+   - 重复判定在**软件内部**完成，不依赖 Excel 公式比较票号：票据号码常有 15 位以上，
+     而表格软件的 COUNTIF / SUMIF 会把「数字样文本」按数字比较、只保留 15 位有效数字，
+     会导致重复判定整体失效（详见更新记录 v4.9.0）。
 7. 处理结束后，弹出「识别结果统计」：总计识别图片数、成功下载 PDF、识别但未下载、
    未识别、其它各多少张，并附本次耗时、平均每张耗时与并发路数，方便核对处理结果。
 8. 日志区右上角提供「清空日志」按钮，一键清空历史日志，便于开始下一个任务。
@@ -167,8 +176,9 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
 - 识别到二维码但非网址 → 复制一份到「未识别/其它-<原名>」
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
-- 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额类列为纯数字、无千分位，
-                         含「是否重复」列与右侧统计区汇总；重复项只计同票号第 2 张及以后）
+- 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额类列为纯数字、无千分位；
+                         「是否重复」列互指重复行号；右侧「统计（剔重后）」按剔重口径统计，
+                         「重复票据」块只计同票号第 2 张及以后）
 
 【独立工具：只转 PDF】
 命令行方式可只做前置转换（不识别、不下载、不汇总）：
@@ -188,6 +198,29 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-18  v4.9.0
+- **汇总表右侧统计区重构为左右两块**（原先是一竖列到底）：
+  · 左块「统计（剔重后）」：票据张数 / 合计总金额 / 合计总统筹金额 /〔合计大病保险支付〕/
+    〔合计医疗救助支付〕/ 可赔付金额 —— **全部改为“剔除重复票据”之后的口径**，
+    即同一票号只算第 1 张，重复份不再参与这一块的计算。
+  · 右块「重复票据」：新增**重复票据张数**，其后为重复票据金额合计 / 重复票据统筹合计 /
+    〔重复票据大病保险支付合计〕/〔重复票据医疗救助支付合计〕—— 只统计多出来的份
+    （同一票号第 2 张及以后），首张不重复计入。
+  · 两块互补：左块张数 + 右块张数 = 明细行数；左块金额 + 右块金额 = 明细合计行金额。
+  · 明细底部的「合计」行照旧对**全部**明细行求和（不剔重），方便与原始票据逐张核对。
+- **「是否重复」列改为互指行号**：不再只标一个「是」，而是写成「与第3、5行重复」，
+  同一票号各有几张、分别落在哪几行，一眼可见。
+- **修复（重要）：票据号码超过 15 位时，重复判定会整体失效** —— 影响 v4.4 ~ v4.8 的
+  「重复票据…合计」以及所有按票号去重的统计。原因是原先用 `COUNTIF(票号累计区间, 票号)`
+  交给 Excel 判断重复，而 Excel / WPS / 在线表格的 COUNTIF / SUMIF 会把「长得像数字的文本」
+  内部转成数字再比较，双精度浮点只能存 15~16 位有效数字 —— 19 位票号（如 3205002026000120032）
+  会与同前缀的票号全部塌陷成同一个值，被判成同一张票。实测 16 行票据里有 15 行被误判为重复，
+  「票据张数」由 13 错算成 1。现在重复判定全部改在**软件内部**完成（与「是否重复」列同一套逻辑），
+  汇总表里只保留判定结果，不再依赖表格软件的票号比较，Excel / WPS / 在线预览结果一致。
+- 顺带修复：汇总表的公式单元格补写**计算结果缓存值**。原先用腾讯文档等「不重算公式」的在线预览
+  打开时，统计栏会显示 0 或空白（Excel / WPS 会自动重算，所以本地看不出问题）；
+  现在打开即显示正确数值，公式本身仍完整保留、可照常重算。
 
 2026-09-17  v4.8.0
 - **更新过程支持中途取消**：下载新版本时进度框新增「✖ 取消更新」按钮，点窗口右上角
@@ -1684,7 +1717,8 @@ _AMOUNT_FIELD = "金额合计（小写）"
 _POOL_FIELD = "医保统筹基金支付"
 _TICKET_FIELD = "票据号码"
 _AUX_TAG = "重复份"        # 辅助列标记值：同一票据号第 2 张及以后
-_AUX_HEADER = "重复份标记（辅助列，不参与展示）"
+_AUX_FIRST = "首份"        # 辅助列标记值：该票号的首张（空票号也算首份，不算重复）
+_AUX_HEADER = "首份/重复份标记（辅助列，不参与展示）"
 
 
 def _total_label(field):
@@ -1695,6 +1729,83 @@ def _total_label(field):
 def _dup_label(field):
     """统计区「重复票据」类项目的显示名。"""
     return "重复票据统筹合计" if field == _POOL_FIELD else "重复票据" + field + "合计"
+
+
+def _inject_formula_cache(xlsx_path, values):
+    """把公式的计算结果写回单元格缓存值 ``<v>``（**公式本身保留**）。
+
+    背景：openpyxl 只写公式、不计算结果，单元格里留的是空 ``<v />``。Excel / WPS 打开会
+    重算，所以本机看着正常；但**不重算公式的查看器**（腾讯文档在线预览、部分网盘预览、
+    ``pandas.read_excel`` / ``openpyxl(data_only=True)``）读到的是空值 —— 统计栏显示 0
+    或空白，看着像算错了。这里按公式语义把结果写回，任何查看器都能直接看到数值。
+
+    ``values``：``{单元格引用（如 "L2"）: (值, 是否文本)}``；返回命中的单元格数。
+    """
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    if not values:
+        return 0
+
+    sheet = "xl/worksheets/sheet1.xml"
+    # ⚠️ 匹配一个完整单元格时，必须兼顾自闭合空单元格：若写成
+    #    '<c [^>]*r="..."[^>]*>.*?</c>'，遇到 <c r="D18" s="9"/> 时 `>` 会匹配到它自己的
+    #    `>`，随后 `.*?</c>` 一路吞掉**紧跟其后的那个单元格**，导致后者漏注入。
+    cell_re = re.compile(r"<c\b[^>]*?(?:/>|>.*?</c>)", re.S)
+    ref_re = re.compile(r'\br="([A-Z]+)(\d+)"')
+    empty_v = re.compile(r"<v\s*/>|<v>\s*</v>")
+
+    def _num_str(v):
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, int):
+            return str(v)
+        s = ("%.10f" % float(v)).rstrip("0").rstrip(".")
+        return s or "0"
+
+    def _patch(m):
+        cell = m.group(0)
+        rm = ref_re.search(cell)
+        if not rm:
+            return cell
+        ref = rm.group(1) + rm.group(2)
+        if ref not in values:
+            return cell
+        val, is_text = values[ref]
+        text = str(val) if is_text else _num_str(val)
+        head, sep, body = cell.partition(">")
+        if is_text and ' t="' not in head:
+            head = head.replace("<c ", '<c t="str" ', 1)
+        body, n = empty_v.subn("<v>%s</v>" % escape(text), body)
+        if n == 0:                       # 本来就没有 <v>，补在 </c> 之前
+            body = body.replace("</c>", "<v>%s</v></c>" % escape(text))
+        return head + sep + body
+
+    zin = zipfile.ZipFile(xlsx_path, "r")
+    try:
+        items = [(it, zin.read(it.filename)) for it in zin.infolist()]
+    finally:
+        zin.close()
+
+    hit = 0
+    out = []
+    for it, data in items:
+        if it.filename == sheet:
+            xml = data.decode("utf-8")
+            hit = sum(1 for ref in values if ('r="%s"' % ref) in xml)
+            data = cell_re.sub(_patch, xml).encode("utf-8")
+        out.append((it, data))
+
+    # ⚠️ 直接覆写目标文件。不要用「临时文件 + os.replace」：目标被 Office / 预览器打开时，
+    #    os.replace 需要目标文件的 DELETE 权限 → PermissionError(WinError 5)；
+    #    而普通写入（截断重写）是放行的（openpyxl 的 wb.save 就是这么保存的）。
+    zout = zipfile.ZipFile(xlsx_path, "w", zipfile.ZIP_DEFLATED)
+    try:
+        for it, data in out:
+            zout.writestr(it, data)
+    finally:
+        zout.close()
+    return hit
 
 
 def _write_summary_excel(rows, out_path, include_cond=()):
@@ -1718,6 +1829,8 @@ def _write_summary_excel(rows, out_path, include_cond=()):
     _MONEY_FMT = "0.00"
 
     # ---- 列布局（全部按列名定位，增删列都不需要改硬编码列号）----
+    #   明细列 … | 是否重复 | 间隔 | 左块「统计（剔重后）」标签/数值 | 间隔
+    #            | 右块「重复票据」标签/数值 | 辅助列（隐藏）
     headers = list(_SUMMARY_BASE_FIELDS)
     headers += [f for f in _SUMMARY_COND_FIELDS if f in include_cond]
     headers.append("是否重复")
@@ -1725,14 +1838,14 @@ def _write_summary_excel(rows, out_path, include_cond=()):
     ncols = len(headers)
     col_of = {name: i + 1 for i, name in enumerate(headers)}
     col_letter = {name: get_column_letter(c) for name, c in col_of.items()}
-    dup_col = col_letter["是否重复"]
-    ticket_col = col_letter[_TICKET_FIELD]
     # 金额类列（金额合计 + 各支付列）：写数字、套两位小数格式、合计行求和
     _TEXT_FIELDS = ("文件名", "交款人", "票据号码", "开票日期")
     money_fields = [f for f in data_fields if f not in _TEXT_FIELDS]
     deduct_fields = [f for f in _DEDUCT_FIELDS if f in col_of]
-    # 辅助列：藏在统计区右侧，用来给「重复票据…合计」去重（判断某行是否重复份）
-    aux_col_idx = ncols + 4
+    # 两个统计块 + 隐藏在它们右侧的辅助列，列号全部由数据列数推算
+    stat_label_col, stat_val_col = ncols + 2, ncols + 3      # 左块「统计（剔重后）」
+    dup_label_col, dup_val_col = ncols + 5, ncols + 6        # 右块「重复票据」
+    aux_col_idx = ncols + 7                                  # 辅助列（隐藏）
     aux_col = get_column_letter(aux_col_idx)
 
     wb = Workbook()
@@ -1747,16 +1860,43 @@ def _write_summary_excel(rows, out_path, include_cond=()):
         cell.alignment = _SUMMARY_CENTER
         cell.border = _SUMMARY_BORDER
 
-    # 「是否重复」判定逻辑保持不变：同一票据号码出现 >= 2 次即标记“是”
+    # ---- 同票号分组与去重判定（**全部在程序侧算好**，不交给公式）----
+    # ⚠️ 千万不要退回「=IF(AND(票号<>"",COUNTIF(票号累计区间,票号)>1),"重复份","首份")」：
+    #    票号通常是 19 位纯数字，而 Excel / WPS / 腾讯文档的 SUMIF / COUNTIF 会把
+    #    「长得像数字的文本」内部转成数字再比较，双精度浮点只有 15~16 位有效数字 ——
+    #    同前缀的票号会全部塌陷成同一个值、被当成同一张票（实测 16 行 19 位票号里
+    #    15 行被判「重复份」，「票据张数」由 13 错成 1）。放在这里用 Counter 判定，
+    #    既准确，又天然与「是否重复」列口径一致。
     _ticket_counts = Counter()
     for r in rows:
         tn = r.get(_TICKET_FIELD)
         if tn:
             _ticket_counts[tn] += 1
 
+    # 同票号各自的明细行号（Excel 行号 = 明细序号 + 2，第 1 行是表头），用于互指文案
+    _dup_group_rows = {}
+    for i, r in enumerate(rows):
+        tn = r.get(_TICKET_FIELD)
+        if tn and _ticket_counts[tn] >= 2:
+            _dup_group_rows.setdefault(tn, []).append(i + 2)
+
+    # 每行的「首份 / 重复份」：同票号第 2 张及以后算「重复份」；
+    # 空票号（识别失败）不算重复，记「首份」，保证 首份数 + 重复份数 = 明细总行数。
+    _seen_ticket = Counter()
+    aux_flags = []
     for r in rows:
         tn = r.get(_TICKET_FIELD)
-        dup = "是" if (tn and _ticket_counts[tn] >= 2) else ""
+        _seen_ticket[tn] += 1
+        aux_flags.append(_AUX_TAG if (tn and _seen_ticket[tn] > 1) else _AUX_FIRST)
+
+    for i, r in enumerate(rows):
+        tn = r.get(_TICKET_FIELD)
+        # 「是否重复」列：不再只标「是」，改为**互指行号**，一眼能看出与哪几行是同一张票
+        if tn and _ticket_counts[tn] >= 2:
+            others = [x for x in _dup_group_rows[tn] if x != i + 2]
+            dup = "与第" + "、".join(str(x) for x in others) + "行重复"
+        else:
+            dup = ""
         values = []
         for f in data_fields:
             v = r.get(f)
@@ -1773,13 +1913,10 @@ def _write_summary_excel(rows, out_path, include_cond=()):
             v = ws.cell(row=row_idx, column=col_of[f]).value
             if isinstance(v, (int, float)):
                 ws.cell(row=row_idx, column=col_of[f]).number_format = _MONEY_FMT
-        # 辅助列：判断本行是否为「同一票据号的重复份」（第 2 张及以后）。
-        # COUNTIF 用**累计区间**（$C$2:$C本行），计数 > 1 说明前面已有同号票据。
-        # 多张同号票据里，只有多出来的那些份计入「重复票据…合计」，
-        # 首张的数据仍完整保留在明细里、也已计入「合计总金额」，不再重复累加。
-        ws.cell(row=row_idx, column=aux_col_idx,
-                value=('=IF(AND(${tc}{r}<>"",COUNTIF(${tc}$2:${tc}{r},${tc}{r})>1),'
-                       '"{tag}","")'.format(tc=ticket_col, r=row_idx, tag=_AUX_TAG)))
+        # 辅助列：写**文本字面量**（不是公式），供两个统计块的 SUMIF / COUNTIF 使用。
+        # 多张同号票据里只有「重复份」计入「重复票据…合计」；
+        # 首张已计入「统计（剔重后）」各项，明细行本身全部保留、不做删改。
+        ws.cell(row=row_idx, column=aux_col_idx, value=aux_flags[i])
 
     last = ws.max_row
     if last >= 2:
@@ -1799,83 +1936,115 @@ def _write_summary_excel(rows, out_path, include_cond=()):
         for f in money_fields:
             ws.cell(row=ws.max_row, column=col_of[f]).number_format = _MONEY_FMT
 
-    # ---- 右侧统计区（标签列 / 数值列由数据列数推算，紧跟数据列空一列）----
-    stat_label_col = ncols + 2
-    stat_val_col = ncols + 3
+    # ---- 两个统计块（列号由数据列数推算；行号先按标签顺序算好，再拼公式）----
     stat_vcol = get_column_letter(stat_val_col)
-    stat_title_row = 1
-    stat_first_row = 2
-
+    dup_vcol = get_column_letter(dup_val_col)
+    stat_first_row = 2                                # 第 1 行是块标题，数据从第 2 行起
     amount_col = col_letter[_AMOUNT_FIELD]
-    # 先按显示顺序排好标签，据此算出各统计项行号，再用行号拼公式，
-    # 避免「可赔付金额」这类跨行引用随列数 / 项数变化而写错。
-    stat_labels = (["票据张数", "合计总金额"]
+    aux_rng = f"{aux_col}2:{aux_col}{last}"           # 辅助列（仅数据行区间）
+    first_crit = f'"{_AUX_FIRST}"'
+    tag_crit = f'"{_AUX_TAG}"'
+
+    # 左块「统计（剔重后）」：**每一项都只统计「首份」** —— 即剔除重复票据之后的口径。
+    left_labels = (["票据张数", "合计总金额"]
                    + [_total_label(f) for f in deduct_fields]
-                   + ["可赔付金额", "重复票据金额合计"]
-                   + [_dup_label(f) for f in deduct_fields])
-    row_of = {lab: stat_first_row + i for i, lab in enumerate(stat_labels)}
-
+                   + ["可赔付金额"])
+    left_row = {lab: stat_first_row + i for i, lab in enumerate(left_labels)}
     # 可赔付金额 = 合计总金额 − 各支付类合计（统筹 / 大病保险 / 医疗救助 …
-    # 这些都属于已由基金、保险或救助支付、患者并未实际支出的部分）
-    deduct_cells = [f"{stat_vcol}{row_of[_total_label(f)]}" for f in deduct_fields]
-
-    stat_items = [
-        ("票据张数", f"=COUNTA(A2:A{last})"),
-        ("合计总金额", f"=SUM({amount_col}2:{amount_col}{last})"),
+    # 这些钱由基金 / 保险 / 救助支付，患者并未实际支出）
+    deduct_cells = [f"{stat_vcol}{left_row[_total_label(f)]}" for f in deduct_fields]
+    left_items = [
+        ("票据张数", f"=COUNTIF({aux_rng},{first_crit})"),
+        ("合计总金额",
+         f"=SUMIF({aux_rng},{first_crit},{amount_col}2:{amount_col}{last})"),
     ]
     for f in deduct_fields:
         L = col_letter[f]
-        stat_items.append((_total_label(f), f"=SUM({L}2:{L}{last})"))
-    stat_items.append(
+        left_items.append(
+            (_total_label(f), f"=SUMIF({aux_rng},{first_crit},{L}2:{L}{last})"))
+    left_items.append(
         ("可赔付金额",
-         f"={stat_vcol}{row_of['合计总金额']}-" + "-".join(deduct_cells)))
-    # 重复票据各项：只累计「重复份」（同票号第 2 张及以后），首张不重复计入
-    stat_items.append(
+         f"={stat_vcol}{left_row['合计总金额']}-" + "-".join(deduct_cells)))
+
+    # 右块「重复票据」：只累计「重复份」（同票号第 2 张及以后），首张不重复计入
+    right_items = [
+        ("重复票据张数", f"=COUNTIF({aux_rng},{tag_crit})"),
         ("重复票据金额合计",
-         f'=SUMIF({aux_col}2:{aux_col}{last},"{_AUX_TAG}",'
-         f'{amount_col}2:{amount_col}{last})'))
+         f"=SUMIF({aux_rng},{tag_crit},{amount_col}2:{amount_col}{last})"),
+    ]
     for f in deduct_fields:
         L = col_letter[f]
-        stat_items.append(
-            (_dup_label(f),
-             f'=SUMIF({aux_col}2:{aux_col}{last},"{_AUX_TAG}",{L}2:{L}{last})'))
-    # 标题
-    tcell = ws.cell(row=stat_title_row, column=stat_label_col, value="统计")
-    tcell.fill = _SUMMARY_FILL
-    tcell.font = _SUMMARY_FONT
-    tcell.alignment = _SUMMARY_CENTER
-    tcell.border = _SUMMARY_BORDER
-    tcell2 = ws.cell(row=stat_title_row, column=stat_val_col, value="数值")
-    tcell2.fill = _SUMMARY_FILL
-    tcell2.font = _SUMMARY_FONT
-    tcell2.alignment = _SUMMARY_CENTER
-    tcell2.border = _SUMMARY_BORDER
-    # 数据行
-    for i, (label, formula) in enumerate(stat_items):
-        rrow = stat_first_row + i
-        lc = ws.cell(row=rrow, column=stat_label_col, value=label)
-        lc.font = Font(bold=True, color="1F4E78")
-        lc.alignment = Alignment(horizontal="left", vertical="center")
-        lc.border = _SUMMARY_BORDER
-        vc = ws.cell(row=rrow, column=stat_val_col, value=formula)
-        vc.font = Font(bold=True)
-        vc.alignment = _SUMMARY_CENTER
-        vc.border = _SUMMARY_BORDER
-        vc.number_format = _MONEY_FMT if label != "票据张数" else "0"
+        right_items.append(
+            (_dup_label(f), f"=SUMIF({aux_rng},{tag_crit},{L}2:{L}{last})"))
 
-    # 辅助列表头 + 隐藏（只为重复票据去重服务，不影响阅读）
+    count_labels = ("票据张数", "重复票据张数")
+    for lcol, vcol, title, items in (
+            (stat_label_col, stat_val_col, "统计（剔重后）", left_items),
+            (dup_label_col, dup_val_col, "重复票据", right_items)):
+        for col, text in ((lcol, title), (vcol, "数值")):
+            tc = ws.cell(row=1, column=col, value=text)
+            tc.fill = _SUMMARY_FILL
+            tc.font = _SUMMARY_FONT
+            tc.alignment = _SUMMARY_CENTER
+            tc.border = _SUMMARY_BORDER
+        for i, (label, formula) in enumerate(items):
+            rrow = stat_first_row + i
+            lc = ws.cell(row=rrow, column=lcol, value=label)
+            lc.font = Font(bold=True, color="1F4E78")
+            lc.alignment = Alignment(horizontal="left", vertical="center")
+            lc.border = _SUMMARY_BORDER
+            vc = ws.cell(row=rrow, column=vcol, value=formula)
+            vc.font = Font(bold=True)
+            vc.alignment = _SUMMARY_CENTER
+            vc.border = _SUMMARY_BORDER
+            vc.number_format = "0" if label in count_labels else _MONEY_FMT
+
+    # 辅助列表头 + 隐藏（只为两块统计的 SUMIF / COUNTIF 服务，不影响阅读）
     ac = ws.cell(row=1, column=aux_col_idx, value=_AUX_HEADER)
     ac.font = Font(size=9, color="808080")
 
     widths = [26, 14, 18, 14, 16, 18]
     widths += [18] * (len(headers) - len(_SUMMARY_BASE_FIELDS) - 1)  # 条件列
-    widths += [12, 3, 26, 18, 10]   # 是否重复 | 间隔列 | 统计标签 | 统计数值 | 辅助列
+    # 是否重复 | 间隔 | 左块标签 | 左块数值 | 间隔 | 右块标签 | 右块数值 | 辅助列
+    widths += [12, 3, 30, 18, 3, 26, 18, 10]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.column_dimensions[aux_col].hidden = True
-
     ws.freeze_panes = "A2"
+
+    # ---- 把公式结果写回缓存值（openpyxl 不算公式，详见 _inject_formula_cache）----
+    def _col_sum(rs, field):
+        """按列求和：跳过空串 / None（解析失败或该票没有这一栏）。"""
+        return sum(v for v in (r.get(field) for r in rs)
+                   if isinstance(v, (int, float)))
+
+    first_rows = [r for r, fl in zip(rows, aux_flags) if fl == _AUX_FIRST]
+    tag_rows = [r for r, fl in zip(rows, aux_flags) if fl == _AUX_TAG]
+    first_amount = _col_sum(first_rows, _AMOUNT_FIELD)
+    first_deduct = {f: _col_sum(first_rows, f) for f in deduct_fields}
+    tag_amount = _col_sum(tag_rows, _AMOUNT_FIELD)
+    tag_deduct = {f: _col_sum(tag_rows, f) for f in deduct_fields}
+
+    cache = {}
+    left_values = ([len(first_rows), first_amount]
+                   + [first_deduct[f] for f in deduct_fields]
+                   + [first_amount - sum(first_deduct.values())])
+    for i, v in enumerate(left_values):
+        cache[f"{stat_vcol}{stat_first_row + i}"] = (
+            round(v, 2) if isinstance(v, float) else v, False)
+    right_values = [len(tag_rows), tag_amount] + [tag_deduct[f] for f in deduct_fields]
+    for i, v in enumerate(right_values):
+        cache[f"{dup_vcol}{stat_first_row + i}"] = (
+            round(v, 2) if isinstance(v, float) else v, False)
+    if last >= 2:                                     # 合计行照旧：明细列全部求和（不剔重）
+        total_row_idx = last + 1
+        cache[f"{amount_col}{total_row_idx}"] = (
+            round(_col_sum(rows, _AMOUNT_FIELD), 2), False)
+        for f in deduct_fields:
+            cache[f"{col_letter[f]}{total_row_idx}"] = (round(_col_sum(rows, f), 2), False)
+
     wb.save(out_path)
+    _inject_formula_cache(out_path, cache)
 
 
 def summarize_invoices(pdf_folder: str, log=print):
