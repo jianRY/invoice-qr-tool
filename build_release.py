@@ -40,6 +40,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import base64
+import socket
 import uuid
 import time
 
@@ -80,11 +81,32 @@ VERSION_FILE = os.path.join(ROOT, "VERSION")
 LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 PROXY = "http://127.0.0.1:10808"
 
-# 代理全局生效（urllib / git 都用）
-os.environ.setdefault("HTTPS_PROXY", PROXY)
-os.environ.setdefault("HTTP_PROXY", PROXY)
-os.environ.setdefault("https_proxy", PROXY)
-os.environ.setdefault("http_proxy", PROXY)
+# 代理全局生效（urllib / git 都用）。
+# ⚠️ 不能用 setdefault：WorkBuddy 沙箱会在环境里注入它自己的代理
+#    （实测 http_proxy/https_proxy = http://127.0.0.1:61290，对 github.com 一律
+#     返回 `CONNECT tunnel failed, response 502`），setdefault 会被这个已存在的值
+#     挡住而**静默失效** —— 表现为构建/签名全成功、一到 push 就 502（v4.10.0 实测）。
+#    故这里必须**强制覆盖**；仅在代理端口探测不通时才退回环境原值。
+def _proxy_alive(proxy=PROXY, timeout=2.0):
+    try:
+        host_port = proxy.split("://", 1)[-1]
+        host, port = host_port.rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+USE_PROXY = _proxy_alive()
+if USE_PROXY:
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        _prev = os.environ.get(_k)
+        if _prev and _prev != PROXY:
+            print("[代理] 环境变量 {}={} 已强制覆盖为 {}".format(_k, _prev, PROXY))
+        os.environ[_k] = PROXY
+else:
+    print("[代理] {} 不可达，保持环境原值（直连）".format(PROXY))
+
 
 
 # ---------------- 版本工具 ----------------
@@ -208,8 +230,10 @@ def git_env():
 
 
 def git(*args, check=True, capture=True):
+    # 代理用 `-c` 显式传给 git：不依赖环境变量，沙箱注入的代理也拦不住。
+    proxy_args = ["-c", "http.proxy=" + PROXY, "-c", "https.proxy=" + PROXY] if USE_PROXY else []
     r = subprocess.run(
-        [GIT] + list(args), capture_output=capture, text=True,
+        [GIT] + proxy_args + list(args), capture_output=capture, text=True,
         encoding="utf-8", errors="replace", env=git_env(),
     )
     if check and r.returncode != 0:
