@@ -159,14 +159,18 @@ def is_feature_commit(subject):
 
 
 def release_subjects():
-    """本次待发布的提交标题（上次发布提交..HEAD）；无基线时取最近 15 条。"""
+    """本次待发布的提交标题（上次发布提交..HEAD）。
+
+    ⚠️ 只有「完全没有基线文件」时才退回最近 15 条用于推断。基线存在但范围为空，
+    说明自上次发布以来没有新提交，必须返回空列表 —— 曾经的 fallback 会把**已发布过**
+    的历史提交当成本次变更，让 bump_auto 误判成「有功能提交」而多跳一位版本号
+    （2026-09-19 实测：基线刷成 HEAD 后仍报出 4 条早已发布的 feat）。
+    """
     last = ""
     if os.path.exists(LAST_RELEASE_COMMIT):
         last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
     rng = "{}..HEAD".format(last) if last else "-15"
     out = git("log", "--pretty=%s", rng, check=False).stdout or ""
-    if not out.strip() and last:
-        out = git("log", "--pretty=%s", "-15", check=False).stdout or ""
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
