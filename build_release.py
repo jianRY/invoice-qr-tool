@@ -408,6 +408,30 @@ def build_installer():
 
 
 # ---------------- 资源生成 ----------------
+# 发版流水线自身产生的提交，不该出现在给用户看的「更新内容」里
+_NOISE_COMMIT_RE = re.compile(
+    r"^(?:release\s*:|chore(?:\([^)]*\))?\s*:|[a-z]+\(release\)\s*:)", re.I)
+
+
+def _user_facing_lines(log):
+    """从 `git log --oneline` 输出里剔掉流水线提交，只留面向用户的条目。
+
+    过滤对象：`release: v4.10.0`（脚本打版）、`chore: 记录 vX 发布提交`（脚本记基线）、
+    以及任何 scope 为 release 的提交（如 `fix(release): ...`，改的是发版脚本而非软件功能）。
+    逐条比对而非整段丢弃 —— 与功能提交混在一起时，功能条目照常保留。
+    """
+    kept = []
+    for ln in log.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        subject = ln.split(" ", 1)[1] if " " in ln else ln
+        if _NOISE_COMMIT_RE.match(subject):
+            continue
+        kept.append(ln)
+    return kept
+
+
 def make_assets(new_tag):
     os.makedirs(ASSET_DIR, exist_ok=True)
     # 复制双 exe（ASCII 文件名，GitHub 附件不支持中文）
@@ -427,7 +451,9 @@ def make_assets(new_tag):
     log = git("log", "--oneline", rng, check=False).stdout.strip()
     if not log:
         log = git("log", "--oneline", "-15").stdout.strip()
-    lines = log.splitlines()
+    lines = _user_facing_lines(log)
+    if not lines:
+        lines = log.splitlines()   # 极端情况：改动全在流水线，别留空段落
     changelog = "# 发票二维码识别下载工具 {}\n\n".format(new_tag)
     changelog += "## 更新内容\n"
     for ln in lines:
