@@ -269,6 +269,11 @@ img { max-width: 100%; display: block; }
 .dl-actions .btn { flex: 1; min-width: 220px; justify-content: center; padding: 16px 22px; font-size: 16px; }
 .btn-download { background: var(--grad); color: #fff; box-shadow: 0 12px 28px rgba(37,99,235,.4); }
 .btn-download:hover { transform: translateY(-2px); box-shadow: 0 16px 34px rgba(37,99,235,.5); }
+/* 安装版按钮：白底 + 主色描边，与渐变主按钮并列时主次分明 */
+.btn-installer { background: #fff; color: var(--primary-600); border-color: #bcd2fb; box-shadow: var(--shadow-sm); }
+.btn-installer:hover { transform: translateY(-2px); background: var(--primary-50); border-color: var(--primary); box-shadow: 0 14px 32px rgba(37,99,235,.18); }
+.dl-hint { margin: 16px 0 0; font-size: 13.5px; color: var(--muted); text-align: center; line-height: 1.95; }
+.dl-hint b { color: var(--ink-2); }
 .dl-note { margin-top: 16px; font-size: 13.5px; color: var(--muted); text-align: center; }
 .dl-note a { color: var(--primary); font-weight: 700; }
 
