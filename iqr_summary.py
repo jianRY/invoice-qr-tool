@@ -12,7 +12,10 @@ import 本模块不会拖慢启动。PyInstaller 打包会沿 import 自动收�
 import os
 import re
 from collections import Counter
-from datetime import datetime
+# ⚠️ 必须是 `import datetime`（模块），不是 `from datetime import datetime`：
+#    下面调用写的是 datetime.datetime.now()。拆模块时这行被写成了导入类，
+#    结果汇总发票在生成文件名这一步直接 AttributeError 崩掉（v4.10.0 线上 bug）。
+import datetime
 
 
 
