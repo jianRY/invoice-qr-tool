@@ -436,6 +436,61 @@ def _user_facing_lines(log):
     return kept
 
 
+def _changelog_section(tag):
+    """从主程序源码的 CHANGELOG_TEXT 里抠出 tag 对应的那一段。
+
+    这是 Release 正文的**首选来源** —— 它同时就是软件内「更新记录」显示的文案，
+    所以线上 Release 与软件内说明永远是同一份，不会各写一遍而走样。
+    返回 None 表示源码里还没写该版本段落（此时回退到 git 提交标题）。
+    """
+    try:
+        src = open(os.path.join(ROOT, "invoice_qr_tool.py"), encoding="utf-8").read()
+    except OSError:
+        return None
+    m = re.search(r'CHANGELOG_TEXT\s*=\s*"""(.*?)"""', src, re.S)
+    if not m:
+        return None
+    text = m.group(1)
+    head = re.search(r"^\d{4}-\d{2}-\d{2}\s+" + re.escape(tag) + r"\s*$", text, re.M)
+    if not head:
+        return None
+    tail = text[head.end():]
+    nxt = re.search(r"^\d{4}-\d{2}-\d{2}\s+v\d", tail, re.M)
+    block = (tail[:nxt.start()] if nxt else tail).strip("\n")
+    return block or None
+
+
+def _release_body(new_tag, portable_name, installer_name):
+    """Release 正文 与 附件 InvoiceQR_Changelog.txt 共用同一份内容。"""
+    body = "# 发票二维码识别下载工具 {}\n\n".format(new_tag)
+    section = _changelog_section(new_tag)
+    if section:
+        body += "## 更新内容\n\n" + section + "\n"
+        print("[资源] Release 正文取自源码更新记录（{} 段落 {} 行）".format(new_tag, len(section.splitlines())))
+    else:
+        # 兜底：源码里没有该版本段落，用「相对上次发布」的提交标题（已滤掉发版流水线提交）
+        print("[资源] ⚠ 源码更新记录里没有 {} 段落，正文回退为 git 提交标题".format(new_tag))
+        last = ""
+        if os.path.exists(LAST_RELEASE_COMMIT):
+            last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
+        rng = "{}..HEAD".format(last) if last else "-15"
+        log = git("log", "--oneline", rng, check=False).stdout.strip()
+        if not log:
+            log = git("log", "--oneline", "-15").stdout.strip()
+        lines = _user_facing_lines(log) or log.splitlines()  # 全是流水线提交时别留空段
+        body += "## 更新内容\n"
+        for ln in lines:
+            body += "- " + ln + "\n"
+    body += "\n## 下载说明\n"
+    body += "- `{}`：单文件运行版（双击即用，无需安装）。\n".format(portable_name)
+    body += "- `{}`：可安装版（装到 Program Files，开始菜单/桌面快捷方式，含卸载程序）。\n".format(installer_name)
+    body += "- 软件界面与本地文件名仍为中文 `{}`。\n".format(APP_EXE)
+    # 版本段落里若已说明升级方式，就不再重复追加（正文出现两遍同义句很显廉价）
+    if not any(k in body for k in ("覆盖安装", "覆盖旧版本", "无需迁移")):
+        body += "\n> 升级方式：直接运行新版即可覆盖旧版本，无需卸载，也无需迁移任何数据。\n"
+    return body
+
+
 def make_assets(new_tag):
     os.makedirs(ASSET_DIR, exist_ok=True)
     # 复制双 exe（ASCII 文件名，GitHub 附件不支持中文）
@@ -444,28 +499,8 @@ def make_assets(new_tag):
     shutil.copy2(PORTABLE_OUT, os.path.join(ASSET_DIR, portable_name))
     shutil.copy2(INSTALLER_OUT, os.path.join(ASSET_DIR, installer_name))
 
-    # Changelog：相对上次发布提交的 git log
-    last = ""
-    if os.path.exists(LAST_RELEASE_COMMIT):
-        last = open(LAST_RELEASE_COMMIT, encoding="utf-8").read().strip()
-    if last:
-        rng = "{}..HEAD".format(last)
-    else:
-        rng = "-15"
-    log = git("log", "--oneline", rng, check=False).stdout.strip()
-    if not log:
-        log = git("log", "--oneline", "-15").stdout.strip()
-    lines = _user_facing_lines(log)
-    if not lines:
-        lines = log.splitlines()   # 极端情况：改动全在流水线，别留空段落
-    changelog = "# 发票二维码识别下载工具 {}\n\n".format(new_tag)
-    changelog += "## 更新内容\n"
-    for ln in lines:
-        changelog += "- " + ln + "\n"
-    changelog += "\n## 下载说明\n"
-    changelog += "- `{}`：单文件运行版（双击即用，无需安装）。\n".format(portable_name)
-    changelog += "- `{}`：可安装版（装到 Program Files，开始菜单/桌面快捷方式，含卸载程序）。\n".format(installer_name)
-    changelog += "- 软件界面与本地文件名仍为中文 `{}`。\n".format(APP_EXE)
+    # Changelog（= Release 正文）优先取源码「更新记录」本版段落，git log 兜底
+    changelog = _release_body(new_tag, portable_name, installer_name)
     with open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), "w", encoding="utf-8") as f:
         f.write(changelog)
 
@@ -497,17 +532,32 @@ def update_website(new_tag):
     """
     ver = new_tag.lstrip("v")                    # 4.0
     today = time.strftime("%Y-%m-%d")            # 2026-09-16
-    try:
-        size_mb = round(os.path.getsize(PORTABLE_OUT) / 1_000_000)   # 十进制 MB
-    except OSError:
-        size_mb = 0
+
+    def _mb(path):
+        """十进制 MB，与页面 chip 显示口径一致（1024 进制会与实际对不上）。"""
+        try:
+            return round(os.path.getsize(path) / 1_000_000)
+        except OSError:
+            return 0
+
+    size_mb = _mb(PORTABLE_OUT)
+    size_mb_i = _mb(INSTALLER_OUT)
 
     def rewrite(path, pairs):
+        """pairs 每项为 (正则, 替换) 或 (正则, 替换, 次数)；次数 0/缺省 = 全部替换。
+
+        未命中的规则会打印告警 —— 官网字段正则失配是会**静默**把页面留在旧版本的，
+        以前就吃过这个亏，所以宁可吵一点。
+        """
         if not os.path.exists(path):
             print("    跳过（缺失）:", os.path.basename(path)); return
         s = open(path, encoding="utf-8").read()
-        for pat, rep in pairs:
-            s = re.sub(pat, rep, s)
+        for item in pairs:
+            pat, rep = item[0], item[1]
+            cnt = item[2] if len(item) > 2 else 0
+            s, n = re.subn(pat, rep, s, count=cnt)
+            if n == 0:
+                print("    ⚠ 未命中:", os.path.basename(path), "->", pat[:48])
         with open(path, "w", encoding="utf-8") as f:
             f.write(s)
 
@@ -516,13 +566,18 @@ def update_website(new_tag):
         (r"当前版本 v[\d.]+", "当前版本 " + new_tag),
         (r'(class="v"[^>]*>)\s*v[\d.]+', r"\g<1>" + new_tag),
         (r"免费下载 v[\d.]+", "免费下载 " + new_tag),
+        # 数据卡「111 MB / 单文件 EXE」只改数字，标签不动（首个匹配即该卡片）
+        (r">\d+ MB</b>", ">{} MB</b>".format(size_mb), 1),
     ])
     # 下载页：meta 描述、版本 chip、日期 chip、体积 chip、主下载直链（含无 v 前缀的真实附件名）
     rewrite(os.path.join(WEBSITE_DIR, "download.html"), [
         (r"v[\d.]+（Windows", new_tag + "（Windows"),
         (r'(<span class="chip">)v[\d.]+', r"\g<1>" + new_tag),
         (r'(<span class="chip gray">)\d{4}-\d{2}-\d{2}', r"\g<1>" + today),
-        (r'(<span class="chip gray">≈ )\d+( MB)', r"\g<1>" + str(size_mb) + r"\g<2>"),
+        # 体积 chip：整块替换（旧写法「≈ 111 MB」/ 新写法「单文件 111 MB · 安装版 132 MB」都能改）；
+        # 负向断言排除日期 chip，避免把发布日期也当体积写掉
+        (r'(<span class="chip gray">)(?!\d{4}-\d{2}-\d{2})[^<]*',
+         r"\g<1>单文件 {} MB · 安装版 {} MB".format(size_mb, size_mb_i)),
         (r"releases/download/v[\d.]+/InvoiceQRDownloader[_v]*[\d.]+\.exe",
          "releases/download/{}/InvoiceQRDownloader_{}.exe".format(new_tag, ver)),
         (r"releases/download/v[\d.]+/InvoiceQRInstaller[_v]*[\d.]+\.exe",
@@ -560,6 +615,9 @@ def publish(new_tag, token):
         release_id = data["id"]
         upload_url = data.get("upload_url", "").split("{")[0]
         print("[发布] 复用已有 Release {} (HTTP {})".format(new_tag, status))
+        # 重跑 / 补传附件时同步刷新正文，避免线上还是上次的旧文案
+        st_b, _ = api("PATCH", rel_url + "/" + str(release_id), token, json_data={"body": body})
+        print("[发布] 正文已刷新 (HTTP {})".format(st_b))
     else:
         status, data = api(
             "POST", rel_url, token,
