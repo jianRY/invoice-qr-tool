@@ -21,3 +21,5 @@ outputs/
 # ---- 敏感/自动生成（不入库） ----
 .github_token
 .last_release_commit
+# CLI 自检（--test）在程序目录写的运行日志，属临时产物
+test_run.log

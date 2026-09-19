@@ -30,7 +30,7 @@ A single-file Windows desktop tool that **batch-processes invoice / receipt imag
 6. When finished: PDFs are in `PDF/`, converted images in `PDF/图片/`, and the summary in `PDF/发票汇总_*.xlsx`.
 7. To update, click the **Check for Updates** button (or just confirm the prompt shown by the silent startup check).
 
-The UI also has **Usage**, **Changelog**, and **Check for Updates** buttons, always accessible.
+The top bar also has **Usage**, **Changelog**, and **Check for Updates** entries, always accessible.
 
 ## Naming rules at a glance
 
@@ -49,6 +49,7 @@ The UI also has **Usage**, **Changelog**, and **Check for Updates** buttons, alw
 - The update source is the public repo's Release — **no account or token required**.
 - **Automatic rollback on failure**: the current executable is backed up before replacement (`_backup.exe`); if the new version fails its startup self-check, the updater script automatically restores the previous version, relaunches it, and shows a **"Update rolled back"** warning dialog so you are never left with a broken or silently-failed app.
 - **Update progress dialog**: a dedicated progress window shows the update stage, a progress bar, live download speed (MB/s / KB/s), downloaded size, and a detailed log; when done it replaces and relaunches automatically — no blocking popup.
+- **Card-based UI, crisp on high-DPI screens**: a light layout built from a top bar plus rounded white cards, with fully custom-drawn buttons / checkboxes / progress bar (no native grey 3-D chrome), level-coloured log lines (✓ green / ⚠ amber / ✗ red), and a progress card showing "正在处理 x / y 份" plus elapsed time. **DPI awareness** is enabled, so text stays sharp at 125% / 150% / 200% scaling instead of being bitmap-stretched.
 - **Faster startup**: heavy dependencies (OpenCV / PyMuPDF / pdfplumber / openpyxl / zxing-cpp) are lazily imported only when their feature is actually used; the GUI and the update check no longer initialize them at launch.
 
 ### How the auto-update works
@@ -74,6 +75,7 @@ invoice_qr_tool.py          # main program: tkinter GUI + QR recognition + pipel
 iqr_summary.py              # invoice field parsing and Excel summary writer
 iqr_net.py                  # session management and downloads (PDF, update package)
 iqr_update.py               # self-update: check Release -> download -> replace old exe
+ui_kit.py                   # UI kit: SKIN (colours/metrics) + custom card/button/progress/log widgets
 README.md                   # this file (English)
 README.zh.md                # Chinese documentation
 使用说明.txt / 更新日志.txt   # bundled Chinese usage & changelog
