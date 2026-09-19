@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>下载 · 发票二维码识别下载工具</title>
-  <meta name="description" content="下载发票二维码识别下载工具 v5.0.0（Windows 单文件 EXE，免费免安装）。" />
+  <meta name="description" content="下载发票二维码识别下载工具 v5.0.0（Windows 单文件版 / 安装版可选，免费，本地运行）。" />
   <link rel="icon" type="image/png" href="assets/app-icon.png" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
@@ -30,7 +30,7 @@
   <section class="dl-hero">
     <div class="container">
       <h1>下载发票二维码识别下载工具</h1>
-      <p>免费、单文件、免安装。下载后双击即可在 Windows 上运行，所有处理均在本地完成。</p>
+      <p>免费、本地运行。单文件版下载即用，也可选装到 Program Files 的安装版，所有处理都在你自己的电脑上完成。</p>
     </div>
   </section>
 
@@ -46,21 +46,26 @@
         <div class="dl-ver">
           <span class="chip">v5.0.0</span>
           <span class="chip gray">2026-09-19</span>
-          <span class="chip gray">≈ 111 MB</span>
+          <span class="chip gray">单文件 111 MB · 安装版 132 MB</span>
         </div>
       </div>
 
       <div class="dl-actions">
         <a class="btn btn-download" href="https://github.com/jianRY/invoice-qr-tool/releases/download/v5.0.0/InvoiceQRDownloader_5.0.0.exe">
-          ⬇ 下载 Windows 版（EXE）
+          ⬇ 单文件版（免安装）
         </a>
-        <a class="btn btn-ghost" href="https://github.com/jianRY/invoice-qr-tool/releases" target="_blank" rel="noopener">
-          前往 GitHub Releases
+        <a class="btn btn-installer" href="https://github.com/jianRY/invoice-qr-tool/releases/download/v5.0.0/InvoiceQRInstaller_5.0.0.exe">
+          ⬇ 安装版（含卸载）
         </a>
       </div>
+      <p class="dl-hint">
+        <b>单文件版</b>：一个 EXE，双击即用，不写注册表，适合放 U 盘随身带。<br />
+        <b>安装版</b>：装到 Program Files，自动创建开始菜单 / 桌面快捷方式与卸载项。<br />
+        两版功能完全一致，按使用习惯选一个即可。
+      </p>
       <p class="dl-note">
-        点击上方按钮即可下载 Windows 版（单文件 EXE，免安装），安装包由 GitHub Releases 提供。
-        下载完成后双击即可直接使用，无需任何依赖；软件内也提供「检查更新」，可自动升级到新版本。
+        下载后双击即可使用，无需安装任何依赖；软件内提供「检查更新」，可自动升级到新版本。<br />
+        历史版本见 <a href="https://github.com/jianRY/invoice-qr-tool/releases" target="_blank" rel="noopener">GitHub Releases</a>。
       </p>
     </div>
 
@@ -71,7 +76,8 @@
         <ul>
           <li>操作系统：Windows 7 / 8 / 10 / 11</li>
           <li>架构：x64（64 位）</li>
-          <li>无需安装，无需联网（更新检查除外）</li>
+          <li>单文件版无需安装；安装版需管理员权限</li>
+          <li>除「检查更新」外全程离线</li>
           <li>运行需约 300 MB 临时内存</li>
         </ul>
       </div>
@@ -112,6 +118,10 @@
         <details>
           <summary>识别失败 / 没下载到 PDF 的图片去哪了？</summary>
           <div class="ans">未下载、未识别或其它情况的图片，会自动复制一份到原文件夹下的「未识别」子文件夹，并分别加上「未下载- / 未识别- / 其它-」前缀，原始图片始终保留不动。</div>
+        </details>
+        <details>
+          <summary>单文件版和安装版怎么选？</summary>
+          <div class="ans">两个版本功能完全一致，只是「放」的地方不同。<b>单文件版</b>只有一个 EXE，双击即用、不写注册表，适合放 U 盘随身带或临时用；<b>安装版</b>会装到 Program Files，自动创建开始菜单 / 桌面快捷方式，并在「应用和功能」里登记卸载项，适合长期固定在一台电脑上使用。装错了也不要紧，卸载后换另一版重装即可。</div>
         </details>
         <details>
           <summary>怎么升级到新版本？</summary>
