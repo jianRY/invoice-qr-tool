@@ -20,8 +20,9 @@
 第 6 步的汇总保持串行（pdfplumber 是纯 Python 解析，并发无收益）。
 处理中可通过 CancelToken 请求停止。
 
-界面：整行扁平「▶ 开始处理」主按钮 + 右侧「■ 停止」+ 自绘扁平进度条
-（右侧显示「进度：x / y 份 · 6 路并发」）；「使用说明 / 检查更新」位于顶部菜单栏「帮助」。
+界面：卡片化浅色界面（顶栏 + 圆角白卡 + 蓝色主色），整行「▶ 开始处理」主按钮
++ 右侧「停止」+ 自绘圆角进度条；「使用说明 / 检查更新」位于顶栏。
+界面尺寸与配色集中在 ui_kit.py 的 SKIN（= PRESETS["标准"]），改外观只改那一处。
 """
 
 import os
@@ -33,8 +34,11 @@ import shutil
 import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+# ⚠️ ui_kit 必须早于 import tkinter：它 import 时即设置进程 DPI 感知，
+#    顺序反了会让高分屏（125%/150%）下的界面被位图拉伸、文字发虚。
+import ui_kit as K
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
 
 # 本地模块（原为本文件的一部分，见各模块 docstring）：
 #   iqr_net     —— 会话管理与下载
@@ -94,7 +98,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "4.10.0"
+__VERSION__ = "5.0.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -138,13 +142,13 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
      而表格软件的 COUNTIF / SUMIF 会把「数字样文本」按数字比较、只保留 15 位有效数字，
      会导致重复判定整体失效（详见更新记录 v4.9.0）。
 7. 处理结束后，弹出「识别结果统计」：总计识别图片数、成功下载 PDF、识别但未下载、
-   未识别、其它各多少张，并附本次耗时、平均每张耗时与并发路数，方便核对处理结果。
+   未识别、其它各多少张，并附本次耗时与平均每张耗时，方便核对处理结果。
 8. 日志区右上角提供「清空日志」按钮，一键清空历史日志，便于开始下一个任务。
 9. 多张图片**并发处理**（默认 6 路）：识别、下载、转图并行推进。绝大多数时间都花在
    等网络下载 PDF 上，并发后批量处理明显更快（下载阶段实测约 5 倍、识别约 3 倍）。
 10. 单张 PDF 下载失败会**自动重试**（最多 2 次、逐次退避）：偶发网络抖动不会再被
     误判成「未下载」而需要人工重跑。
-11. 处理过程中可点「■ 停止」随时中止：尚未开始的图片会被直接跳过，已下载的 PDF 全部保留，
+11. 处理过程中可点「停止」随时中止：尚未开始的图片会被直接跳过，已下载的 PDF 全部保留，
     原图始终不动；停止后不再执行汇总与打开文件夹。
 12. **PDF 前置转换（自动，无需勾选）**：目标文件夹里只要有 PDF，软件会先自动把 PDF 逐页
     转成 JPG，再往下走识别/下载流程。分三种情况：
@@ -163,18 +167,18 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    - 处理完成后打开文件夹
    - 将下载的 PDF 转换为图片（JPG，长边 2000px）
    - 处理完成后汇总发票（生成 Excel）
-4. 点「▶ 开始处理」（主界面整行的大按钮），在日志区查看进度；按钮下方进度条右侧
-   实时显示「进度：x / y 份 · 6 路并发」，日志区每 3 秒报一次「已完成 x / y 张」，
-   卡住也能一眼看出还在跑。
-   要中止就点「开始处理」右侧的「■ 停止」；日志区右上角有「清空日志」。
-   「使用说明 / 更新记录」「检查更新」「清空日志」也可在顶部菜单栏「帮助」中找到。
+4. 点「▶ 开始处理」（主界面整行的大按钮），进度卡与日志区实时显示处理进度：
+   进度条上方左侧是「正在处理 x / y 份」、右侧是「已用 mm:ss」，日志区每 3 秒
+   报一次「已完成 x / y 张」，卡住也能一眼看出还在跑。
+   要中止就点「开始处理」右侧的「停止」；日志卡右上角有「清空日志」。
+   「使用说明 / 更新记录」「检查更新」在顶栏右侧。
 5. 处理完成后，PDF 在「PDF」文件夹，转换图片在「PDF/图片」，问题图片的副本在「未识别」文件夹，
    汇总表在「PDF/发票汇总_*.xlsx」。
 
 【自动更新】
 - 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「是」即自动
   下载并安装（无需手动去网页下载）。
-- 也可随时通过顶部菜单栏「帮助 → 检查更新」手动检查。
+- 也可随时点顶栏右侧的「检查更新」手动检查。
 - 更新源为公开仓库 jianRY/invoice-qr-tool 的 Release，无需任何账号或令牌。
 - 更新过程有「更新进度」提示框：展示阶段、进度条、下载速度、已下载大小与详细日志。
 - **下载过程中可随时取消**：进度框里有「✖ 取消更新」按钮（点窗口 ✕ 同样生效）。
@@ -216,6 +220,27 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-19  v5.0.0
+- **全新界面（卡片化）**：整体换成「浅灰底 + 圆角白卡 + 蓝色主色」的现代布局，
+  按钮、复选框、进度条、链接全部自绘，风格统一；并按 DPI 感知缩放，高分屏
+  （125% / 150% / 200%）下文字不再发虚，子窗口尺寸也跟着缩放。
+  主界面自上而下为「目标文件夹 → 处理选项 → 开始处理/停止 → 进度 → 处理日志」，
+  「使用说明 / 更新记录」与「检查更新」移到顶栏右侧。
+- **进度区更直观**：进度条上方左侧是「正在处理 x / y 份」，右侧新增「已用 mm:ss」计时；
+  中途停止时进度条停在真实进度并转为琥珀色（不再跳满 100%，避免误以为整批跑完）；
+  文件夹里没有可处理的图片时提示「没有需要处理的图片」。
+- **日志分级着色**：✓ 绿色、⚠ 琥珀、✗ 红色、=== 蓝色，长任务里一眼扫出问题行。
+- 界面上不再显示「6 路并发」等内部字样（并发能力不变，仍为默认 6 路）。
+- **修复：勾选「处理完成后汇总发票」后程序必然报错** —— 生成汇总表文件名时把 datetime
+  模块当成类调用，走到「出文件名」那一步就抛异常，导致汇总功能实际不可用。
+  该问题自 v4.10.0 引入，勾选汇总的用户请务必更新到本版。
+- **修复：关闭窗口后偶发「invalid command name」报错** —— 日志轮询、界面刷新、耗时计时
+  三个内部定时器在关窗时未取消，窗口销毁后仍会被唤起。现在关闭时统一清理，
+  无论走关闭按钮还是其他方式退出都不会再出现。
+- 修复：使用说明窗口、更新进度框在高分屏上尺寸偏小（未按缩放换算，被压成窄条）。
+- 说明：本次为主要版本更新（界面整体重构），使用方式与输出文件规则与 v4.10.0 完全一致，
+  直接覆盖安装即可，无需迁移任何数据。
 
 2026-09-18  v4.10.0
 - **汇总表新增「序号」列**（放在最左侧）：1、2、3… 与明细行一一对应，配合「文件名」
@@ -563,6 +588,20 @@ def apply_window_icon(win) -> None:
         pass
 
 
+def _place_child_window(win, w: int, h: int) -> None:
+    """给 Toplevel 设定尺寸并居中。
+
+    ⚠️ `geometry()` 的数字是**物理像素**，而开启 DPI 感知后 Tk 的字号是按真实 DPI
+    放大的 —— 直接写逻辑尺寸会让子窗口又小又挤（内容被压成窄条）。所以这里统一
+    过一层 K.u()，再钳到屏幕内、居中到屏幕，避免小屏放不下。
+    """
+    W, H = K.u(w), K.u(h)
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    W, H = min(W, max(320, sw - K.u(20))), min(H, max(240, sh - K.u(60)))
+    x, y = max(0, (sw - W) // 2), max(0, (sh - H) // 3)
+    win.geometry("%dx%d+%d+%d" % (W, H, x, y))
+
+
 class UpdateProgressDialog:
     """更新进度框：展示阶段、进度条、下载速度、已下载大小与详细日志。
 
@@ -580,7 +619,7 @@ class UpdateProgressDialog:
         self._cancelling = False          # 已点过取消，正在等下载线程收尾
         self.win = tk.Toplevel(parent)
         self.win.title("更新进度")
-        self.win.geometry("480x380")
+        _place_child_window(self.win, 500, 430)
         self.win.resizable(False, False)
         try:
             self.win.transient(parent)
@@ -594,41 +633,55 @@ class UpdateProgressDialog:
         self._poll()
 
     def _build_widgets(self):
-        pad = {"padx": 12, "pady": 6}
+        sk = K.SKIN
+        K.style_ttk(sk)
+        self.win.configure(bg=sk.bg)
+        body = tk.Frame(self.win, bg=sk.bg)
+        body.pack(fill=tk.BOTH, expand=True, padx=K.u(12), pady=K.u(10))
+
         self.stage_var = tk.StringVar(value="准备中…")
-        ttk.Label(
-            self.win, textvariable=self.stage_var,
-            font=("Microsoft YaHei", 11, "bold"),
-        ).pack(anchor=tk.W, **pad)
-
-        self.bar = ttk.Progressbar(self.win, mode="determinate", maximum=100)
-        self.bar.pack(fill=tk.X, padx=12, pady=(0, 6))
-
-        row = ttk.Frame(self.win)
-        row.pack(fill=tk.X, padx=12, pady=(0, 6))
         self.pct_var = tk.StringVar(value="0%")
         self.size_var = tk.StringVar(value="0.0 / 0.0 MB")
         self.speed_var = tk.StringVar(value="— KB/s")
-        ttk.Label(row, textvariable=self.pct_var, width=10).pack(side=tk.LEFT)
-        ttk.Label(row, textvariable=self.size_var, width=22).pack(side=tk.LEFT)
-        ttk.Label(row, textvariable=self.speed_var, width=16).pack(side=tk.LEFT)
 
-        ttk.Label(self.win, text="详细进度：").pack(anchor=tk.W, padx=12)
-        self.txt = scrolledtext.ScrolledText(
-            self.win, wrap=tk.WORD, state=tk.DISABLED, height=11
-        )
-        self.txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        # 进度卡片：阶段文案（左）+ 百分比（右）+ 进度条 + 大小/速度
+        card = K.Card(body, sk)
+        card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        head = tk.Frame(card.body, bg=sk.card)
+        head.pack(fill=tk.X)
+        tk.Label(head, textvariable=self.stage_var, bg=sk.card, fg=sk.text,
+                 font=K.f(sk.fs_body, True)).pack(side=tk.LEFT)
+        tk.Label(head, textvariable=self.pct_var, bg=sk.card, fg=sk.accent_d,
+                 font=K.f(sk.fs_body, True)).pack(side=tk.RIGHT)
+        self.bar = K.RoundProgress(card.body, sk, height=sk.bar_h)
+        self.bar.pack(fill=tk.X, pady=(K.u(8), 0))
+        stats = tk.Frame(card.body, bg=sk.card)
+        stats.pack(fill=tk.X, pady=(K.u(6), 0))
+        tk.Label(stats, textvariable=self.size_var, bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_small)).pack(side=tk.LEFT)
+        tk.Label(stats, textvariable=self.speed_var, bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_small)).pack(side=tk.RIGHT)
 
-        btn_row = ttk.Frame(self.win)
-        btn_row.pack(pady=(0, 10))
-        self.btn_cancel = ttk.Button(
-            btn_row, text="✖ 取消更新", command=self.request_cancel
-        )
-        self.btn_cancel.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_close = ttk.Button(
-            btn_row, text="关闭", command=self._close, state=tk.DISABLED
-        )
-        self.btn_close.pack(side=tk.LEFT)
+        # 按钮条先 pack：它固定在底部，日志卡片随后吃掉剩余高度（顺序反了按钮被挤没）
+        btn_row = tk.Frame(body, bg=sk.bg)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(K.u(10), 0))
+        self.btn_cancel = K.RoundButton(btn_row, sk, "取消更新", self.request_cancel,
+                                        kind="danger", width=104, height=34,
+                                        font_size=sk.fs_body)
+        self.btn_cancel.pack(side=tk.LEFT)
+        self.btn_close = K.RoundButton(btn_row, sk, "关闭", self._close, kind="ghost",
+                                       width=104, height=34, font_size=sk.fs_body)
+        self.btn_close.pack(side=tk.LEFT, padx=(K.u(8), 0))
+        self.btn_close.configure_state("disabled")
+
+        # 详细进度日志（占满剩余高度）
+        log_card = K.Card(body, sk, auto=False, fill=True)
+        log_card.pack(fill=tk.BOTH, expand=True)
+        tk.Label(log_card.body, text="详细进度", bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_body, True)).pack(anchor="w")
+        tk.Frame(log_card.body, bg=sk.border, height=1).pack(fill=tk.X, pady=K.u(8))
+        self.txt = K.LogView(log_card.body, sk, max_lines=400)
+        self.txt.pack(fill=tk.BOTH, expand=True)
 
     def emit(self, **kw):
         self.queue.put(kw)
@@ -642,21 +695,18 @@ class UpdateProgressDialog:
         """
         if self._closed or self._cancelling or self._locked or self.cancel.is_set():
             return
-        if str(self.btn_cancel["state"]) == "disabled":
+        if not self.btn_cancel.is_enabled():
             return
         self._cancelling = True
         self.cancel.set()
         # 按钮置灰并提示，避免重复点击；真正的收尾由工作线程回报后完成
-        try:
-            self.btn_cancel.configure(state=tk.DISABLED, text="正在取消…")
-        except Exception:
-            pass
+        self.btn_cancel.configure_state("disabled", "正在取消…")
         self.stage_var.set("正在取消更新…")
         self._append("收到取消请求，正在断开下载并清理临时文件…")
 
     def _on_window_close(self):
         """点 ✕：能取消就取消（不关窗，等收尾），否则按状态处理。"""
-        if self.btn_close["state"] != "disabled":
+        if self.btn_close.is_enabled():
             self._close()
             return
         if self._locked:
@@ -669,16 +719,14 @@ class UpdateProgressDialog:
     def _finish_cancelled(self):
         """工作线程确认取消已生效：定稿 UI（保留日志供查看，按钮切成「关闭」）。"""
         self._cancelling = False
+        self._poll_job = None        # _poll 的 after 句柄（关闭时必须取消）
         self._locked = True          # 关闭一切取消入口
         self.stage_var.set("已取消更新")
         try:
             self.btn_cancel.pack_forget()   # 取消入口消失，只留「关闭」
         except Exception:
             pass
-        try:
-            self.btn_close.configure(state=tk.NORMAL)
-        except Exception:
-            pass
+        self.btn_close.configure_state("normal")
 
     def _close(self):
         # 下载还没断开时，不允许直接关窗（先取消、等收尾）
@@ -688,6 +736,12 @@ class UpdateProgressDialog:
         if self._closed:
             return
         self._closed = True
+        if self._poll_job is not None:
+            try:
+                self.win.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
         try:
             self.win.destroy()
         except Exception:
@@ -710,7 +764,7 @@ class UpdateProgressDialog:
         except queue.Empty:
             pass
         if not self._closed:
-            self.win.after(80, self._poll)
+            self._poll_job = self.win.after(80, self._poll)
 
     def _apply(self, ev):
         t = ev.get("type")
@@ -720,7 +774,7 @@ class UpdateProgressDialog:
         elif t == "progress":
             w, tot = ev.get("written", 0), ev.get("total", 0)
             pct = (w / tot * 100) if tot else 0
-            self.bar["value"] = pct
+            self.bar.set_value(pct)
             self.pct_var.set(f"{pct:.1f}%")
             self.size_var.set(f"{w / 1048576:.1f} / {tot / 1048576:.1f} MB")
             sp = ev.get("speed", 0) or 0
@@ -733,10 +787,7 @@ class UpdateProgressDialog:
         elif t == "lock":
             # 进入不可取消的落盘阶段
             self._locked = True
-            try:
-                self.btn_cancel.configure(state=tk.DISABLED, text="保存中…")
-            except Exception:
-                pass
+            self.btn_cancel.configure_state("disabled", "保存中…")
         elif t == "cancelled":
             self._finish_cancelled()
         elif t == "done":
@@ -758,17 +809,12 @@ class UpdateProgressDialog:
             else:
                 self.stage_var.set("更新失败")
                 self._append("更新失败，请重试或手动更新。")
-            try:
-                self.btn_cancel.configure(state=tk.DISABLED)
-            except Exception:
-                pass
-            self.btn_close.configure(state=tk.NORMAL)
+            self.btn_cancel.configure_state("disabled")
+            self.btn_close.configure_state("normal")
 
     def _append(self, text):
-        self.txt.configure(state=tk.NORMAL)
-        self.txt.insert(tk.END, text + "\n")
-        self.txt.see(tk.END)
-        self.txt.configure(state=tk.DISABLED)
+        # 更新日志是纯文本，不做分级着色（tag 显式给 None）
+        self.txt.append(text, None)
 
 
 def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
@@ -1399,7 +1445,7 @@ def _process_folder_impl(
         log_queue.put(("log", msg))
 
     def progress(current: int, total: int):
-        # 带上并发路数，界面可直接显示「进度：x / y 份 · 6 路并发」
+        # 第 4 位是并发路数：界面已不再展示，保留在队列里供诊断用
         log_queue.put(("progress", current, total, workers))
 
     cancel = cancel if cancel is not None else CancelToken()
@@ -1450,7 +1496,7 @@ def _process_folder_impl(
     out_bases = _unique_out_bases(files)
     ctx = _TaskCtx(folder, pdf_dir, img_dir, convert_pdf, cancel)
 
-    log(f"开始处理：{total} 张图片，{workers} 路并发。")
+    log(f"开始处理：共 {total} 张图片。")
     # 起始进度归零：旧版是在「开始处理第 N 张之前」就上报 N，
     # 于是进度条先跳一格再干活，且卡在下载时会长时间不动，看着像死机。
     progress(0, total)
@@ -1469,7 +1515,7 @@ def _process_folder_impl(
                 return
             left = total - done
             if left > 0:
-                log(f"  …处理中：已完成 {done}/{total} 张，剩余 {left} 张（{workers} 路并发）")
+                log(f"  …处理中：已完成 {done}/{total} 张，剩余 {left} 张")
 
     threading.Thread(target=_heartbeat, daemon=True).start()
 
@@ -1549,7 +1595,7 @@ def _process_folder_impl(
     if stats["cancelled"]:
         summary.append(f"■ 因「停止」未处理：{stats['cancelled']} 张")
     summary.append(
-        f"耗时：{elapsed:.1f} 秒（{workers} 路并发，平均 {elapsed / max(1, done):.2f} 秒/张）"
+        f"耗时：{elapsed:.1f} 秒（平均 {elapsed / max(1, done):.2f} 秒/张）"
     )
     for line in summary:
         log(line)
@@ -1580,54 +1626,6 @@ def _process_folder_impl(
     log_queue.put(("done",))
 
 
-class _FlatProgressBar(tk.Canvas):
-    """扁平进度条：浅灰轨道 + 细边框 + 蓝色填充，与整体界面风格保持一致。
-
-    系统默认进度条在 Windows 上是绿色渐变，跟这套扁平浅色界面不搭，故自绘。
-    「停止」是未完成态，填充改用琥珀色，与跑满的蓝色一眼可辨。"""
-
-    TRACK = "#EDEFF2"
-    BORDER = "#D6DBE1"
-    FILL = "#2563EB"
-    FILL_STOPPED = "#F59E0B"
-
-    def __init__(self, master, height: int = 20, **kw):
-        super().__init__(
-            master, height=height, bg=self.TRACK, highlightthickness=0, bd=0, **kw
-        )
-        self._value = 0.0
-        self._stopped = False
-        self.bind("<Configure>", lambda _e: self._redraw())
-
-    def set_value(self, pct: float, stopped: bool = False):
-        """设置进度（0~100）。stopped=True 表示这是「已停止」时的残留进度，用琥珀色。"""
-        try:
-            pct = float(pct)
-        except (TypeError, ValueError):
-            pct = 0.0
-        self._value = max(0.0, min(100.0, pct))
-        self._stopped = bool(stopped)
-        self._redraw()
-
-    def reset(self):
-        self.set_value(0)
-
-    def _redraw(self):
-        self.delete("all")
-        w, h = self.winfo_width(), self.winfo_height()
-        if w <= 2 or h <= 2:
-            return
-        self.create_rectangle(
-            0, 0, w - 1, h - 1, outline=self.BORDER, fill=self.TRACK
-        )
-        fill_w = (w - 2) * self._value / 100.0
-        if fill_w >= 1:
-            self.create_rectangle(
-                1, 1, 1 + fill_w, h - 2, outline="",
-                fill=self.FILL_STOPPED if self._stopped else self.FILL,
-            )
-
-
 class InvoiceQrToolApp:
     # 日志区保留的最大行数：上千张图的长任务（每张 2~4 行 + 每 3 秒心跳）会堆到几万行，
     # 滚动越来越卡、也白占内存。超过就裁掉最早的，只留最近的这些行。
@@ -1636,23 +1634,36 @@ class InvoiceQrToolApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"发票二维码识别下载工具 v{__VERSION__}")
-        self.root.geometry("800x600")
-        self.root.minsize(700, 450)
+        K.setup_scale(self.root)          # 按实际 DPI 推导缩放比（150% → 1.5）
+        self.root.configure(bg=K.SKIN.bg)
         apply_window_icon(self.root)
 
         self.folder_var = tk.StringVar()
         self.open_after_var = tk.BooleanVar(value=True)
         self.convert_pdf_var = tk.BooleanVar(value=False)
         self.summarize_var = tk.BooleanVar(value=False)
+        # 进度卡左侧的状态文案。沿用 progress_var 这个变量名：外部脚本与自测
+        # 一直是按这个名字读界面状态的。
+        self.progress_var = tk.StringVar(value="就绪")
+        self.elapsed_var = tk.StringVar(value="")      # 进度卡右侧「已用 mm:ss」
 
         self.log_queue: queue.Queue = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.last_stats: dict | None = None
         self.cancel_token: CancelToken | None = None
         self._busy = False
-        self._log_written = 0        # 距上次裁剪日志已写多少行（见 _log）
+        self._started_at: float | None = None   # 本次任务开始时刻（算「已用」）
+        self._elapsed_job = None                # 每秒刷新的 after 句柄
+        # 三个常驻轮询的 after 句柄：关窗时必须显式取消。否则 root.destroy() 之后
+        # 已排队的回调还会被 Tcl 唤起，报 `invalid command name "...._poll_log"`。
+        self._poll_job = None
+        self._pump_job = None
+        self._closing = False
 
         self._build_ui()
+        # 兜底清理：不管是谁销毁窗口（关闭按钮 / 外部脚本 / 自测），
+        # 都要把常驻轮询的 after 任务取消掉，否则 Tcl 事后会唤起已失效的回调。
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         self._poll_log()
         self._pump_ui()
         # 关闭窗口时若任务还在跑，先让用户确认（避免误关导致半途而废）
@@ -1662,127 +1673,195 @@ class InvoiceQrToolApp:
             target=_silent_startup_check, args=(self.root,), daemon=True
         ).start()
 
-    def _build_menubar(self):
-        """顶部菜单栏：承载「使用说明 / 检查更新 / 清空日志」等次要功能。"""
-        self.menubar = tk.Menu(self.root)
-
-        self.menu_help = tk.Menu(self.menubar, tearoff=0)
-        self.menu_help.add_command(
-            label="使用说明 / 更新记录", command=self._show_help
-        )
-        self.menu_help.add_command(label="检查更新", command=self._check_update)
-        self.menu_help.add_separator()
-        self.menu_help.add_command(label="清空日志", command=self._clear_log)
-        self.menubar.add_cascade(label="帮助", menu=self.menu_help)
-
-        self.root.config(menu=self.menubar)
-
+    # ───────────────────────── 搭界面 ─────────────────────────
+    # 外观是「卡片化」：浅灰底 + 圆角白卡 + 蓝色主色。所有配色与尺寸都取自
+    # ui_kit.SKIN，改外观只改 ui_kit 里那一处，这里一行都不用动。
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 8}
+        sk = K.SKIN
+        K.style_ttk(sk)
+        self._build_topbar()
+        body = tk.Frame(self.root, bg=sk.bg)
+        body.pack(fill=tk.BOTH, expand=True, padx=K.u(sk.page_x),
+                  pady=(K.u(sk.page_top), K.u(sk.page_bottom)))
+        self._build_picker(body)
+        self._build_options(body)
+        self._build_actions(body)
+        self._build_progress_card(body)
+        self._build_log_card(body)
+        self._apply_geometry()
 
-        self._build_menubar()
+    def _apply_geometry(self):
+        """设定窗口尺寸：默认用 SKIN.win，但**钳到可用屏幕内**。
 
-        # 文件夹选择
-        frame_path = ttk.Frame(self.root)
-        frame_path.pack(fill=tk.X, **pad)
-        ttk.Label(frame_path, text="目标文件夹：").pack(side=tk.LEFT)
-        ent_path = ttk.Entry(frame_path, textvariable=self.folder_var)
-        ent_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(frame_path, text="浏览…", command=self._browse_folder).pack(
-            side=tk.LEFT
-        )
+        小屏笔记本（1366×768 @125%，逻辑高只有 614）装不下 690；不钳的话
+        窗口底部会顶出屏幕、日志区整块看不到。
+        """
+        sk = K.SKIN
+        avail_w = int(self.root.winfo_screenwidth() / max(1.0, K.SCALE)) - 60
+        avail_h = int(self.root.winfo_screenheight() / max(1.0, K.SCALE)) - 90
+        w, h = sk.win
+        w, h = max(320, min(w, avail_w)), max(240, min(h, avail_h))
+        mw, mh = sk.win_min
+        self.root.minsize(K.u(min(mw, w)), K.u(min(mh, h)))
+        self.root.geometry("%dx%d" % (K.u(w), K.u(h)))
 
-        # 选项
-        frame_opts = ttk.Frame(self.root)
-        frame_opts.pack(fill=tk.X, **pad)
-        ttk.Checkbutton(
-            frame_opts,
-            text="处理完成后打开文件夹",
-            variable=self.open_after_var,
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(
-            frame_opts,
-            text="将下载的 PDF 转换为图片（JPG，长边 2000px）",
-            variable=self.convert_pdf_var,
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(
-            frame_opts,
-            text="处理完成后汇总发票（生成 Excel）",
-            variable=self.summarize_var,
-        ).pack(side=tk.LEFT, padx=5)
+    def _build_topbar(self):
+        """顶栏：应用图标 + 名称 + 版本徽标，右侧「使用说明 / 检查更新」。"""
+        sk = K.SKIN
+        bar = tk.Frame(self.root, bg=sk.card, height=K.u(sk.topbar_h))
+        bar.pack(fill=tk.X)
+        bar.pack_propagate(False)
+        logo = tk.Canvas(bar, bg=sk.card, highlightthickness=0, bd=0,
+                         width=K.u(sk.logo_s), height=K.u(sk.logo_s))
+        K.logo_mark(logo, K.u(1), K.u(1), K.u(sk.logo_s) - K.u(2), sk)
+        logo.pack(side=tk.LEFT, padx=(K.u(sk.page_x + 2), K.u(10)))
+        tk.Label(bar, text="发票二维码识别下载工具", bg=sk.card, fg=sk.text,
+                 font=K.f(sk.fs_title, True)).pack(side=tk.LEFT)
+        tk.Label(bar, text=f"v{__VERSION__}", bg=sk.accent_l, fg=sk.accent_d,
+                 font=K.f(sk.fs_small - 1, True), padx=K.u(8),
+                 pady=K.u(2)).pack(side=tk.LEFT, padx=K.u(10))
+        K.make_link(bar, sk, "检查更新", self._check_update).pack(
+            side=tk.RIGHT, padx=(K.u(6), K.u(14)))
+        K.make_link(bar, sk, "使用说明", self._show_help).pack(side=tk.RIGHT)
+        tk.Frame(self.root, bg=sk.border, height=1).pack(fill=tk.X)
 
-        # 操作按钮区：整行扁平主按钮（浅底 + 细边框 + 居中文字），点击区域大、易点；
-        # 右侧配「■ 停止」，处理过程中可随时中止（尚未开始的任务会被直接取消）。
-        # 「使用说明 / 检查更新」等次要功能已移入顶部菜单栏。
-        frame_btn_row = ttk.Frame(self.root)
-        frame_btn_row.pack(fill=tk.X, padx=10, pady=(12, 6))
+    def _build_picker(self, parent):
+        """目标文件夹卡片：说明标签 + 输入框 + 「浏览…」。"""
+        sk = K.SKIN
+        card = K.Card(parent, sk)
+        card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        tk.Label(card.body, text="目标文件夹", bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_body, True)).pack(anchor="w")
+        row = tk.Frame(card.body, bg=sk.card)
+        row.pack(fill=tk.X, pady=(K.u(6), 0))
+        self.ent_path = ttk.Entry(row, style="P.TEntry", font=K.f(sk.fs_body),
+                                  textvariable=self.folder_var)
+        self.ent_path.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # ⚠️ 先让输入框量出自己的高度，「浏览…」再对齐它：ttk.Entry 的高度是
+        #    「上下内边距 + 字体行高」，硬编码一个数字永远差几像素。
+        self.ent_path.update_idletasks()
+        self.btn_browse = K.RoundButton(
+            row, sk, "浏览…", self._browse_folder, kind="ghost",
+            width=max(76, int(sk.btn_h * 2.2)),
+            height=self.ent_path.winfo_reqheight() / max(1.0, K.SCALE),
+            font_size=sk.fs_body)
+        self.btn_browse.pack(side=tk.LEFT, padx=(K.u(8), 0))
 
-        frame_btn_border = tk.Frame(frame_btn_row, bg="#D6DBE1")  # 外层充当 1px 细边框
-        frame_btn_border.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def _build_options(self, parent):
+        """处理选项卡片：三个自绘复选框（两个「处理完成后…」并排，转图单独一行）。"""
+        sk = K.SKIN
+        card = K.Card(parent, sk)
+        card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        tk.Label(card.body, text="处理选项", bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_body, True)).pack(anchor="w", pady=(0, K.u(4)))
+        grid = tk.Frame(card.body, bg=sk.card)
+        grid.pack(fill=tk.X)
+        K.RoundCheck(grid, sk, "处理完成后打开文件夹",
+                     self.open_after_var).grid(row=0, column=0, sticky="w",
+                                               pady=K.u(2))
+        K.RoundCheck(grid, sk, "处理完成后汇总发票（Excel）",
+                     self.summarize_var).grid(row=0, column=1, sticky="w",
+                                              padx=(K.u(40), 0), pady=K.u(2))
+        K.RoundCheck(grid, sk, "将下载的 PDF 转换为图片（JPG，长边 2000px）",
+                     self.convert_pdf_var).grid(row=1, column=0, columnspan=2,
+                                                sticky="w", pady=K.u(2))
 
-        self.btn_start = tk.Button(
-            frame_btn_border,
-            text="▶  开始处理",
-            command=self._start_processing,
-            font=("Microsoft YaHei", 12, "bold"),
-            bg="#FAFAFB",
-            fg="#1F2937",
-            activebackground="#EEF1F4",
-            activeforeground="#1F2937",
-            disabledforeground="#9CA3AF",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-            pady=11,
-        )
-        self.btn_start.pack(fill=tk.X, padx=1, pady=1)
+    def _build_actions(self, parent):
+        """操作区：整行蓝色主按钮「▶ 开始处理」+ 右侧「停止」。"""
+        sk = K.SKIN
+        row = tk.Frame(parent, bg=sk.bg)
+        row.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        self.btn_start = K.RoundButton(row, sk, "开始处理", self._start_processing,
+                                       kind="primary", font_size=sk.fs_btn,
+                                       icon="▶", height=sk.btn_h)
+        self.btn_start.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.btn_stop = K.RoundButton(row, sk, "停止", self._stop_processing,
+                                      kind="danger", width=int(sk.btn_h * 2.6),
+                                      font_size=sk.fs_btn2, height=sk.btn_h)
+        self.btn_stop.pack(side=tk.LEFT, padx=(K.u(sk.card_gap), 0))
+        self.btn_stop.configure_state("disabled", "停止")
 
-        # 停止按钮：与主按钮同高、同样扁平细边框风格，但更窄
-        frame_stop_border = tk.Frame(frame_btn_row, bg="#D6DBE1")
-        frame_stop_border.pack(side=tk.LEFT, padx=(6, 0), fill=tk.Y)
-        self.btn_stop = tk.Button(
-            frame_stop_border,
-            text="■  停止",
-            command=self._stop_processing,
-            font=("Microsoft YaHei", 11, "bold"),
-            bg="#FAFAFB",
-            fg="#B91C1C",
-            activebackground="#FEF2F2",
-            activeforeground="#B91C1C",
-            disabledforeground="#C7CBD1",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
-            state=tk.DISABLED,
-            width=9,
-        )
-        self.btn_stop.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+    def _build_progress_card(self, parent):
+        """进度卡片：左侧状态文案 + 右侧「已用 mm:ss」+ 圆角进度条。"""
+        sk = K.SKIN
+        card = K.Card(parent, sk)
+        card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        head = tk.Frame(card.body, bg=sk.card)
+        head.pack(fill=tk.X)
+        tk.Label(head, textvariable=self.progress_var, bg=sk.card, fg=sk.text,
+                 font=K.f(sk.fs_body, True)).pack(side=tk.LEFT)
+        tk.Label(head, textvariable=self.elapsed_var, bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_small)).pack(side=tk.RIGHT)
+        self.progress = K.RoundProgress(card.body, sk, height=sk.bar_h)
+        self.progress.pack(fill=tk.X, pady=(K.u(8), K.u(2)))
 
-        # 进度条 + 右侧「进度：x / y 份」计数，同一行展示
-        frame_progress = ttk.Frame(self.root)
-        frame_progress.pack(fill=tk.X, padx=10, pady=(0, 8))
-        self.progress = _FlatProgressBar(frame_progress, height=20)
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.progress_var = tk.StringVar(
-            value=f"就绪（{DEFAULT_WORKERS} 路并发）"
-        )
-        ttk.Label(
-            frame_progress, textvariable=self.progress_var, width=24, anchor=tk.E
-        ).pack(side=tk.LEFT, padx=(10, 2))
+    def _build_log_card(self, parent):
+        """日志卡片：占满剩余高度，标题行右侧放「清空」。"""
+        sk = K.SKIN
+        card = K.Card(parent, sk, auto=False, fill=True)
+        card.pack(fill=tk.BOTH, expand=True)
+        head = tk.Frame(card.body, bg=sk.card)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="处理日志", bg=sk.card, fg=sk.text,
+                 font=K.f(sk.fs_body, True)).pack(side=tk.LEFT)
+        K.RoundButton(head, sk, "清空", self._clear_log, kind="ghost",
+                      width=64, height=26, font_size=sk.fs_small).pack(side=tk.RIGHT)
+        tk.Frame(card.body, bg=sk.border, height=1).pack(fill=tk.X, pady=K.u(8))
+        self.log_view = K.LogView(card.body, sk, max_lines=self._LOG_MAX_LINES)
+        self.log_view.pack(fill=tk.BOTH, expand=True)
 
-        # 日志区（标题行右侧提供「清空日志」，便于开始下一个任务前清空）
-        frame_log_head = ttk.Frame(self.root)
-        frame_log_head.pack(fill=tk.X, padx=10)
-        ttk.Label(frame_log_head, text="处理日志：").pack(side=tk.LEFT)
-        ttk.Button(
-            frame_log_head, text="清空日志", command=self._clear_log, width=10
-        ).pack(side=tk.RIGHT)
-        self.txt_log = scrolledtext.ScrolledText(
-            self.root, wrap=tk.WORD, state=tk.DISABLED, height=20
-        )
-        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 10))
+    # ───────────────────────── 状态与计时 ─────────────────────────
+    def _elapsed_text(self) -> str:
+        if self._started_at is None:
+            return self.elapsed_var.get()
+        sec = max(0, int(time.time() - self._started_at))
+        return f"已用 {sec // 60:02d}:{sec % 60:02d}"
+
+    def _tick_elapsed(self):
+        """每秒刷新右侧「已用 mm:ss」；任务结束后自动停表。"""
+        if not self._busy or self._started_at is None:
+            self._elapsed_job = None
+            return
+        self.elapsed_var.set(self._elapsed_text())
+        try:
+            self._elapsed_job = self.root.after(1000, self._tick_elapsed)
+        except tk.TclError:
+            self._elapsed_job = None
+
+    def _stop_polling(self):
+        """取消三个常驻 after 任务（日志轮询 / UI 泵 / 计时器）。
+
+        句柄在各自的重排处保存，这里统一取消并置 None —— 幂等，可重复调用。
+        """
+        for name in ("_poll_job", "_pump_job", "_elapsed_job"):
+            job = getattr(self, name, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass            # 窗口已销毁时 Tcl 会拒绝，忽略即可
+                setattr(self, name, None)
+
+    def _on_root_destroy(self, event=None):
+        """<Destroy> 兜底：只在 root 自己被销毁时清理（子控件销毁也会触发本事件）。"""
+        if event is not None and getattr(event, "widget", None) is not self.root:
+            return
+        self._closing = True
+        self._stop_polling()
+
+    def _start_elapsed_timer(self):
+        self._started_at = time.time()
+        self.elapsed_var.set("已用 00:00")
+        self._tick_elapsed()
+
+    def _stop_elapsed_timer(self):
+        if self._elapsed_job is not None:
+            try:
+                self.root.after_cancel(self._elapsed_job)
+            except Exception:
+                pass
+            self._elapsed_job = None
+        self._started_at = None
 
     def _browse_folder(self):
         path = filedialog.askdirectory()
@@ -1798,46 +1877,42 @@ class InvoiceQrToolApp:
         check_and_prompt_update(self.root)
 
     def _show_help(self):
+        sk = K.SKIN
         win = tk.Toplevel(self.root)
         win.title("使用说明 / 更新记录")
-        win.geometry("660x540")
+        _place_child_window(win, 880, 640)
+        win.configure(bg=sk.bg)
         try:
             win.transient(self.root)
             win.grab_set()
         except Exception:
             pass
         apply_window_icon(win)
-        txt = scrolledtext.ScrolledText(win, wrap=tk.WORD, state=tk.NORMAL)
-        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        txt.insert(tk.END, USAGE_TEXT + "\n\n" + CHANGELOG_TEXT)
-        txt.configure(state=tk.DISABLED)
-        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=6)
+        # 先 pack 底部的按钮条，再让卡片吃掉剩余空间（顺序反了按钮会被挤没）
+        btn_row = tk.Frame(win, bg=sk.bg)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, K.u(10)))
+        K.RoundButton(btn_row, sk, "关闭", win.destroy, kind="ghost",
+                      width=110, height=34, font_size=sk.fs_body).pack()
+        card = K.Card(win, sk, auto=False, fill=True)
+        card.pack(fill=tk.BOTH, expand=True, padx=K.u(sk.page_x),
+                  pady=K.u(sk.page_top))
+        view = K.LogView(card.body, sk)
+        view.pack(fill=tk.BOTH, expand=True)
+        view.set_text(USAGE_TEXT + "\n\n" + CHANGELOG_TEXT)
 
     def _clear_log(self):
         """清空日志区内容（不影响正在运行的任务），便于开始下一个任务。"""
-        self.txt_log.configure(state=tk.NORMAL)
-        self.txt_log.delete("1.0", tk.END)
-        self.txt_log.configure(state=tk.DISABLED)
-        self._log_written = 0
+        self.log_view.clear()
 
     def _log(self, msg: str):
         now = time.strftime("%H:%M:%S")
-        self.txt_log.configure(state=tk.NORMAL)
-        self.txt_log.insert(tk.END, f"[{now}] {msg}\n")
-        # 每写满一批就检查一次总行数（不逐行查，省开销），超限裁掉最早的部分
-        self._log_written += 1
-        if self._log_written >= 200:
-            self._log_written = 0
-            try:
-                total = int(self.txt_log.index("end-1c").split(".")[0])
-                if total > self._LOG_MAX_LINES:
-                    self.txt_log.delete("1.0", f"{total - self._LOG_MAX_LINES}.0")
-            except Exception:
-                pass
-        self.txt_log.see(tk.END)
-        self.txt_log.configure(state=tk.DISABLED)
+        # 级别按**正文**判定（tag_for 会自动跳过 [HH:MM:SS] 前缀），
+        # 这样「=== / ✓ / ⚠ / ✗」的着色规则不会因加了时间戳而失效。
+        self.log_view.append(f"[{now}] {msg}", K.LogView.tag_for(msg))
 
     def _poll_log(self):
+        if self._closing:
+            return
         try:
             while True:
                 item = self.log_queue.get_nowait()
@@ -1845,12 +1920,10 @@ class InvoiceQrToolApp:
                     self._log(item[1])
                 elif item[0] == "progress":
                     current, total = item[1], item[2]
-                    workers = item[3] if len(item) > 3 else DEFAULT_WORKERS
+                    # 第 4 位是并发路数：界面已不再展示，保留在队列里供诊断用
                     if total > 0:
                         self.progress.set_value((current / total) * 100)
-                        self.progress_var.set(
-                            f"进度：{current} / {total} 份 · {workers} 路并发"
-                        )
+                        self.progress_var.set(f"正在处理 {current} / {total} 份")
                     else:
                         # total == 0：文件夹里没有可处理的图片，不是「跑完了」
                         self.progress.reset()
@@ -1864,7 +1937,7 @@ class InvoiceQrToolApp:
         except tk.TclError:
             return          # 窗口已销毁，停止轮询
         try:
-            self.root.after(100, self._poll_log)
+            self._poll_job = self.root.after(100, self._poll_log)
         except tk.TclError:
             pass
 
@@ -1874,6 +1947,8 @@ class InvoiceQrToolApp:
         更新检查跑在后台线程，它拿到的结果必须回到主线程才能碰界面；这是那条通道的
         消费端。放在这里是因为它和其他轮询一样依赖主线程的事件循环。
         """
+        if self._closing:
+            return
         try:
             while True:
                 fn = _UI_QUEUE.get_nowait()
@@ -1884,7 +1959,7 @@ class InvoiceQrToolApp:
         except queue.Empty:
             pass
         try:
-            self.root.after(60, self._pump_ui)
+            self._pump_job = self.root.after(60, self._pump_ui)
         except tk.TclError:
             pass
 
@@ -1903,9 +1978,7 @@ class InvoiceQrToolApp:
             self.progress.set_value(
                 (done / total * 100) if total else 0.0, stopped=True
             )
-            self.progress_var.set(
-                f"已停止：{done} / {total} 份（未处理 {s.get('cancelled') or 0} 份）"
-            )
+            self.progress_var.set(f"已停止：{done} / {total} 份")
         elif s and not (s.get("total") or 0):
             # 文件夹里没有可处理的图片：空进度 + 明确文案，别显示成跑满
             self.progress.reset()
@@ -1913,12 +1986,17 @@ class InvoiceQrToolApp:
         else:
             self.progress.set_value(100)
             if s:
-                self.progress_var.set(
-                    f"进度：{s['total']} / {s['total']} 份 · "
-                    f"{s.get('workers', DEFAULT_WORKERS)} 路并发"
-                )
-        self.btn_start.configure(state=tk.NORMAL, text="▶  开始处理")
-        self.btn_stop.configure(state=tk.DISABLED, text="■  停止")
+                self.progress_var.set(f"已完成 {s['total']} / {s['total']} 份")
+        # 停表：优先用工作线程实测的耗时，拿不到就用界面自己的计时
+        el = (s or {}).get("elapsed") or 0.0
+        if el:
+            self.elapsed_var.set(
+                f"已用 {int(el) // 60:02d}:{int(el) % 60:02d}")
+        else:
+            self.elapsed_var.set(self._elapsed_text())
+        self._stop_elapsed_timer()
+        self.btn_start.configure_state("normal", "开始处理")
+        self.btn_stop.configure_state("disabled", "停止")
         self._log("--- 任务结束 ---")
         if s:
             self._show_stats_popup(s)
@@ -1945,8 +2023,7 @@ class InvoiceQrToolApp:
             processed = max(1, s["total"] - cancelled)
             msg += (
                 f"\n\n耗时：{elapsed:.1f} 秒"
-                f"（{s.get('workers', DEFAULT_WORKERS)} 路并发，"
-                f"平均 {elapsed / processed:.2f} 秒/张）"
+                f"（平均 {elapsed / processed:.2f} 秒/张）"
             )
         messagebox.showinfo("识别结果统计", msg)
 
@@ -1962,11 +2039,12 @@ class InvoiceQrToolApp:
         _PROCESSING.set()
         self.cancel_token = CancelToken()
 
-        self.btn_start.configure(state=tk.DISABLED, text="处理中…")
-        self.btn_stop.configure(state=tk.NORMAL, text="■  停止")
+        self.btn_start.configure_state("disabled", "处理中…")
+        self.btn_stop.configure_state("normal", "停止")
         self.progress.set_value(0)
-        self.progress_var.set(f"正在准备…（{DEFAULT_WORKERS} 路并发）")
-        self._log(f"=== 开始处理（{DEFAULT_WORKERS} 路并发）===")
+        self.progress_var.set("正在准备…")
+        self._start_elapsed_timer()
+        self._log("=== 开始处理 ===")
 
         self.worker_thread = threading.Thread(
             target=process_folder,
@@ -1986,7 +2064,7 @@ class InvoiceQrToolApp:
         """请求中止：尚未开始的任务会被直接取消，已发出的网络请求会自然收尾。"""
         if not self._busy or self.cancel_token is None:
             return
-        self.btn_stop.configure(state=tk.DISABLED, text="正在停止…")
+        self.btn_stop.configure_state("disabled", "正在停止…")
         self.cancel_token.cancel()
         self._log("--- 已请求停止：等待已开始的任务收尾（已发出的网络请求无法中途打断）---")
 
@@ -2002,6 +2080,10 @@ class InvoiceQrToolApp:
                 return
             if self.cancel_token is not None:
                 self.cancel_token.cancel()
+        # 先立标志再取消句柄：标志挡住「取消瞬间又自己排了一个」的竞态，
+        # 这样 destroy 之后不会再有回调被 Tcl 唤起。（<Destroy> 绑定会再兜一次）
+        self._closing = True
+        self._stop_polling()
         self.root.destroy()
 
 
