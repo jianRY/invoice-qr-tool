@@ -84,11 +84,16 @@ SUPPORTED_PDF_EXTS = (".pdf",)
 # 「PDF 前置转换」子文件夹名：只要目标文件夹里出现 PDF，就把 PDF 转出的图片与原有图片
 # 一起收进这个子文件夹，再在其中按原逻辑处理（输出 PDF/ 未识别/ 汇总表也都落在它里面）。
 POSTPROCESS_DIR_NAME = "处理后"
+# 「重复票据」子文件夹：重新下载回来才发现与已有 PDF 内容一模一样的发票，
+# 把它的**原始图片**复制一份进去，方便人工过目（原图保留不动）。
+DUP_DIR_NAME = "重复票据"
+
 
 # 状态前缀：把“未下载 / 未识别 / 其它”的图片复制到「未识别」子文件夹时加在文件名前
 PREFIX_UNRECOGNIZED = "未识别-"  # 未识别到任何二维码
 PREFIX_NOT_DOWNLOADED = "未下载-"  # 识别到网址但无可下载的 PDF
 PREFIX_OTHER = "其它-"           # 其它情况（识别到二维码但内容非网址等）
+PREFIX_DUPLICATE = "重复-"        # 内容与已有发票完全相同（重复票据）
 
 # 二维码识别的内存护栏。zxing-cpp 识别小二维码靠「逐级放大重试」，而放大后的位图是
 # 实体内存（宽 × 高 × 3 字节）：4000×3000 再放大 2× 就是 8000×6000 ≈ 144MB / 张，
@@ -100,7 +105,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.0.1"
+__VERSION__ = "5.0.2"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -180,7 +185,7 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    要中止就点「开始处理」右侧的「停止」；日志卡右上角有「清空日志」。
    「使用说明 / 更新记录」「检查更新」在顶栏右侧。
 5. 处理完成后，PDF 在「PDF」文件夹，转换图片在「PDF/图片」，问题图片的副本在「未识别」文件夹，
-   汇总表在「PDF/发票汇总_*.xlsx」。
+   重复票据的原图副本在「重复票据」文件夹，汇总表在「PDF/发票汇总_*.xlsx」。
 
 【自动更新】
 - 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「是」即自动
@@ -203,11 +208,14 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 网址 + 无 PDF 可下载 → 复制一份到「未识别/未下载-<原名>」
 - 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
 - 识别到二维码但非网址 → 复制一份到「未识别/其它-<原名>」
+- 内容与已有发票相同   → 复制一份到「重复票据/重复-<原名>」（原图保留不动，便于人工核对）
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
-- 自动维护             → PDF/_去重索引.json（记录「网址 → 发票内容指纹」，供重跑时免发请求）
-                         · 删掉它不影响已下载的 PDF（下一轮仍会按同名文件跳过，并重新记一遍）
-                         · 想让某张发票强制重新下载：把 PDF/<名字>.pdf 删掉即可；
-                           该条记忆对应的 PDF 不在盘上时会自动失效，不会拦着你重下
+- 过程中临时文件       → PDF/_去重索引.json（记录「网址 → 发票内容指纹」，供重跑时免发请求）
+                         PDF/_图片指纹.json（记录「图片内容 → 已保存 PDF」，供改名后重跑免发请求）
+                         · **两者都在任务结束（含中途「停止」）时自动删除**，不留中间产物
+                         · 删掉只损失一点速度、不影响正确性：下一轮仍会按「同名 PDF 已存在」
+                           跳过，并对现有 PDF 重新算一遍内容指纹，结果一模一样
+                         · 想让某张发票强制重新下载：把 PDF/<名字>.pdf 删掉即可
 - 勾选汇总             → PDF/发票汇总_YYYYMMDD_HHMMSS.xlsx（金额类列为纯数字、无千分位；
                          「是否重复」列互指重复行号；右侧「统计（剔重后）」按剔重口径统计，
                          「重复票据」块只计同票号第 2 张及以后）
@@ -227,7 +235,17 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - **同一张发票永不重复下载**：软件在下一次处理时会比对「二维码网址 → 发票内容指纹」的
   记忆，命中就不发请求（日志显示「上次已下载过，本次直接复用「…」（未重新下载）」）。
   因此同一文件夹反复处理，**第 2 轮起的下载次数为 0**；把图片改名后再跑同样认得出来。
-  该记忆保存在「PDF/_去重索引.json」；对应的 PDF 被删掉后，该条记录会在下次运行时自动清除。
+- **索引删掉后，重跑依旧不白发请求**：索引是加速用的缓存、收尾即删，为了让重跑仍然
+  「零请求」，软件还会用**文件系统本身就能推导出来的信息**兜底，这些信息不依赖任何中间文件：
+  · 同名 PDF 已存在 → 直接复用；
+  · 源 PDF 转出的页面图 → 认出它来自哪份 PDF，直接复用（日志「这张图由「…」转出」）；
+  · 同一批里内容完全相同的图（同一张发票存了多份）→ 自动结对，只让第一张去请求；
+  · 以上都没命中时，才发一次请求确认内容，确认后发现与已有发票相同即合并、不重复保存。
+- **重复票据会留下原图**：如果重新下载回来才发现某张发票与已有 PDF 内容一模一样
+  （说明它还有第二个下载入口，或网址已被平台改动），软件会把这张发票的**原始图片**
+  复制一份到「重复票据」文件夹，文件名前加「重复-」，方便你人工核对到底是哪张；
+  原图与已下载的 PDF 都保持不动。同一张发票被拍多张图（二维码网址相同）属**已知去重**，
+  只复用不重复下载，也不会往「重复票据」里塞 —— 避免这个文件夹被噪声撑大。
 - 「汇总发票」这一步保持单线程：它用 pdfplumber 解析 PDF，属纯 Python 计算，
   并发实测没有收益（1.0×）。
 - 单文件 EXE，无需安装，双击即用。
@@ -235,6 +253,29 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-20  v5.0.2
+- **新增：重复票据的原图会被留证** —— 重新下载回来才发现与已有发票内容完全相同的，
+  软件会把这张发票的**原始图片**复制一份到「重复票据」文件夹（不存在则自动新建），
+  文件名前加「重复-」，方便你一眼看出是哪张原图出了问题。原图与已下载的 PDF 都保持不动。
+  同一张发票被拍多张图（二维码网址相同）属已知去重，只复用、不重复下载，也不进这个文件夹。
+- **新增：任务结束后自动清理去重索引** —— 「PDF/_去重索引.json」是重跑加速用的缓存，
+  现在收尾时（正常跑完或中途「停止」）会自动删掉。删掉不影响正确性：下一轮仍会按
+  「同名 PDF 已存在」跳过，并对现有 PDF 重新计算内容指纹，结果完全一致。
+- **重跑不再有「白发一次的请求」** —— 索引收尾即删，为了不让删索引变成「下一轮多下一次」，
+  软件改用**文件系统本身就能推导的关系**来去重，这些关系不依赖任何中间文件、删掉索引照样成立：
+  · 源 PDF 转出的页面图（如「电子发票1_1.jpg」）能认出自己来自「电子发票1.pdf」，直接复用；
+  · 同一批里内容完全相同的图片（同一张发票被存了两份）自动结对，只让第一张去请求。
+  实测「文件夹里放 PDF + 图片」「同一发票存两份图」「上次被强杀留下暂存」这几种场景，
+  重跑的真实请求数都降到 0。
+- **修复：一张发票被存成两份图时，重跑会偶发多请求一次** —— 两份图内容相同、由并发决定
+  谁是「被下载的那张」，若下次跑时恰好先处理了另一张，就会白下一次。现在会优先让
+  「名下已有 PDF」的那张当代表，从根上消除这个竞态（压测 30 轮零复现）。
+- **修复：空文件夹（没有需要处理的图片）时会报「处理过程出现未预期的错误」** ——
+  收尾清理那一步误用了尚未创建的变量，导致这条路径必然报错。现已修正。
+- 使用说明同步：新增「重复票据」文件夹与输出规则，订正缓存文件说明，并补充「删索引后
+  为何重跑仍然零请求」的解释。
+- 说明：本次为功能补充版本，使用方式与输出文件规则与 v5.0.1 完全一致，直接覆盖安装即可。
 
 2026-09-20  v5.0.1
 - **修复：相同的 PDF 又重复下载了（v4.10.0 起的回归）** —— v4.10.0 承诺过「已下载的会
@@ -1067,6 +1108,10 @@ def _sha1_file(path: str) -> str:
 
 # 跨轮去重记忆的文件名（放在「PDF」目录里：该目录会被保留/恢复，汇总只认 *.pdf 不受影响）
 CACHE_FILE_NAME = "_去重索引.json"
+# 「图片内容 → 该内容对应的已保存 PDF」清单：删掉索引后仍能免掉重复请求的关键。
+# 只记内容指纹（不含网址），因此比索引更耐改（图片改名、换轮次都不受影响）。
+# 同样在任务收尾时删除 —— 它只是本轮的加速缓存，不是用户数据。
+SHOT_CACHE_FILE_NAME = "_图片指纹.json"
 
 
 class _DedupIndex:
@@ -1091,7 +1136,8 @@ class _DedupIndex:
     # 等待期间的轮询间隔：足够细，用户点「停止」能很快挣脱
     POLL = 0.25
 
-    def __init__(self, pdf_dir: str, source_pdfs=None, cache_path: "str | None" = None):
+    def __init__(self, pdf_dir: str, source_pdfs=None, cache_path: "str | None" = None,
+                 shot_path: "str | None" = None):
         self.pdf_dir = pdf_dir
         # 文件夹里本来就有的发票 PDF（PDF 前置转换的输入）也纳入内容判定，
         # 免得「源 PDF 就在旁边」却又下一份一模一样的回来
@@ -1102,11 +1148,23 @@ class _DedupIndex:
         self._by_path: dict = {}    # normcase 绝对路径 -> sha1（让 adopt 能反查指纹）
         self._cache: dict = {}      # url -> sha1（跨轮记忆，落盘到 cache_path）
         self.cache_path = cache_path
+        self._shot_path = shot_path
         self._remembered: set = set()   # 本次运行开始前就已知的网址（快照）
         self._cache_loaded = False
         self._scanned = False
         self.reused_urls = 0        # 本次由跨轮记忆直接命中、免发请求的网址数
         self.duplicate_files = 0    # 索引里发现的「内容相同但文件名不同」的存量
+        self.dup_hits = 0           # 本次运行中「下载回来才发现内容重复」的次数
+        # 图片内容 SHA1 -> 已保存的 PDF 文件名。同一张图被存成两份、或源 PDF 转出的
+        # 页面图与已有 PDF 内容一致时，靠它直接复用、**不再发请求**。
+        # ⚠️ 不要再给 _shot_path 赋 None：上面已由构造参数设好，
+        #    在此重复赋 None 会让图片指纹整层静默失效（落盘路径变 None，永远不写文件）。
+        self._shot: dict = {}
+        self.shot_reused = 0        # 本次靠图片指纹免掉请求的图片数
+        # 文件名别名表：本张图片「其实对应」哪份 PDF（页面图 → 源 PDF）。
+        # 纯内存、每轮由前置转换重新推导，不落盘 —— 因此收尾删索引对它毫无影响。
+        self._alias: dict = {}
+        self.alias_reused = 0       # 本次靠别名表免掉的请求数
 
     # ---- 内部 ----
     def _scan_locked(self):
@@ -1173,6 +1231,134 @@ class _DedupIndex:
         # 属本轮新学到的，不算「上次下过」，两者日志文案不同。
         self._remembered = set(self._cache)
 
+    # ---- 图片内容指纹（删索引后仍免请求的关键）----
+    def _load_shots_locked(self):
+        """读入上一轮记下的「图片内容 → 已保存 PDF 文件名」。"""
+        if self._shot or not self._shot_path:
+            return
+        try:
+            with open(self._shot_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            shots = data.get("shots") if isinstance(data, dict) else None
+            if isinstance(shots, dict):
+                self._shot = {str(k): str(v) for k, v in shots.items()}
+        except (OSError, ValueError, TypeError):
+            self._shot = {}
+
+    def flush_shots(self, log=None):
+        """把图片指纹清单落盘（tmp + os.replace），只保留对应 PDF 仍在盘上的条目。"""
+        if not self._shot_path:
+            return
+        with self._lock:
+            self._scan_locked()
+            keep = {k: v for k, v in self._shot.items()
+                    if _is_valid_pdf_file(os.path.join(self.pdf_dir, v))}
+            self._shot = keep
+        if not keep:
+            return
+        tmp = self._shot_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self._shot_path), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                json.dump({"version": 1, "shots": keep}, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self._shot_path)
+        except OSError as e:
+            if log:
+                log(f"图片指纹：写入失败（{e}），下一轮会重新计算。")
+
+    def link_identical_images(self, folder: str, names, log=None) -> int:
+        """把同一批里**内容完全相同**的图片预先结成一组，只让第一个去请求。
+
+        场景：文件夹里放了同一张发票的两份图（字节相同、文件名不同）。若不做这件事，
+        两份图会各自去下载一次；删掉去重索引后更是每轮都要白下一次。
+        分组只看内容 SHA1，纯文件系统推导，**不依赖任何落盘缓存**。
+
+        做法：同组登记「其余图片名 → 组代表名」，代表下载完产出
+        「代表名.pdf」后，其余图片凭别名直接命中（见 _process_one 的 alias 分支）。
+        代表名本身没有对应 PDF 时，别名查不到有效 PDF，回退到原来的逻辑，不会误判。
+
+        返回结成的组数（用于日志）。
+        """
+        by_digest: dict = {}
+        for nm in names:
+            fp = os.path.join(folder, nm)
+            try:
+                dg = _sha1_file(fp)
+            except OSError:
+                continue
+            if dg:
+                by_digest.setdefault(dg, []).append(nm)
+        groups = 0
+        with self._lock:
+            for _dg, members in by_digest.items():
+                if len(members) < 2:
+                    continue
+                # ① 代表优先挑「名下 PDF 已存在」的那张：它已经有成果，绝不能再去请求。
+                #    否则会出现「代表自己没 PDF → 白下一次」的竞态。
+                head = None
+                for nm in members:
+                    cand = os.path.splitext(nm)[0] + ".pdf"
+                    if _is_valid_pdf_file(os.path.join(self.pdf_dir, cand)):
+                        head = nm
+                        break
+                # ② 组内都还没 PDF（本轮首次），按原顺序取第一个当代表去下载
+                if head is None:
+                    head = members[0]
+                head_pdf = os.path.splitext(head)[0] + ".pdf"
+                for other in members:
+                    if other == head:
+                        continue
+                    self._alias[os.path.normcase(other)] = head_pdf
+                groups += 1
+        if log and groups:
+            log(f"去重索引：本批有 {groups} 组图片内容完全相同（同一张发票存了多份），"
+                f"同组只处理第一张，其余直接复用、不会重复请求。")
+        return groups
+
+    def remember_alias(self, img_name: str, pdf_name: str):
+        """登记「这张图片其实对应那份 PDF」（页面图 → 源 PDF）。
+
+        与图片指纹的区别：指纹靠图片内容 SHA1，需要先读文件算哈希；别名靠文件名，
+        零开销且必然命中 —— 页面图每次都是同一份 PDF 用同一套命名规则转出来的。
+        """
+        if not img_name or not pdf_name:
+            return
+        with self._lock:
+            self._alias[os.path.normcase(img_name)] = pdf_name
+
+    def lookup_alias(self, img_name: str) -> "str | None":
+        """这张图是否登记过对应的 PDF？有且那份 PDF 确实在「PDF」目录里就返回其名。"""
+        if not img_name:
+            return None
+        with self._lock:
+            name = self._alias.get(os.path.normcase(img_name))
+            if not name:
+                return None
+            if not _is_valid_pdf_file(os.path.join(self.pdf_dir, name)):
+                return None
+            return name
+
+    def remember_shot(self, shot_digest: "str | None", pdf_name: str):
+        """记下「这张图片的内容 = 那份 PDF」，供下一轮开局直接复用。"""
+        if not shot_digest or not pdf_name:
+            return
+        with self._lock:
+            self._shot[shot_digest] = pdf_name
+
+    def lookup_shot(self, shot_digest: "str | None") -> "str | None":
+        """这张图片的内容之前是否已有对应 PDF？有就返回文件名。"""
+        if not shot_digest:
+            return None
+        with self._lock:
+            self._load_shots_locked()
+            name = self._shot.get(shot_digest)
+            if not name:
+                return None
+            if not _is_valid_pdf_file(os.path.join(self.pdf_dir, name)):
+                self._shot.pop(shot_digest, None)   # 那份 PDF 已被删 → 记忆失效
+                return None
+            return name
+
     def flush(self, log=None):
         """把跨轮记忆写回磁盘（tmp + os.replace 原子替换；只保留指纹仍在盘上的条目）。
 
@@ -1228,6 +1414,9 @@ class _DedupIndex:
         if log and dup:
             log(f"去重索引：其中发现 {dup} 份内容完全相同的 PDF（疑似同一发票的重复副本）。"
                 f"按「相同发票只留一份」的规则，本次不会再下载它们，存量文件保持不动。")
+        if log and self._shot:
+            log(f"图片指纹：记下了 {len(self._shot)} 张图片与已有 PDF 的对应关系，"
+                f"重跑时这些图片不会再发请求。")
 
     def adopt(self, url: str, pdf_path: str):
         """目标 PDF 本来就在（同名）时登记台账，好让后面同网址的图直接复用。"""
@@ -1287,14 +1476,21 @@ class _DedupIndex:
                 st["name"] = None
                 st["event"].set()
 
-    def settle(self, url: str, pdf_path: str):
-        """下载完成后登记内容。返回保留者的文件名（说明自己这份没留下），否则 None。"""
+    def settle(self, url: str, pdf_path: str, shot_digest: "str | None" = None):
+        """下载完成后登记内容。
+
+        返回 ``(保留者的文件名或 None, 是否「内容与已有发票完全相同」)``。
+
+        第 2 个值专门用来告诉调用方「这是一张重复票据」——只有走到内容 SHA1 比对那一层
+        命中时才是 True；同名复用 / 同网址复用属于**已知的去重**，不算重复票据，
+        免得把「上次已经下过、这次照常跳过」这种正常情况也报成重复。
+        """
         try:
             digest = _sha1_file(pdf_path)
         except OSError:
             with self._lock:
                 self._commit_locked(url, os.path.basename(pdf_path))
-            return None
+            return None, False
 
         with self._lock:
             self._scan_locked()
@@ -1317,18 +1513,25 @@ class _DedupIndex:
                     except OSError:
                         pass
                     self._commit_locked(url, os.path.basename(keeper))
-                    return os.path.basename(keeper)
+                    self.dup_hits += 1
+                    # 这张图的内容 = 那份 PDF → 记下来，下一轮开局直接复用、不再发请求
+                    if shot_digest:
+                        self._shot[shot_digest] = os.path.basename(keeper)
+                    return os.path.basename(keeper), True
                 # 保留者是**文件夹里自带的源 PDF**（在 PDF 目录之外）。此时不能去动它
                 # （用户的原件一律不动），而「PDF」目录里又必须有这一份供汇总使用，
                 # 于是留下自己这份，并把「内容 → 保留者」改指向自己：
                 # 后续同内容的图片就会命中我，不会再留第二份。
                 self._by_hash[digest] = pdf_path
                 self._commit_locked(url, os.path.basename(pdf_path))
-                return None
+                return None, False
 
             self._by_hash.setdefault(digest, pdf_path)
             self._commit_locked(url, os.path.basename(pdf_path))
-            return None
+            if shot_digest:
+                # 本张图下回来的就是它自己那份 PDF → 记住，重跑时无需再请求
+                self._shot[shot_digest] = os.path.basename(pdf_path)
+            return None, False
 
 
 class _TaskCtx:
@@ -1448,18 +1651,60 @@ def _copy_to_unrecognized(folder: str, fpath: str, fname: str, prefix: str):
     并发安全：目标名固定为「前缀 + 原文件名」，同一张图片只会被处理一次，
     不存在两个线程写同一个目标文件的情况。
     """
-    sub = os.path.join(folder, "未识别")
+    return _copy_original_into(folder, "未识别", fpath, fname, prefix)
+
+
+def _remove_dedup_cache(pdf_dir: str, log=None, file_name: str = CACHE_FILE_NAME) -> bool:
+    """删除「PDF」目录下的跨轮去重索引文件。
+
+    它是纯加速缓存：删掉之后下一轮靠「同名 PDF 已存在」与内容 SHA1 扫描照样能复用，
+    只是要重新算一遍指纹、多花零点几秒。按建哥要求，任务收尾时一律清理。
+
+    返回是否确实删掉了一个文件（不存在则返回 False，不算失败）。
+    """
+    path = os.path.join(pdf_dir, file_name)
+    if not os.path.exists(path):
+        return False
     try:
-        os.makedirs(sub, exist_ok=True)
+        os.remove(path)
+        if log:
+            label = "去重索引" if file_name == CACHE_FILE_NAME else "图片指纹"
+            log(f"已清理{label}：{file_name}（下次运行会重新建立）")
+        return True
+    except OSError as e:
+        if log:
+            log(f"去重索引清理失败（{e}），不影响本次结果。")
+        return False
+
+
+def _copy_original_into(folder: str, sub: str, fpath: str, fname: str, prefix: str):
+    """把原图复制一份到 ``folder/sub/``，文件名前加 prefix；**原图保留不动**。
+
+    「未识别」与「重复票据」两个文件夹共用这一个内核，行为完全一致：文件夹不存在就新建，
+    重名自动加序号让位（同名前缀下不可能撞，但外部往里丢过东西时要能兜住）。
+
+    返回 (目标路径或 None, 日志行列表)。并发安全：目标名只由「前缀 + 原文件名」决定，
+    同一张图片只处理一次，不存在两个线程写同一个目标文件的情况。
+    """
+    target_dir = os.path.join(folder, sub)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
     except Exception as e:
-        return None, [f"  -> 创建「未识别」文件夹失败：{e}"]
+        return None, [f"  -> 创建「{sub}」文件夹失败：{e}"]
     new_name = prefix + fname
-    dest = os.path.join(sub, new_name)
+    dest = os.path.join(target_dir, new_name)
+    if os.path.exists(dest):
+        # 同一原图被处理两次、或用户手工往里放过同名文件：让位而不是覆盖
+        stem, ext = os.path.splitext(new_name)
+        i = 1
+        while os.path.exists(dest):
+            i += 1
+            dest = os.path.join(target_dir, f"{stem}_{i}{ext}")
     try:
         shutil.copy2(fpath, dest)
     except Exception as e:
         return None, [f"  -> 复制失败：{e}"]
-    return dest, [f"  -> 已复制到「未识别」：{new_name}"]
+    return dest, [f"  -> 已复制到「{sub}」：{os.path.basename(dest)}"]
 
 
 def _is_valid_pdf_file(path: str) -> bool:
@@ -1484,17 +1729,21 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     关键设计：**不写任何共享状态**。统计、进度、日志全部通过返回值交回主线程汇总，
     所以无论多少路并发都不会出现计数竞态，也不需要加锁。
 
-    返回 {"fname", "kind", "elapsed", "lines"}，
+    返回 {"fname", "kind", "dup_hit", "elapsed", "lines"}，
     kind ∈ success / no_pdf / unrecognized / other / error / cancelled。
+    dup_hit=True 表示这是一张「重复票据」（内容与已有发票完全相同），原图已复制到
+    「重复票据」文件夹 —— 用独立字段而非塞进 kind，是为了不新增状态、不动既有统计口径。
     """
     t0 = time.perf_counter()
     fpath = os.path.join(ctx.folder, fname)
     lines: list = []
+    dup_hit = False      # 本次是否「重下回来才发现内容重复」（要复制原图到「重复票据」）
 
     def finish(kind: str) -> dict:
         return {
             "fname": fname,
             "kind": kind,
+            "dup_hit": dup_hit,
             "elapsed": time.perf_counter() - t0,
             "lines": lines,
         }
@@ -1535,13 +1784,49 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     #      ③ 下载结果内容与已有 PDF 相同 → 只留一份。
     pdf_path = os.path.join(ctx.pdf_dir, f"{out_base}.pdf")
     already = _is_valid_pdf_file(pdf_path)
+
+    # ★ 图片内容指纹：这张图的内容之前已经对应过某份 PDF（比如同一张图存了两份、
+    #   或上一轮它就是从这个网址下回来的）→ 直接复用，**连请求都不发**。
+    #   这一层正是为了「删掉网址索引后重跑仍不白发请求」而加的：网址索引怕改，
+    #   而图片内容指纹只看图片本身，改名/换轮次都不受影响。
     reused = already
+    shot_digest = None
+    shot_hit = None
+    alias_hit = None
+    if not already:
+        # ★ 别名表：本张图是「某份 PDF 转出来的页面图」→ 那份 PDF 就是它，零请求。
+        #   这一层只看文件名，不用算哈希、也不依赖任何 json 缓存，因此最稳。
+        alias_hit = ctx.dedup.lookup_alias(fname)
+        if not alias_hit:
+            try:
+                shot_digest = _sha1_file(fpath)
+            except OSError:
+                shot_digest = None
+            shot_hit = ctx.dedup.lookup_shot(shot_digest) if shot_digest else None
+
     if already:
+        reused = True
         # 这一份上次已经下过（中途「停止」后再跑、隔天补几张再跑都会碰到）：
         # 直接复用，不再请求一次。同一平台短时间内并发请求多了容易被限流，
         # 全量重下既慢又容易让本来正常的票据变成「未下载」。
         ctx.dedup.adopt(url, pdf_path)
+        # 顺手记下「这张图 = 这份 PDF」：删掉索引后重跑，靠它开局就能认出、不再请求
+        ctx.dedup.remember_shot(shot_digest, os.path.basename(pdf_path))
         lines.append(f"  -> 已存在 PDF，跳过下载：{os.path.basename(pdf_path)}")
+    elif alias_hit:
+        # 本张图已被判定「就是那份 PDF」（页面图转出的 / 与本批另一张图内容完全相同）
+        # → 零请求直接复用。
+        reused = True
+        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, alias_hit))
+        ctx.dedup.alias_reused += 1
+        lines.append(f"  -> 本张图与「{alias_hit}」是同一次识别，该发票已存在（未重新下载）")
+    elif shot_hit:
+        # 这张图的内容之前已经对应过某份 PDF（同一张图存了两份、或上一轮就是它下的）
+        # → 直接复用，连请求都不发。比自己名下那份改了名的情况也能命中。
+        reused = True
+        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, shot_hit))
+        ctx.dedup.shot_reused += 1
+        lines.append(f"  -> 这张图上次已处理过，直接复用「{shot_hit}」（未重新下载）")
     else:
         verdict, shared = ctx.dedup.begin(url, ctx.cancel)
         if ctx.cancel.cancelled:
@@ -1552,6 +1837,10 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
         if verdict == "reuse":
             # 不再发请求，也不为它多存一份 PDF
             reused = True
+            # 同一发票的另一张图（同网址）走到这里：它最终就是 shared 那份 PDF，
+            # 一并记下图片指纹 —— 否则下一轮删掉索引后，这张图又要白请求一次。
+            if shared:
+                ctx.dedup.remember_shot(shot_digest, os.path.basename(shared))
             if ctx.dedup.seen_before(url):
                 lines.append(f"  -> 上次已下载过，本次直接复用「{shared}」（未重新下载）")
             else:
@@ -1578,16 +1867,25 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
                 lines.extend(msgs)
                 return finish("no_pdf")
             try:
-                keeper = ctx.dedup.settle(url, pdf_path)
+                keeper, is_dup = ctx.dedup.settle(url, pdf_path, shot_digest)
             except Exception as e:
                 # 登记台账出问题不该影响下载结果本身，更不能把同网址的等待者晾在那儿
                 ctx.dedup.abort(url)
-                keeper = None
+                keeper, is_dup = None, False
                 lines.append(f"  -> 去重登记失败（{e}），本次下载结果照常保留")
             if keeper:
                 # 下载回来的内容与已有 PDF 一模一样（同一张发票的另一个下载入口）
                 reused = True
                 lines.append(f"  -> 内容与「{keeper}」完全相同（同一张发票），不重复保存")
+                if is_dup:
+                    # 只有「重下回来才发现重复」这一种才把原图留证：说明出现了另一个
+                    # 下载入口或网址失效，稍后多半得人工核一眼。单纯同网址复用（同一发票
+                    # 拍多张图）属于已知去重，不往「重复票据」里塞，免得文件夹被噪声撑大。
+                    dup_hit = True
+                    _, msgs = _copy_original_into(
+                        ctx.folder, DUP_DIR_NAME, fpath, fname, PREFIX_DUPLICATE
+                    )
+                    lines.extend(msgs)
             else:
                 lines.append(f"  -> 已下载 PDF：{os.path.basename(pdf_path)}")
 
@@ -1728,6 +2026,10 @@ def prepare_target_folder(
         "has_pdf": 0, "converted_pages": 0, "converted_pdfs": 0,
         "copied_images": 0, "failed": 0, "skipped": False, "target": folder,
         "kept_pdfs": 0,
+        # 转出的页面图文件名 -> 源 PDF 文件名。这份对应关系**完全由文件系统推导**，
+        # 不依赖任何 json 缓存，所以删掉去重索引后依然成立：重跑时页面图凭它
+        # 认出「我来自那份 PDF」，直接复用、不再发请求。
+        "page_maps": {},
         # 文件夹里自带的发票 PDF：交给下载去重台账做内容比对，
         # 免得「源 PDF 就摆在旁边」却又下一份一模一样的回来
         "source_pdfs": [],
@@ -1812,6 +2114,10 @@ def prepare_target_folder(
             made = convert_pdf_to_images(pdf_path, target, base, name_fn=_name_fn)
             info["converted_pages"] += len(made)
             info["converted_pdfs"] += 1
+            # 这些页面图都是从 name 这份 PDF 转出来的 → 登记「页面图 → 该 PDF」，
+            # 下一轮重跑时靠它免请求（不受索引被删影响）。
+            for _p in made:
+                info["page_maps"][os.path.basename(_p)] = name
             log(f"  -> {name}：转换 {len(made)} 页 → "
                 f"{os.path.basename(made[0]) if made else '（无内容）'}"
                 + (f" … {os.path.basename(made[-1])}" if len(made) > 1 else ""))
@@ -1892,12 +2198,19 @@ def _process_folder_impl(
 
     # ★ 前置：PDF → JPG 转换（有 PDF 时才动作；全图片直接跳过）
     source_pdfs: list = []
+    page_maps: dict = {}
     if preconvert:
         folder, pc_info = prepare_target_folder(folder, log=log, cancel=cancel)
         # 文件夹里自带的发票 PDF（前置转换的输入）：纳入内容去重，避免重复下载
         source_pdfs = list(pc_info.get("source_pdfs") or [])
+        # 页面图 → 源 PDF：纯文件系统推导，不落盘，删索引也照样有效
+        page_maps = dict(pc_info.get("page_maps") or {})
         if cancel.cancelled:
             log("已在「前置转换」阶段停止，本次未开始识别。")
+            # 走到这里还没建 dedup，但上一轮可能留了索引 → 按「跑完即干净」一并清理
+            _remove_dedup_cache(os.path.join(folder, "PDF"), log=log)
+            _remove_dedup_cache(os.path.join(folder, "PDF"), log=log,
+                                file_name=SHOT_CACHE_FILE_NAME)
             log_queue.put(("done",))
             return
 
@@ -1921,9 +2234,13 @@ def _process_folder_impl(
     if total == 0:
         progress(0, 0)
         log("没有需要处理的图片。")
+        # 这一轮没跑并发，但上一轮可能留下缓存文件 → 一并清理，保持「跑完即干净」。
+        # 注意：此处尚未创建 dedup 台账，只做文件级清理，不要去碰 dedup。
+        _remove_dedup_cache(pdf_dir, log=log)
+        _remove_dedup_cache(pdf_dir, log=log, file_name=SHOT_CACHE_FILE_NAME)
         log_queue.put(("stats", {
             "total": 0, "success": 0, "skipped": 0, "no_pdf": 0, "unrecognized": 0,
-            "other": 0, "error": 0, "cancelled": 0,
+            "other": 0, "error": 0, "cancelled": 0, "dup_shots": 0,
             "workers": workers, "elapsed": 0.0,
         }))
         log_queue.put(("done",))
@@ -1935,8 +2252,17 @@ def _process_folder_impl(
     # 下载去重台账：同一二维码网址 / 同一 PDF 内容只下载一次、只保存一份。
     # 预热放在并发开始前，日志里的存量统计才不会被多线程交错打乱。
     dedup = _DedupIndex(pdf_dir, source_pdfs=source_pdfs,
-                        cache_path=os.path.join(pdf_dir, CACHE_FILE_NAME))
+                        cache_path=os.path.join(pdf_dir, CACHE_FILE_NAME),
+                        shot_path=os.path.join(pdf_dir, SHOT_CACHE_FILE_NAME))
+    # 前置转换推导出的「页面图 → 源 PDF」别名：纯内存登记，收尾删索引也不受影响。
+    # 有它在，重跑时「电子发票1_1.jpg」能直接认出自己来自「电子发票1.pdf」，零请求。
+    for _img, _pdf in (page_maps or {}).items():
+        dedup.remember_alias(_img, _pdf)
+
     dedup.warmup(log=log)
+    # 本批内容完全相同的图片（同一张发票存了多份）预先结对：只让第一张去请求，
+    # 其余凭别名直接复用。分组只看图片内容，不依赖任何落盘缓存，删索引也不受影响。
+    dedup.link_identical_images(folder, files, log=log)
     ctx = _TaskCtx(folder, pdf_dir, img_dir, convert_pdf, cancel, dedup=dedup)
 
     log(f"开始处理：共 {total} 张图片。")
@@ -2011,12 +2337,18 @@ def _process_folder_impl(
     finally:
         heartbeat_stop.set()
         close_all_sessions()
-        # 把「网址 → 内容指纹」落盘：下次重跑这些发票连请求都不会再发。
-        # 放在 finally 里，中途「停止」也已下到的那些同样会被记住。
+        # 先把「网址 → 内容指纹」落盘再删：flush 顺带会剔除「PDF 已被用户删掉」的失效条目，
+        # 这一步不白做 —— 它保证「删索引 → 想恢复缓存」时拿到的是一份干净记忆。
         dedup.flush(log=log)
+        dedup.flush_shots(log=log)
+        # 任务结束（正常跑完 / 中途「停止」）都清掉这两个缓存文件，文件夹里不留中间产物。
+        # 放在 finally 里，异常路径也不会漏。
+        _remove_dedup_cache(pdf_dir, log=log)
+        _remove_dedup_cache(pdf_dir, log=log, file_name=SHOT_CACHE_FILE_NAME)
 
     elapsed = time.perf_counter() - t_start
     kind_count = Counter(r["kind"] for r in results)
+    dup_shots = sum(1 for r in results if r.get("dup_hit"))
     # 统计在并发结束后统一汇总，避免在多个线程里做 `stats[k] += 1`（非原子，会丢计数）
     stats = {
         "total": total,
@@ -2028,6 +2360,7 @@ def _process_folder_impl(
         "other": kind_count["other"],
         "error": kind_count["error"],
         "cancelled": kind_count["cancelled"],
+        "dup_shots": dup_shots,
         "workers": workers,
         "elapsed": elapsed,
     }
@@ -2054,6 +2387,17 @@ def _process_folder_impl(
         summary.insert(
             pos,
             f"✓ 同一张发票已下载过（未重复下载，也只保留一份 PDF）：{stats['duplicate']} 张",
+        )
+    if dedup.shot_reused:
+        summary.insert(
+            pos,
+            f"✓ 图片内容与已有发票相同（未发请求，直接复用）：{dedup.shot_reused} 张",
+        )
+        pos += 1
+    if dup_shots:
+        summary.append(
+            f"✓ 重复票据（内容与已有发票相同，原图已复制到「{DUP_DIR_NAME}」/"
+            f"{PREFIX_DUPLICATE}…）：{dup_shots} 张"
         )
     if stats["error"]:
         summary.append(f"✗ 处理出错（详见上方日志）：{stats['error']} 张")
