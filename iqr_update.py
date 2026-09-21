@@ -9,6 +9,7 @@
 PyInstaller 打包会沿 import 自动收集，spec 无需改动。
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -60,14 +61,28 @@ def _get_json(url: str, timeout: int = 8):
 
 
 def _parse_update_json(data):
-    """把站点上的 update.json 解析成 (version, [下载源...], notes)。"""
+    """把站点上的 update.json 解析成 (version, [下载源...], notes, sha256)。
+
+    sha256 由发版脚本算好写进 update.json，供 perform_update 下载后校验；
+    拿不到就返回空串（老版本元数据没有该字段，此时跳过校验、不影响更新）。
+    """
     if not isinstance(data, dict):
         return None
     tag = str(data.get("version") or "").strip()
     urls = [u for u in (data.get("url"), data.get("fallback_url")) if u]
     if not tag or not urls:
         return None
-    return _parse_version(tag), urls, (data.get("notes") or "")
+    sha = str(data.get("sha256") or "").strip().lower()
+    return _parse_version(tag), urls, (data.get("notes") or ""), sha
+
+
+def _file_sha256(path: str) -> str:
+    """算文件 SHA256（小写十六进制）。用于校验下载到的更新包完整。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _from_github_api():
@@ -104,16 +119,18 @@ def _from_github_api():
 
     if not download_url:
         return None
-    return version, [download_url], notes
+    # GitHub API 不提供 SHA256，第四位留空（客户端跳过校验）
+    return version, [download_url], notes, ""
 
 
 def get_latest_release():
-    """查询最新版本，返回 (version, download_urls, notes) 或 None。
+    """查询最新版本，返回 (version, download_urls, notes, sha256) 或 None。
 
     download_urls 是**候选下载源列表**，按顺序尝试：
         [0] 自有服务器直链（国内快，支持 Range）
         [1] GitHub Release 直链（服务器没同步到 / 不可达时兜底）
-    调用方把整个列表交给 perform_update()，由它在下载层逐个试。
+    调用方把整个列表交给 perform_update()，由它在下载层逐个试；
+    已同步的 sha256 也一并传下去做完整性校验。
 
     检查顺序（2026-09-22 改为双源，起因：用户反馈 GitHub 拉包慢、易超时）：
         ① 自有服务器 /updates/qr.json —— 秒回，国内直连
@@ -205,13 +222,16 @@ def send_to_recycle_bin(path: str) -> bool:
 
 
 def perform_update(download_urls, latest_version: tuple, on_event=None,
-                   cancel=None) -> bool:
+                   cancel=None, sha256: str = "") -> bool:
     """下载最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
     并把旧的 EXE 移动到回收站。
 
     download_urls: 候选下载源列表（取自 get_latest_release），**逐个尝试直到成功**——
         首选自有服务器直链，失败自动切 GitHub 直链；单个源网络抖动不影响整体更新。
         为兼容旧调用，也可以直接传一个字符串 URL。
+    sha256: 更新包期望的 SHA256（取自 update.json，小写十六进制）。非空时下载完先校验，
+        不一致就当次更新失败并丢弃半截包——网络中途断流 / 缓存坏包不会再被装上。
+        为空（GitHub API 兜底源、老元数据）则跳过校验。
 
     流程（cancel 只在能干净收尾的阶段生效）：
       ① 下载 → 可取消：立刻断开、删除半截 .part，等于什么都没发生；
@@ -309,6 +329,27 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
         # 极端情形：刚好在下载结束时点取消，同样干净收尾
         _emit_cancelled("已取消更新：临时文件已清理。")
         return False
+
+    # ---- ①.5 完整性校验（update.json 带 sha256 才做）----
+    # 放在落盘之前：校验不过就丢弃，绝不让损坏的 exe 进入程序目录。
+    if sha256:
+        emit({"type": "stage", "text": "正在校验更新包完整性…"})
+        try:
+            actual = _file_sha256(part)
+        except Exception as e:
+            actual = ""
+            emit({"type": "detail", "text": f"读取更新包准备校验时出错：{e}"})
+        # 读不到（actual 为空）时放行，避免因偶发 IO 问题把正常更新挡掉
+        if actual and actual != sha256:
+            _cleanup_part()
+            emit({"type": "detail",
+                  "text": "更新包校验失败（SHA256 不一致），已丢弃该文件。"})
+            emit({"type": "detail",
+                  "text": "可能是下载中途断流或缓存了损坏的文件，请稍后重试。"})
+            emit({"type": "done", "ok": False})
+            return False
+        if actual:
+            emit({"type": "detail", "text": "更新包校验通过（SHA256 一致）。"})
 
     # ---- ② 落盘（临界区，不可取消）----
     try:

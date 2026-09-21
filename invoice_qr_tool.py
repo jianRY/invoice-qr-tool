@@ -118,7 +118,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.0.3"
+__VERSION__ = "5.1.1"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -274,6 +274,13 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-22  v5.1.1
+- **补齐 SHA256 完整性校验**：v5.1.0 的更新说明里写了这项校验，但代码只解析了更新包
+  摘要、并未真正比对（实现遗漏）。本版补上 —— 下载完成后计算 SHA256 与更新元数据核对，
+  不一致立即丢弃该文件并按「更新失败」处理，损坏包 / 半截包不会被装上。
+- 校验发生在「保存并替换」**之前**，因此校验不通过时当前版本与已有文件完全不受影响，
+  软件照常继续使用；GitHub 兜底源不提供摘要，此时自动跳过校验，不影响更新。
 
 2026-09-22  v5.1.0
 - **自动更新改为「国内服务器优先，GitHub 兜底」** —— 检查更新与下载新版本都优先访问
@@ -948,11 +955,12 @@ class UpdateProgressDialog:
         self.txt.append(text, None)
 
 
-def _start_update_flow(root: tk.Tk, download_urls, version: tuple):
+def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str = ""):
     """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。
 
     download_urls 是候选下载源列表（自有服务器直链 → GitHub 直链），
     依次尝试直到成功，见 iqr_update.get_latest_release / perform_update。
+    sha256 为期望的更新包摘要（取自 update.json），非空时下载完先校验再替换。
 
     取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
     """
@@ -964,7 +972,8 @@ def _start_update_flow(root: tk.Tk, download_urls, version: tuple):
         def on_event(ev):
             dlg.emit(**ev)          # emit 只入队，由主线程 _poll 消费
         try:
-            perform_update(download_urls, version, on_event=on_event, cancel=dlg.cancel)
+            perform_update(download_urls, version, on_event=on_event,
+                           cancel=dlg.cancel, sha256=sha256)
         except Exception as e:
             # 兜底：工作线程异常退出就再没人报 done，进度框会卡在「不可关闭」状态
             dlg.emit({"type": "detail", "text": f"更新过程出错：{e}"})
@@ -1012,7 +1021,7 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
                 messagebox.showinfo(
                     "检查更新", "暂时无法连接到更新服务器（或当前已是最新）。")
             return
-        version, download_urls, notes = result
+        version, download_urls, notes, sha256 = result
         if version <= _parse_version(__VERSION__):
             if manual:
                 messagebox.showinfo("检查更新", f"当前已是最新版本 v{__VERSION__}。")
@@ -1027,7 +1036,7 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
         )
         if ok:
-            _start_update_flow(root, download_urls, version)
+            _start_update_flow(root, download_urls, version, sha256)
     finally:
         _end_update_check()
 
