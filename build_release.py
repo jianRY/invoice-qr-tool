@@ -204,6 +204,40 @@ def write_version(v):
         f.write(v + "\n")
 
 
+APP_SRC = os.path.join(ROOT, "invoice_qr_tool.py")
+
+
+def sync_app_version(ver):
+    """把主程序源码里的 __VERSION__ 改成本次要发布的版本号（幂等 + 读回校验）。
+
+    ⚠️ 这一步绝对不能省。软件标题栏显示的版本、以及更新检查里判断「是否已有新版」
+    用的都是 __VERSION__，而 PyInstaller 是把源码**原样**打进 exe 的 —— 发版脚本
+    若只写 VERSION 文件、不同步源码，装上的新版会自报旧版本号，于是每次启动都提示
+    「发现新版本」，更新完仍是旧号 → **更新死循环**（本仓库实际踩过，2026-09-22）。
+    写文件用二进制读写，保证除这一行外其余字节（含行尾）完全不动。
+    """
+    want = ver
+    with open(APP_SRC, "rb") as f:
+        raw = f.read()
+    src = raw.decode("utf-8")
+    pat = re.compile(r'__VERSION__\s*=\s*"[^"]*"')
+    if not pat.search(src):
+        raise RuntimeError(
+            "未在 {} 里找到 __VERSION__ 赋值，无法同步版本号".format(APP_SRC))
+    new_src = pat.sub(lambda _m: '__VERSION__ = "{}"'.format(want), src, count=1)
+    if new_src != src:
+        with open(APP_SRC, "wb") as f:
+            f.write(new_src.encode("utf-8"))
+    # 读回校验：写完必须核对实际落盘值，不能只看「写入没报错」
+    with open(APP_SRC, encoding="utf-8") as f:
+        back = re.search(r'__VERSION__\s*=\s*"([^"]*)"', f.read())
+    got = back.group(1) if back else ""
+    if got != want:
+        raise RuntimeError("版本号同步失败：期望 {}，实际 {}".format(want, got))
+    print("[版本] 源码 __VERSION__ 已同步 -> {}".format(got))
+    return got
+
+
 # ---------------- 凭据 ----------------
 def get_pat():
     # 1) wincred（与 git 同一凭据，无需落盘）
@@ -763,6 +797,10 @@ def main():
                   "如需覆盖请用 --force 或先 --version 指定更高版本。".format(new_tag, latest))
             return
 
+    # 版本号闸门：打包前必须把 __VERSION__ 同步成目标版本（幂等）。
+    # 放在构建之前 —— 否则 exe 里装的是旧版本号，用户侧会陷入「反复提示更新」。
+    sync_app_version(new_tag.lstrip("v"))
+
     # 构建
     if publish_only:
         print("[publish-only] 跳过构建与签名，直接使用现有 dist/ 已签名 exe")
@@ -782,6 +820,16 @@ def main():
         if not os.path.exists(p):
             raise RuntimeError("构建产物缺失：" + p)
         print("产物:", p, "{}KB".format(os.path.getsize(p) // 1024))
+
+    # 二次核对：产物由源码打出来，构建完成后源码里的版本号必须仍是目标版本，
+    # 否则说明中途被改动，产物会带错号 → 宁可中止发版也不要发出去
+    with open(APP_SRC, encoding="utf-8") as _f:
+        _m = re.search(r'__VERSION__\s*=\s*"([^"]*)"', _f.read())
+    _got = _m.group(1) if _m else ""
+    if _got != new_tag.lstrip("v"):
+        raise RuntimeError("构建后源码版本号为 {}，与目标 {} 不一致，已中止发版"
+                           .format(_got, new_tag))
+    print("[版本] 构建后核对通过：产物内含版本号 {}".format(_got))
 
     make_assets(new_tag)
     update_website(new_tag)   # 同步官网版本数据（宝塔脚本拉取后展示的新版网页）
