@@ -4,12 +4,17 @@
 发票二维码识别下载工具
 功能：
 1. 识别指定文件夹内图片中的二维码（全部图片均识别，不再按网址去重）；
-2. 若二维码为网址，则下载对应 PDF 到同目录 PDF 文件夹下，文件名与原始图片相同；
+2. 若二维码为网址，则下载对应 PDF 到同目录 PDF 文件夹下：
+   - 一张图只有 1 个二维码：文件名与原始图片相同（原名.pdf）；
+   - 一张图有 2 个及以上二维码：每个二维码各下一份，
+     命名为「原始图片名_第1页.pdf / _第2页.pdf …」（编号稳定可复现）；
 3. 识别结果的归类与文件处理：
    - 成功识别并下载到 PDF：原图片文件名保持不变；
-   - 识别到网址但无可下载的 PDF：复制一份到「未识别」文件夹，文件名前加“未下载-”；
-   - 未识别到任何二维码：复制一份到「未识别」文件夹，文件名前加“未识别-”；
-   - 其它情况（识别到二维码但非网址等）：复制一份到「未识别」文件夹，文件名前加“其它-”；
+   - 一张图有多个二维码、其中部分下载成功部分失败：
+     复制一份到「未识别」文件夹，文件名前加「部分未识别-」（已下成的 PDF 保留）；
+   - 识别到网址但无可下载的 PDF（单二维码时沿用「未下载-」前缀）；
+   - 未识别到任何二维码：复制一份到「未识别」文件夹，文件名前加「未识别-」；
+   - 其它情况（识别到二维码但非网址等）：复制一份到「未识别」文件夹，文件名前加「其它-」；
 4. 可选任务完成后打开文件夹；
 5. 可选将下载的 PDF 转换为 JPG 图片（长边 2000px，短边自适应）；
 6. 可选任务完成后汇总发票（对 PDF 文件夹内发票 PDF 提取字段并生成 Excel，
@@ -91,9 +96,17 @@ DUP_DIR_NAME = "重复票据"
 
 # 状态前缀：把“未下载 / 未识别 / 其它”的图片复制到「未识别」子文件夹时加在文件名前
 PREFIX_UNRECOGNIZED = "未识别-"  # 未识别到任何二维码
-PREFIX_NOT_DOWNLOADED = "未下载-"  # 识别到网址但无可下载的 PDF
+PREFIX_NOT_DOWNLOADED = "未下载-"  # 识别到网址但无可下载的 PDF（单二维码时沿用）
 PREFIX_OTHER = "其它-"           # 其它情况（识别到二维码但内容非网址等）
 PREFIX_DUPLICATE = "重复-"        # 内容与已有发票完全相同（重复票据）
+# 一张图里识别到多个二维码，其中**部分**下载成功、部分失败（网址无效 / 无 PDF / 网络失败）。
+# 归类仍然是「未识别」（整张图需要人工过目），但用独立前缀把原因说清楚：
+# 「未识别-」= 图上根本没有能用的码；「部分未识别-」= 有一部分成了、有一部分没成。
+PREFIX_PARTIAL = "部分未识别-"
+
+# 一张图里识别到多个二维码时，第 N 个二维码对应的 PDF 命名：原文件名 + 本后缀。
+# 例：发票照片.jpg 上有两个码 → 发票照片_第1页.pdf、发票照片_第2页.pdf。
+MULTI_PAGE_FMT = "_第{n}页"
 
 # 二维码识别的内存护栏。zxing-cpp 识别小二维码靠「逐级放大重试」，而放大后的位图是
 # 实体内存（宽 × 高 × 3 字节）：4000×3000 再放大 2× 就是 8000×6000 ≈ 144MB / 张，
@@ -105,7 +118,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.0.2"
+__VERSION__ = "5.0.3"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -118,14 +131,20 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 【功能】
 1. 识别指定文件夹内图片中的二维码（每一张图片都会被识别并归类，不会因网址重复整张跳过；
    去重只发生在下载环节，见下条）。
-2. 二维码为网址：自动下载对应 PDF 到「PDF」子文件夹，文件名与原始图片相同。
+2. 二维码为网址：自动下载对应 PDF 到「PDF」子文件夹。
+   - 一张图只有 1 个二维码：文件名与原始图片相同（原名.pdf）。
+   - 一张图有 2 个及以上二维码：**每个二维码都会各自下载一份 PDF**，
+     命名为「原名_第1页.pdf / 原名_第2页.pdf …」（按二维码在图片中的位置从上到下、
+     从左到右编号，重跑顺序一致，不会张冠李戴）。
    - **同一张发票只下载一次、只保留一份 PDF**：一张发票上可能带多个二维码（如截图的短链
      与 PDF 页面上的详情链），内容相同的重复副本会自动合并，最终只留一份。
    - **重跑同一个文件夹不会重新下载**：已下载过且完好的 PDF 直接复用；软件还会记住
      每个网址对应的发票内容，下次连请求都不发（详见文末【说明】）。
 3. 识别结果归类与文件处理（后三类仅做“复制”，原图片始终保留在原始文件夹中不动）：
    - 成功识别并下载到 PDF：原图片文件名保持不变。
-   - 识别到网址但无可下载的 PDF：复制一份到「未识别」文件夹，文件名前加「未下载-」。
+   - 一张图有多个二维码、**部分下载成功、部分失败**：整图复制一份到「未识别」文件夹，
+     文件名前加「部分未识别-」（已下成的 PDF 照常保留在「PDF」里）。
+   - 识别到网址但无可下载的 PDF（单二维码时）：复制一份到「未识别」文件夹，文件名前加「未下载-」。
    - 未识别到任何二维码：复制一份到「未识别」文件夹，文件名前加「未识别-」。
    - 其它情况（识别到二维码但内容非网址等）：复制一份到「未识别」文件夹，文件名前加「其它-」。
 4. 可选：处理完成后自动打开文件夹。
@@ -205,7 +224,9 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 （注：只要文件夹里含 PDF，以下输出全部落在「处理后」子文件夹内 —— 即 目标文件夹\处理后\…）
 - 含 PDF（自动）         → 新建「处理后」，PDF 转「原名_1.jpg / 原名_2.jpg …」+ 复制原有图片进
 - 网址 + 下载成功      → PDF/<原名>.pdf，原图片文件名保持不变
-- 网址 + 无 PDF 可下载 → 复制一份到「未识别/未下载-<原名>」
+- 一张图 2 个以上二维码 → PDF/<原名>_第1页.pdf、<原名>_第2页.pdf …（每个二维码各一份）
+- 多二维码但部分失败   → 已成功的 PDF 保留；整图复制到「未识别/部分未识别-<原名>」
+- 网址 + 无 PDF 可下载 → 复制一份到「未识别/未下载-<原名>」（单二维码时）
 - 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
 - 识别到二维码但非网址 → 复制一份到「未识别/其它-<原名>」
 - 内容与已有发票相同   → 复制一份到「重复票据/重复-<原名>」（原图保留不动，便于人工核对）
@@ -253,6 +274,31 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-20  v5.0.3
+- **新增：一张图上有多个二维码时，每个二维码都会被下载** —— 以前一张图只认第一个码，
+  第二个及以后的二维码会被直接丢掉（比如把两张电子票据拼成一张图，或者一张照片里
+  拍进了两个二维码）。现在会**把所有二维码都找出来、逐个下载**，一个不漏。
+- **多二维码的 PDF 命名：原始图片名 + 第N页** —— 例如「拼图.png」上有两个码，
+  就产出「拼图_第1页.pdf」和「拼图_第2页.pdf」。编号按二维码在图上
+  **从上到下、从左到右**排，且**每次跑顺序都一样**，重跑不会把两张发票的文件名对调。
+  · 只有 **1 个**二维码的图片，命名**保持原样**（还是「原文件名.pdf」），
+    已有的文件、习惯用法完全不受影响。
+- **新增：多二维码只下成一部分时，归类为「部分未识别-」** —— 一张图有多个码，
+  其中有的下成了、有的没下成，整张图会复制一份到「未识别」文件夹、文件名前加
+  「部分未识别-」，提醒你这张图需要人工过目；**已经下成的 PDF 照常保留**
+  （它们是有效票据，不能因为同图另一个码失败就一起丢掉）。日志里会用
+  「[第2页]」这样的前缀标出具体是哪个码失败了。
+- **修复：识别多二维码时只认第一个码** —— 早期版本在放大重试的循环里「找到一个就跳出」，
+  于是第二个码永远没机会被识别。现在会把各放大倍数的结果**全部合并**，再统一去重。
+- **修复：多二维码会「只下一份」** —— 同一张图的所有子项原本共享同一份「原图内容指纹」，
+  第 1 页下完后程序就把整张图登记成「对应第 1 页那份 PDF」，第 2 页随即命中这条记忆
+  直接复用，结果只下一份、多二维码形同虚设。现改为每个子项派生独立的指纹键，
+  两张发票各下各的（实测样本：两个码指向票号 0413803172 / 0413803293 两张不同发票，
+  金额 38.00 / 128.40，各自正确下载）。
+- 去重逻辑对多二维码天然兼容：每个网址各自走「同名 PDF 已存在 / 同网址本批已下 /
+  内容指纹相同」三层台账，多二维码的图重跑同样 **0 请求**（实测第 2 轮下载次数为 0）。
+- 使用说明与 README 同步：新增多二维码的命名规则、`部分未识别-` 前缀与输出规则表。
 
 2026-09-20  v5.0.2
 - **新增：重复票据的原图会被留证** —— 重新下载回来才发现与已有发票内容完全相同的，
@@ -1005,7 +1051,15 @@ def _silent_startup_check(root: tk.Tk):
 
 
 def detect_qr_codes(image_path: str):
-    """返回图片中识别到的所有二维码文本列表（去重）"""
+    """返回图片中识别到的所有二维码文本列表（去重）。
+
+    ⚠️ 顺序 = **从上到下、从左到右**，且刻意做成稳定的：一张图里有多个二维码时，
+    业务上按「第 1 页 / 第 2 页」命名 PDF（见 `_MULTI_PAGE_FMT`），编号必须可复现 ——
+    否则重跑一次，两张发票的文件名会对调，去重台账也会跟着错位。
+    实现上：zxing 的结果按左上角 y（再按 x）排序；OpenCV 兜底路径取其天然顺序。
+
+    只收二维码（QR），不收一维条码 —— 票据上常印条形码，识别到会被误当成「二维码」。
+    """
     # 懒加载：二维码识别相关的重型库仅在真正识别时才导入，缩短启动时间
     import cv2
     import numpy as np
@@ -1032,15 +1086,29 @@ def detect_qr_codes(image_path: str):
         )
         h, w = img.shape[:2]
 
-    codes = []
+    # 统一的去重收口：同一文本只留一次。
+    # 编号规则要求「第 i 个二维码」与「第 i 个网址」一致，所以这里只去重文本。
+    def push(out: list, text: str, pos=None):
+        text = (text or "").strip()
+        if not text or any(t == text for t, _ in out):
+            return
+        out.append((text, pos))
 
-    # 1. zxing-cpp 识别能力更强，先尝试；对小二维码会自动多尺度放大重试
+    found: list = []          # [(text, (y, x) | None)]
+
+    # 1. zxing-cpp 识别能力更强，先尝试；对小二维码会自动多尺度放大重试。
+    #    ⚠️ 关键修复：**不能识别到一个就 break**。同一张图上可能存在两个以上二维码
+    #       （例：把两张电子票据拼成一张图），只有把各放大倍数的结果**全部合并**，
+    #       才能一个不漏 —— 早期版本遇到第一个码就跳出，第二个码直接被丢掉。
     if zxingcpp is not None:
         # ② 放大到几倍，由「放大后位图的像素预算」推导，而不是只看原图长边：
         #    小图照样能放大到 4×，大图则不再无谓放大，单张占用有上限。
         scales = [s for s in (1, 2, 3, 4)
                   if h * w * s * s <= QR_MAX_SCALE_PIXELS] or [1]
 
+        qr_format = getattr(zxingcpp.BarcodeFormat, "QRCode", None) or getattr(
+            zxingcpp.BarcodeFormat, "QR_CODE", None
+        )
         for scale in scales:
             if scale == 1:
                 scaled = img
@@ -1050,42 +1118,50 @@ def detect_qr_codes(image_path: str):
                 scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             try:
                 results = zxingcpp.read_barcodes(scaled)
-                for r in results:
-                    # 只保留 QR 码（zxing-cpp 不同版本枚举名可能不同，这里同时兼容两种写法）
-                    qr_format = getattr(zxingcpp.BarcodeFormat, "QRCode", None) or getattr(
-                        zxingcpp.BarcodeFormat, "QR_CODE", None
-                    )
-                    if qr_format and r.format == qr_format:
-                        text = r.text.strip()
-                        if text and text not in codes:
-                            codes.append(text)
             except Exception:
-                pass
-            if codes:
-                break
+                continue
+            for r in results:
+                # 只保留 QR 码（不同版本枚举名可能不同，这里同时兼容两种写法）
+                if qr_format and r.format != qr_format:
+                    continue
+                pos = None
+                try:
+                    tl = r.position.top_left
+                    # 位置按「缩放前」的原图坐标记（除以倍率），否则不同倍率下
+                    # 同一张二维码的排序键会飘，编号也就跟着不稳定。
+                    pos = (tl.y / float(scale), tl.x / float(scale))
+                except Exception:
+                    pos = None
+                push(found, r.text, pos)
 
-    # 2. OpenCV 自带 QRCodeDetector 兜底
-    if not codes:
+    # 2. OpenCV 自带 QRCodeDetector 兜底（zxing 一个都没认出来时才走）
+    if not found:
         try:
             detector = cv2.QRCodeDetector()
             result = detector.detectAndDecodeMulti(img)
             if result and result[0] and result[1]:
                 for info in result[1]:
-                    if info and info.strip() not in codes:
-                        codes.append(info.strip())
+                    push(found, info)
         except Exception:
             pass
 
-    if not codes:
+    if not found:
         try:
             detector = cv2.QRCodeDetector()
             data, _, _ = detector.detectAndDecode(img)
-            if data and data.strip() not in codes:
-                codes.append(data.strip())
+            push(found, data)
         except Exception:
             pass
 
-    return codes
+    if not found:
+        return []
+
+    # ③ 稳定排序：有坐标的按「从上到下、从左到右」；没坐标的（OpenCV 兜底）保持原序。
+    #    全部无坐标时 sorted 是稳定排序，等价于不做任何改动。
+    if all(p is not None for _, p in found):
+        found.sort(key=lambda item: (round(item[1][0]), round(item[1][1])))
+
+    return [t for t, _ in found]
 
 
 def is_url(text: str) -> str | None:
@@ -1636,8 +1712,8 @@ def convert_pdf_to_images(
 _KIND_LABEL = {
     "success": "✓ 已下载 PDF",
     "skipped": "✓ 已存在（跳过下载）",
-    "duplicate": "✓ 同一发票（不重复下载）",
-    "no_pdf": "⚠ 识别到网址但未下载",
+    "duplicate": "✓ 已存在（未重新下载）",
+    "no_pdf": "⚠ 有二维码未下成（复制到未识别/部分未识别-）",
     "unrecognized": "✗ 未识别到二维码",
     "other": "· 其它情况（二维码非网址）",
     "error": "✗ 处理出错",
@@ -1723,8 +1799,132 @@ def _is_valid_pdf_file(path: str) -> bool:
         return False
 
 
+def _download_one(ctx: _TaskCtx, url: str, out_base: str, fpath: str, fname: str,
+                  shot_digest, alias_key: str, tag: str, lines: list) -> dict:
+    """下载/复用一个二维码网址对应的 PDF —— 多二维码场景下被逐个调用。
+
+    ``alias_key`` 是别名表的查询键 —— ⚠️ 它必须是**图片名**，不是 PDF 基名：
+    别名表登记的语义是「这张图片其实对应那份 PDF」（页面图 → 源 PDF、同批重复图 → 代表图）。
+    单二维码时就是 ``fname``；多二维码时由调用方给出各子项自己的键。
+
+    ``tag`` 是日志前缀：单二维码时空串，多二维码时形如 ``[第2页] ``，
+    这样并发交错的日志里也能一眼看出哪一行属于哪个二维码。
+
+    返回：
+      {"ok": bool, "reused": bool, "already": bool, "pdf": 文件名或 None,
+       "dup_hit": 是否「重下回来才发现内容重复」, "cancelled": 是否被「停止」打断,
+       "reason": 失败原因（给「部分未识别」日志用，成功时为空）}
+    """
+    def say(msg: str):
+        lines.append(f"{tag}{msg}")
+
+    def fail(reason: str) -> dict:
+        return {"ok": False, "reused": False, "already": False, "pdf": None,
+                "dup_hit": False, "cancelled": False, "reason": reason}
+
+    pdf_path = os.path.join(ctx.pdf_dir, f"{out_base}.pdf")
+    already = _is_valid_pdf_file(pdf_path)
+
+    alias_hit = None
+    shot_hit = None
+    if not already:
+        alias_hit = ctx.dedup.lookup_alias(alias_key)
+        if not alias_hit:
+            shot_hit = ctx.dedup.lookup_shot(shot_digest) if shot_digest else None
+
+    if already:
+        # 这一份上次已经下过（中途「停止」后再跑、隔天补几张再跑都会碰到）：
+        # 直接复用，不再请求一次。同一平台短时间内并发请求多了容易被限流，
+        # 全量重下既慢又容易让本来正常的票据变成「未下载」。
+        ctx.dedup.adopt(url, pdf_path)
+        ctx.dedup.remember_shot(shot_digest, os.path.basename(pdf_path))
+        say(f"  -> 已存在 PDF，跳过下载：{os.path.basename(pdf_path)}")
+        return {"ok": True, "reused": True, "already": True,
+                "pdf": os.path.basename(pdf_path), "dup_hit": False,
+                "cancelled": False, "reason": ""}
+
+    if alias_hit:
+        # 本张图已被判定「就是那份 PDF」（页面图转出的 / 与本批另一张图内容完全相同）
+        # → 零请求直接复用。
+        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, alias_hit))
+        ctx.dedup.alias_reused += 1
+        say(f"  -> 本张图与「{alias_hit}」是同一次识别，该发票已存在（未重新下载）")
+        return {"ok": True, "reused": True, "already": False, "pdf": alias_hit,
+                "dup_hit": False, "cancelled": False, "reason": ""}
+
+    if shot_hit:
+        # 这张图的内容之前已经对应过某份 PDF（同一张图存了两份、或上一轮就是它下的）
+        # → 直接复用，连请求都不发。比自己名下那份改了名的情况也能命中。
+        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, shot_hit))
+        ctx.dedup.shot_reused += 1
+        say(f"  -> 这条二维码上次已处理过，直接复用「{shot_hit}」（未重新下载）")
+        return {"ok": True, "reused": True, "already": False, "pdf": shot_hit,
+                "dup_hit": False, "cancelled": False, "reason": ""}
+
+    # 以上都没命中 → 走台账（同网址本批已下 / 真正发请求）
+    verdict, shared = ctx.dedup.begin(url, ctx.cancel)
+    if ctx.cancel.cancelled:
+        # 等在别人的下载结果上时用户点了「停止」：立刻收工，别再把这份下完。
+        # （abort 让同样在等的其他线程也能很快挣脱，而不是干等超时）
+        ctx.dedup.abort(url)
+        return {"ok": False, "reused": False, "already": False, "pdf": None,
+                "dup_hit": False, "cancelled": True, "reason": ""}
+
+    if verdict == "reuse":
+        # 不再发请求，也不为它多存一份 PDF
+        if shared:
+            ctx.dedup.remember_shot(shot_digest, os.path.basename(shared))
+        if ctx.dedup.seen_before(url):
+            say(f"  -> 上次已下载过，本次直接复用「{shared}」（未重新下载）")
+        else:
+            say(f"  -> 同一发票已下载过，不再重复下载（复用「{shared}」）")
+        return {"ok": True, "reused": True, "already": False, "pdf": shared,
+                "dup_hit": False, "cancelled": False, "reason": ""}
+
+    # 真正下载
+    try:
+        download_pdf(url, pdf_path)
+    except PdfNotAvailable as e:
+        ctx.dedup.abort(url)
+        return fail(f"网址无可下载的 PDF（{e}）")
+    except DownloadNetworkError as e:
+        ctx.dedup.abort(url)
+        return fail(f"网络失败，重试后仍未成功（{e}）")
+    except Exception as e:
+        ctx.dedup.abort(url)
+        return fail(f"下载失败（{e}）")
+
+    is_dup = False
+    try:
+        keeper, is_dup = ctx.dedup.settle(url, pdf_path, shot_digest)
+    except Exception as e:
+        # 登记台账出问题不该影响下载结果本身，更不能把同网址的等待者晾在那儿
+        ctx.dedup.abort(url)
+        keeper = None
+        say(f"  -> 去重登记失败（{e}），本次下载结果照常保留")
+    if keeper:
+        # 下载回来的内容与已有 PDF 一模一样（同一张发票的另一个下载入口）
+        say(f"  -> 内容与「{keeper}」完全相同（同一张发票），不重复保存")
+        return {"ok": True, "reused": True, "already": False, "pdf": keeper,
+                "dup_hit": bool(is_dup), "cancelled": False, "reason": ""}
+
+    say(f"  -> 已下载 PDF：{os.path.basename(pdf_path)}")
+    return {"ok": True, "reused": False, "already": False,
+            "pdf": os.path.basename(pdf_path), "dup_hit": False,
+            "cancelled": False, "reason": ""}
+
+
 def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     """处理单张图片 —— 并发任务的最小单元。
+
+    ⚠️ 一张图上可能有**多个二维码**（例：把两张电子票据拼成一张图）。
+    此时每个二维码都要各自下载一份 PDF，命名为「原文件名_第N页.pdf」
+    （N 按二维码在图上从上到下、从左到右的顺序，见 ``detect_qr_codes``）。
+    单二维码时保持旧命名「原文件名.pdf」不变 —— 向后兼容，不污染历史文件。
+
+    只要**有一个**二维码没下成，整张图就算「部分未识别」，原图复制到
+    「未识别/部分未识别-原名」；已经下成的那几份 PDF 照常保留（是有效票据，不该丢）。
+    「未识别-」的含义收窄为「图上没有任何可用二维码」。
 
     关键设计：**不写任何共享状态**。统计、进度、日志全部通过返回值交回主线程汇总，
     所以无论多少路并发都不会出现计数竞态，也不需要加锁。
@@ -1744,14 +1944,19 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
             "fname": fname,
             "kind": kind,
             "dup_hit": dup_hit,
+            "qr_count": qr_count,        # 本图识别到的二维码个数（去重后）
+            "pdf_count": pdf_count,      # 本图实际产出/复用的 PDF 份数
             "elapsed": time.perf_counter() - t0,
             "lines": lines,
         }
 
+    qr_count = 0
+    pdf_count = 0
+
     if ctx.cancel.cancelled:
         return finish("cancelled")
 
-    # 1) 识别二维码
+    # 1) 识别二维码（返回图上**全部**二维码，按从上到下、从左到右排序）
     try:
         codes = detect_qr_codes(fpath)
     except Exception as e:
@@ -1763,150 +1968,126 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
         lines.extend(msgs)
         return finish("unrecognized")
 
-    # 2) 在识别到的二维码中优先找一个网址
-    url = None
+    # 2) 逐个提取网址，**按网址去重**（同一张图里两个码指向同一网址只算一个）。
+    #    注意：同一张发票常带两个不同网址（截图短链 / PDF 页），那种是两个都要下的，
+    #    不在这里合并 —— 它们靠内容去重（第三层）自然收敛成一份 PDF。
+    urls: list = []
     for code in codes:
         candidate = is_url(code)
-        if candidate:
-            url = candidate
-            break
+        if candidate and candidate not in urls:
+            urls.append(candidate)
 
-    if not url:
-        lines.append("  -> 识别到二维码但非网址，归入「其它」")
+    if not urls:
+        lines.append(f"  -> 识别到 {len(codes)} 个二维码但均非网址，归入「其它」")
         _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_OTHER)
         lines.extend(msgs)
         return finish("other")
 
-    # 3) 下载 PDF（内部带网络重试；「网址确实没有 PDF」属业务性失败，不重试）
-    #    三层去重，任一层命中都不再发请求，也不重复保存：
-    #      ① 同名 PDF 已存在且完好 → 复用（上一轮下过的）；
-    #      ② 同一二维码网址本批已下过 → 复用（同一发票被拍了多张图）；
-    #      ③ 下载结果内容与已有 PDF 相同 → 只留一份。
-    pdf_path = os.path.join(ctx.pdf_dir, f"{out_base}.pdf")
-    already = _is_valid_pdf_file(pdf_path)
+    multi = len(urls) > 1
+    qr_count = len(urls)
+    if multi:
+        lines.append(f"  -> 本图识别到 {len(urls)} 个二维码，逐个下载（不重复的网址才下）")
 
-    # ★ 图片内容指纹：这张图的内容之前已经对应过某份 PDF（比如同一张图存了两份、
-    #   或上一轮它就是从这个网址下回来的）→ 直接复用，**连请求都不发**。
-    #   这一层正是为了「删掉网址索引后重跑仍不白发请求」而加的：网址索引怕改，
-    #   而图片内容指纹只看图片本身，改名/换轮次都不受影响。
-    reused = already
-    shot_digest = None
-    shot_hit = None
-    alias_hit = None
-    if not already:
-        # ★ 别名表：本张图是「某份 PDF 转出来的页面图」→ 那份 PDF 就是它，零请求。
-        #   这一层只看文件名，不用算哈希、也不依赖任何 json 缓存，因此最稳。
-        alias_hit = ctx.dedup.lookup_alias(fname)
-        if not alias_hit:
-            try:
-                shot_digest = _sha1_file(fpath)
-            except OSError:
-                shot_digest = None
-            shot_hit = ctx.dedup.lookup_shot(shot_digest) if shot_digest else None
+    # 3) 逐个二维码下载。编号 N 与「第 N 个网址」严格对应（已按图上位置排好序）。
+    try:
+        shot_digest = _sha1_file(fpath)
+    except OSError:
+        shot_digest = None
 
-    if already:
-        reused = True
-        # 这一份上次已经下过（中途「停止」后再跑、隔天补几张再跑都会碰到）：
-        # 直接复用，不再请求一次。同一平台短时间内并发请求多了容易被限流，
-        # 全量重下既慢又容易让本来正常的票据变成「未下载」。
-        ctx.dedup.adopt(url, pdf_path)
-        # 顺手记下「这张图 = 这份 PDF」：删掉索引后重跑，靠它开局就能认出、不再请求
-        ctx.dedup.remember_shot(shot_digest, os.path.basename(pdf_path))
-        lines.append(f"  -> 已存在 PDF，跳过下载：{os.path.basename(pdf_path)}")
-    elif alias_hit:
-        # 本张图已被判定「就是那份 PDF」（页面图转出的 / 与本批另一张图内容完全相同）
-        # → 零请求直接复用。
-        reused = True
-        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, alias_hit))
-        ctx.dedup.alias_reused += 1
-        lines.append(f"  -> 本张图与「{alias_hit}」是同一次识别，该发票已存在（未重新下载）")
-    elif shot_hit:
-        # 这张图的内容之前已经对应过某份 PDF（同一张图存了两份、或上一轮就是它下的）
-        # → 直接复用，连请求都不发。比自己名下那份改了名的情况也能命中。
-        reused = True
-        ctx.dedup.adopt(url, os.path.join(ctx.pdf_dir, shot_hit))
-        ctx.dedup.shot_reused += 1
-        lines.append(f"  -> 这张图上次已处理过，直接复用「{shot_hit}」（未重新下载）")
-    else:
-        verdict, shared = ctx.dedup.begin(url, ctx.cancel)
+    results: list = []
+    cancelled = False
+    for idx, url in enumerate(urls, 1):
         if ctx.cancel.cancelled:
-            # 等在别人的下载结果上时用户点了「停止」：立刻收工，别再把这份下完。
-            # （abort 让同样在等的其他线程也能很快挣脱，而不是干等超时）
-            ctx.dedup.abort(url)
-            return finish("cancelled")
-        if verdict == "reuse":
-            # 不再发请求，也不为它多存一份 PDF
-            reused = True
-            # 同一发票的另一张图（同网址）走到这里：它最终就是 shared 那份 PDF，
-            # 一并记下图片指纹 —— 否则下一轮删掉索引后，这张图又要白请求一次。
-            if shared:
-                ctx.dedup.remember_shot(shot_digest, os.path.basename(shared))
-            if ctx.dedup.seen_before(url):
-                lines.append(f"  -> 上次已下载过，本次直接复用「{shared}」（未重新下载）")
-            else:
-                lines.append(f"  -> 同一发票已下载过，不再重复下载（复用「{shared}」）")
-        else:
-            try:
-                download_pdf(url, pdf_path)
-            except PdfNotAvailable as e:
-                ctx.dedup.abort(url)
-                lines.append(f"  -> 网址无可下载的 PDF（{e}）")
-                _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-                lines.extend(msgs)
-                return finish("no_pdf")
-            except DownloadNetworkError as e:
-                ctx.dedup.abort(url)
-                lines.append(f"  -> 网络失败，重试后仍未成功（{e}）")
-                _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-                lines.extend(msgs)
-                return finish("no_pdf")
-            except Exception as e:
-                ctx.dedup.abort(url)
-                lines.append(f"  -> 下载失败（{e}）")
-                _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_DOWNLOADED)
-                lines.extend(msgs)
-                return finish("no_pdf")
-            try:
-                keeper, is_dup = ctx.dedup.settle(url, pdf_path, shot_digest)
-            except Exception as e:
-                # 登记台账出问题不该影响下载结果本身，更不能把同网址的等待者晾在那儿
-                ctx.dedup.abort(url)
-                keeper, is_dup = None, False
-                lines.append(f"  -> 去重登记失败（{e}），本次下载结果照常保留")
-            if keeper:
-                # 下载回来的内容与已有 PDF 一模一样（同一张发票的另一个下载入口）
-                reused = True
-                lines.append(f"  -> 内容与「{keeper}」完全相同（同一张发票），不重复保存")
-                if is_dup:
-                    # 只有「重下回来才发现重复」这一种才把原图留证：说明出现了另一个
-                    # 下载入口或网址失效，稍后多半得人工核一眼。单纯同网址复用（同一发票
-                    # 拍多张图）属于已知去重，不往「重复票据」里塞，免得文件夹被噪声撑大。
-                    dup_hit = True
-                    _, msgs = _copy_original_into(
-                        ctx.folder, DUP_DIR_NAME, fpath, fname, PREFIX_DUPLICATE
-                    )
-                    lines.extend(msgs)
-            else:
-                lines.append(f"  -> 已下载 PDF：{os.path.basename(pdf_path)}")
+            cancelled = True
+            break
+        # 单二维码：命名与旧版完全一致；多二维码：追加「_第N页」
+        page = "" if not multi else MULTI_PAGE_FMT.format(n=idx)
+        base = f"{out_base}{page}"
+        tag = "" if not multi else f"[第{idx}页] "
+        # 别名表按「图片名 → PDF 名」登记；多二维码时每个子项用「图片名 + 页码后缀」
+        # 作为自己的键，避免同一张图的多个子项互相误命中。
+        alias_key = f"{fname}{page}"
+        # ⚠️ 指纹键同理：一张多码图里**所有子项共享同一个原图摘要**，
+        #    若直接拿它去 lookup_shot/remember_shot，第 1 个子项下完就把整图
+        #    登记成「= 第1页.pdf」，第 2 个子项随即命中这条记忆、直接复用第 1 份，
+        #    结果只下一份 —— 多二维码形同虚设。故给每个子项派生一个独立摘要。
+        item_digest = shot_digest if not multi else f"{shot_digest}:{page}"
+        res = _download_one(ctx, url, base, fpath, fname, item_digest,
+                            alias_key, tag, lines)
+        res["base"] = base
+        res["idx"] = idx
+        results.append(res)
+        if res.get("cancelled"):
+            cancelled = True
+            break
 
-    # 4) 可选：PDF 转 JPG（这一份如果已经转出过图片，也不再重复渲染一遍）
-    #    reused（复用别人的 PDF）时自己名下没有 PDF，跳过转图
-    if ctx.convert_pdf and ctx.img_dir and not reused:
-        first_img = os.path.join(ctx.img_dir, f"{out_base}_第1页.jpg")
-        if already and os.path.exists(first_img):
-            lines.append("  -> 图片已存在，跳过转换")
-        else:
-            try:
-                for img_path in convert_pdf_to_images(pdf_path, ctx.img_dir, out_base):
-                    lines.append(f"  -> 已生成图片：{os.path.basename(img_path)}")
-            except Exception as e:
-                lines.append(f"  -> PDF 转图片失败：{e}")
-    elif reused and not already:
+    # 被「停止」打断：不当成失败处理，原图也不复制（下次接着跑）
+    if cancelled:
+        return finish("cancelled")
+
+    ok_items = [r for r in results if r["ok"]]
+    bad_items = [r for r in results if not r["ok"]]
+    pdf_count = len(ok_items)
+
+    # 4) 部分（或全部）失败 → 整图归入「未识别/部分未识别-原名」，已下成的 PDF 保留
+    if bad_items:
+        for r in bad_items:
+            prefix = "" if not multi else f"[第{r['idx']}页] "
+            lines.append(f"  {prefix}-> 未下载成功：{r['reason']}")
+        if ok_items:
+            lines.append(
+                f"  -> {len(ok_items)} 个已下成、{len(bad_items)} 个未下成："
+                f"整图归入「未识别」（{PREFIX_PARTIAL}…）"
+            )
+        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_PARTIAL)
+        lines.extend(msgs)
+        # 已下成的照常做后续转图（不能因为同图另一个码失败就把有效票据也丢掉）
+        _convert_downloaded(ctx, results, lines)
+        return finish("no_pdf")
+
+    # 5) 全部成功（含全部复用）
+    if any(r["dup_hit"] for r in results):
+        # 只有「重下回来才发现重复」这一种才把原图留证：说明出现了另一个下载入口
+        # 或网址失效，稍后多半得人工核一眼。单纯同网址复用（同一发票拍多张图）
+        # 属于已知去重，不往「重复票据」里塞，免得文件夹被噪声撑大。
+        # 一张图上命中多次也只复制一次（同一个原图没法对应多份留证）。
+        dup_hit = True
+        _, msgs = _copy_original_into(
+            ctx.folder, DUP_DIR_NAME, fpath, fname, PREFIX_DUPLICATE
+        )
+        lines.extend(msgs)
+
+    _convert_downloaded(ctx, results, lines)
+
+    # 全部走「复用」路径 → duplicate；只要有一份是这次真正下的 → success
+    reused_all = all(r["reused"] for r in results)
+    return finish("duplicate" if reused_all else "success")
+
+
+def _convert_downloaded(ctx: _TaskCtx, results: list, lines: list):
+    """把本次成功拿到的 PDF 逐个转成图片（受「将 PDF 转换为图片」开关控制）。
+
+    多二维码时每个子项各转各的；复用来的（自己名下没有 PDF）跳过 —— 那份 PDF
+    当初下载时已经转过了，重复渲染只是白花时间。
+    """
+    if not ctx.convert_pdf or not ctx.img_dir:
+        return
+    for r in results:
+        if not r["ok"] or r["reused"] or not r["pdf"]:
+            continue
+        pdf_path = os.path.join(ctx.pdf_dir, r["pdf"])
+        base = r["base"]
+        first_img = os.path.join(ctx.img_dir, f"{base}_第1页.jpg")
+        if os.path.exists(first_img):
+            lines.append(f"  -> 图片已存在，跳过转换：{os.path.basename(first_img)}")
+            continue
+        try:
+            for img_path in convert_pdf_to_images(pdf_path, ctx.img_dir, base):
+                lines.append(f"  -> 已生成图片：{os.path.basename(img_path)}")
+        except Exception as e:
+            lines.append(f"  -> PDF 转图片失败：{e}")
+    if any(r["reused"] and not r["already"] for r in results):
         lines.append("  -> 该发票已有 PDF，无需重复转图")
-
-    if already:
-        return finish("skipped")
-    return finish("duplicate" if reused else "success")
 
 
 # =====================================================================
@@ -2241,6 +2422,7 @@ def _process_folder_impl(
         log_queue.put(("stats", {
             "total": 0, "success": 0, "skipped": 0, "no_pdf": 0, "unrecognized": 0,
             "other": 0, "error": 0, "cancelled": 0, "dup_shots": 0,
+            "multi_qr": 0, "extra_pdfs": 0,
             "workers": workers, "elapsed": 0.0,
         }))
         log_queue.put(("done",))
@@ -2311,10 +2493,12 @@ def _process_folder_impl(
                     res = fut.result()
                 except CancelledError:
                     # 被「停止」直接取消、根本没开始的任务（不是错误）
-                    res = {"fname": fname, "kind": "cancelled", "elapsed": 0.0, "lines": []}
+                    res = {"fname": fname, "kind": "cancelled", "elapsed": 0.0,
+                           "qr_count": 0, "pdf_count": 0, "lines": []}
                 except Exception as e:      # 兜底：_process_one 内部已尽量不抛异常
                     res = {
                         "fname": fname, "kind": "error", "elapsed": 0.0,
+                        "qr_count": 0, "pdf_count": 0,
                         "lines": [f"  -> 处理失败：{e}"],
                     }
                 results.append(res)
@@ -2349,6 +2533,9 @@ def _process_folder_impl(
     elapsed = time.perf_counter() - t_start
     kind_count = Counter(r["kind"] for r in results)
     dup_shots = sum(1 for r in results if r.get("dup_hit"))
+    # 多二维码统计：一张图含多个二维码的张数，以及它们比「一张一份 PDF」多下的份数
+    multi_qr = sum(1 for r in results if (r.get("qr_count") or 0) > 1)
+    extra_pdfs = sum(max(0, (r.get("pdf_count") or 0) - 1) for r in results)
     # 统计在并发结束后统一汇总，避免在多个线程里做 `stats[k] += 1`（非原子，会丢计数）
     stats = {
         "total": total,
@@ -2361,6 +2548,8 @@ def _process_folder_impl(
         "error": kind_count["error"],
         "cancelled": kind_count["cancelled"],
         "dup_shots": dup_shots,
+        "multi_qr": multi_qr,
+        "extra_pdfs": extra_pdfs,
         "workers": workers,
         "elapsed": elapsed,
     }
@@ -2375,7 +2564,7 @@ def _process_folder_impl(
         "=== 识别结果统计 ===",
         f"总计识别图片：{stats['total']} 张",
         f"✓ 成功识别并下载 PDF（原文件名不变）：{stats['success']} 张",
-        f"⚠ 识别到网址但未下载 PDF（复制到未识别/，未下载-）：{stats['no_pdf']} 张",
+        f"⚠ 有二维码未下载成功（复制到未识别/，{PREFIX_PARTIAL}…）：{stats['no_pdf']} 张",
         f"✗ 未识别到二维码（复制到未识别/，未识别-）：{stats['unrecognized']} 张",
         f"· 其它情况（复制到未识别/，其它-）：{stats['other']} 张",
     ]
@@ -2386,7 +2575,7 @@ def _process_folder_impl(
     if stats["duplicate"]:
         summary.insert(
             pos,
-            f"✓ 同一张发票已下载过（未重复下载，也只保留一份 PDF）：{stats['duplicate']} 张",
+            f"✓ 已有 PDF 直接复用（未重新下载，也只保留一份 PDF）：{stats['duplicate']} 张",
         )
     if dedup.shot_reused:
         summary.insert(
@@ -2398,6 +2587,11 @@ def _process_folder_impl(
         summary.append(
             f"✓ 重复票据（内容与已有发票相同，原图已复制到「{DUP_DIR_NAME}」/"
             f"{PREFIX_DUPLICATE}…）：{dup_shots} 张"
+        )
+    if stats["multi_qr"]:
+        summary.append(
+            f"· 一张图含多个二维码（各自下载，命名「原名_第N页」）：{stats['multi_qr']} 张，"
+            f"合计多下 {stats['extra_pdfs']} 份 PDF"
         )
     if stats["error"]:
         summary.append(f"✗ 处理出错（详见上方日志）：{stats['error']} 张")
@@ -2816,7 +3010,7 @@ class InvoiceQrToolApp:
             "本次识别结果统计：\n\n"
             f"总计识别图片：{s['total']} 张\n"
             f"成功下载 PDF（原文件名不变）：{s['success']} 张\n"
-            f"识别但未下载 PDF（未下载-）：{s['no_pdf']} 张\n"
+            f"有二维码未下载成功（复制到未识别/，部分未识别-）：{s['no_pdf']} 张\n"
             f"未识别到二维码（未识别-）：{s['unrecognized']} 张\n"
             f"其它情况（其它-）：{s['other']} 张"
         )
@@ -2826,6 +3020,13 @@ class InvoiceQrToolApp:
             msg += f"\n已存在 PDF 直接复用（未重新下载）：{s['skipped']} 张"
         if s.get("duplicate"):
             msg += f"\n同一张发票已下载过（未重复下载）：{s['duplicate']} 张"
+        multi_qr = s.get("multi_qr") or 0
+        if multi_qr:
+            extra = s.get("extra_pdfs") or 0
+            msg += (
+                f"\n一张图含多个二维码（各自下载，命名「原名_第N页」）："
+                f"{multi_qr} 张，合计多下 {extra} 份 PDF"
+            )
         cancelled = s.get("cancelled") or 0
         if cancelled:
             msg += f"\n因「停止」未处理：{cancelled} 张"
