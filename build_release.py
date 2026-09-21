@@ -620,12 +620,9 @@ def update_website(new_tag):
         # 负向断言排除日期 chip，避免把发布日期也当体积写掉
         (r'(<span class="chip gray">)(?!\d{4}-\d{2}-\d{2})[^<]*',
          r"\g<1>单文件 {} MB · 安装版 {} MB".format(size_mb, size_mb_i)),
-        (r"releases/download/v[\d.]+/InvoiceQRDownloader[_v]*[\d.]+\.exe",
-         "releases/download/{}/InvoiceQRDownloader_{}.exe".format(new_tag, ver)),
-        (r"releases/download/v[\d.]+/InvoiceQRInstaller[_v]*[\d.]+\.exe",
-         "releases/download/{}/InvoiceQRInstaller_{}.exe".format(new_tag, ver)),
-        # 下载直链已改为自有服务器（国内直连，见 2026-09-22）：刷 files/ 下的文件名版本号。
-        # 上面两条 GitHub 正则在页面里已无匹配（保留是为了兼容旧页面副本）。
+        # 下载直链走自有服务器（国内直连，2026-09-22 起）：只刷 files/ 下的文件名版本号。
+        # 页面里已不再出现 GitHub 直链，故原先针对 releases/download/ 的两条正则已删除 ——
+        # 留着只会每次发版报「未命中」噪音。
         (r"files/InvoiceQRDownloader[_v]*[\d.]+\.exe",
          "files/InvoiceQRDownloader_{}.exe".format(ver)),
         (r"files/InvoiceQRInstaller[_v]*[\d.]+\.exe",
