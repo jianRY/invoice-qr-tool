@@ -32,6 +32,12 @@ GITHUB_LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
 )
 
+# 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）。
+# 2026-09-22 起：检查更新优先读它（国内快），GitHub 只作兜底。
+SITE_URL = "http://47.116.64.26:8888"
+SERVER_UPDATE_JSON = SITE_URL + "/updates/qr.json"
+SERVER_FILES = SITE_URL + "/files"
+
 
 def _parse_version(tag: str) -> tuple:
     """把 'v3.0' / '3.0.1' / 'V3' 这类版本号解析成可比较的元组。
@@ -44,12 +50,28 @@ def _parse_version(tag: str) -> tuple:
     return tuple(nums)
 
 
-def get_latest_release():
-    """查询 GitHub 最新 Release，返回 (version, download_url, notes) 或 None。
+def _get_json(url: str, timeout: int = 8):
+    """取一份 JSON；失败一律返回 None（检查更新不能因为某个源挂了就把程序搞卡）。"""
+    headers = {"User-Agent": "InvoiceQRDownloader", "Accept": "application/json"}
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
 
-    仅读取公开仓库的 Release 列表，无需任何鉴权 token。
-    发布附件必须命名为 InvoiceQRDownloader_<版本>.exe（ASCII，避免中文名被剥离）。
-    """
+
+def _parse_update_json(data):
+    """把站点上的 update.json 解析成 (version, [下载源...], notes)。"""
+    if not isinstance(data, dict):
+        return None
+    tag = str(data.get("version") or "").strip()
+    urls = [u for u in (data.get("url"), data.get("fallback_url")) if u]
+    if not tag or not urls:
+        return None
+    return _parse_version(tag), urls, (data.get("notes") or "")
+
+
+def _from_github_api():
+    """兜底源：GitHub API。只有它能在 update.json 拿不到时给出更新说明。"""
     headers = {"User-Agent": "InvoiceQRDownloader", "Accept": "application/vnd.github+json"}
     try:
         resp = requests.get(GITHUB_LATEST_RELEASE_URL, headers=headers, timeout=15)
@@ -82,7 +104,29 @@ def get_latest_release():
 
     if not download_url:
         return None
-    return version, download_url, notes
+    return version, [download_url], notes
+
+
+def get_latest_release():
+    """查询最新版本，返回 (version, download_urls, notes) 或 None。
+
+    download_urls 是**候选下载源列表**，按顺序尝试：
+        [0] 自有服务器直链（国内快，支持 Range）
+        [1] GitHub Release 直链（服务器没同步到 / 不可达时兜底）
+    调用方把整个列表交给 perform_update()，由它在下载层逐个试。
+
+    检查顺序（2026-09-22 改为双源，起因：用户反馈 GitHub 拉包慢、易超时）：
+        ① 自有服务器 /updates/qr.json —— 秒回，国内直连
+        ② GitHub API releases/latest —— 兜底
+    发布附件仍须命名为 InvoiceQRDownloader_<版本>.exe（ASCII，避免中文名被剥离）。
+    """
+    try:
+        got = _parse_update_json(_get_json(SERVER_UPDATE_JSON))
+        if got:
+            return got
+    except Exception:
+        pass
+    return _from_github_api()
 
 
 def _derive_base_name(exe_path: str) -> str:
@@ -160,10 +204,14 @@ def send_to_recycle_bin(path: str) -> bool:
         return False
 
 
-def perform_update(download_url: str, latest_version: tuple, on_event=None,
+def perform_update(download_urls, latest_version: tuple, on_event=None,
                    cancel=None) -> bool:
-    """下载 GitHub 最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
+    """下载最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
     并把旧的 EXE 移动到回收站。
+
+    download_urls: 候选下载源列表（取自 get_latest_release），**逐个尝试直到成功**——
+        首选自有服务器直链，失败自动切 GitHub 直链；单个源网络抖动不影响整体更新。
+        为兼容旧调用，也可以直接传一个字符串 URL。
 
     流程（cancel 只在能干净收尾的阶段生效）：
       ① 下载 → 可取消：立刻断开、删除半截 .part，等于什么都没发生；
@@ -222,16 +270,39 @@ def perform_update(download_url: str, latest_version: tuple, on_event=None,
         emit({"type": "cancelled"})
         emit({"type": "done", "ok": False})
 
-    # ---- ① 下载（可取消）----
-    try:
-        if not _download_file(download_url, part, progress_cb=_prog, cancel=cancel,
-                              expect_magic=b"MZ"):
-            _cleanup_part()
-            emit({"type": "detail", "text": "下载失败：无法获取更新文件，请稍后重试或手动更新。"})
-            emit({"type": "done", "ok": False})
+    # ---- ① 下载（可取消）：多源依次尝试 ----
+    urls = download_urls if isinstance(download_urls, (list, tuple)) else [download_urls]
+    urls = [u for u in urls if u]
+    if not urls:
+        _cleanup_part()
+        emit({"type": "detail", "text": "下载失败：没有可用的下载源。"})
+        emit({"type": "done", "ok": False})
+        return False
+
+    for idx, url in enumerate(urls, 1):
+        if _cancelled():
+            _emit_cancelled("已取消更新：临时文件已清理。")
             return False
-    except _UpdateCancelled:
-        _emit_cancelled("已取消更新：下载已中断，临时文件已清理。")
+        if idx > 1:
+            emit({"type": "stage", "text": f"正在切换备用下载源（{idx}/{len(urls)}）…"})
+            emit({"type": "detail", "text": f"上一个源不可用，改从备用源下载：{url[:64]}"})
+            _last_w[0] = 0          # 换源后进度从 0 重新计数，速度采样一并重置
+            _last_t[0] = time.time()
+        try:
+            if _download_file(url, part, progress_cb=_prog, cancel=cancel,
+                              expect_magic=b"MZ"):
+                break
+        except _UpdateCancelled:
+            _emit_cancelled("已取消更新：下载已中断，临时文件已清理。")
+            return False
+        except Exception as e:
+            # 单个源出错不致命，继续试下一个；全都失败才报错
+            emit({"type": "detail", "text": f"下载源出错：{e}"})
+    else:
+        _cleanup_part()
+        emit({"type": "detail",
+              "text": "下载失败：所有下载源都不可用，请稍后重试或手动更新。"})
+        emit({"type": "done", "ok": False})
         return False
 
     if _cancelled():

@@ -31,6 +31,7 @@
       仅 fix / docs / chore / refactor 等                      → 只升修订位（4.6.3 → 4.6.4）
   - 手动指定：--version 4.7.0（写 4.7 等价于 4.7.0）。目标版本必须高于线上最新。
 """
+import hashlib
 import os
 import re
 import sys
@@ -80,6 +81,13 @@ WEBSITE_DIR = os.path.join(ROOT, "website")   # 官网静态页（宝塔脚本 g
 VERSION_FILE = os.path.join(ROOT, "VERSION")
 LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 PROXY = "http://127.0.0.1:10808"
+
+# 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）：
+#   /updates/qr.json 客户端自动更新优先读它（国内快）
+#   /files/<资产名>   双 exe 由服务器定时脚本从 Release 镜像过去
+# GitHub 只作兜底。update.json 由本脚本生成并作为 Release 附件上传。
+SITE_URL = "http://47.116.64.26:8888"
+SERVER_FILES = SITE_URL + "/files"
 
 # 代理全局生效（urllib / git 都用）。
 # ⚠️ 不能用 setdefault：WorkBuddy 沙箱会在环境里注入它自己的代理
@@ -507,6 +515,9 @@ def make_assets(new_tag):
     usage = (
         "发票二维码识别下载工具 {tag}\n"
         "================================\n\n"
+        "【下载（推荐：国内直连，速度快）】\n"
+        "{site}/\n"
+        "本站为国内服务器直链，不必访问 GitHub；GitHub 地址见文末。\n\n"
         "项目主页（源码 / 下载 / 更新日志）：\n"
         "{url}\n\n"
         "【单文件运行版】InvoiceQRDownloader_{tag}.exe\n"
@@ -516,9 +527,40 @@ def make_assets(new_tag):
         "  → 自动创建开始菜单 / 桌面快捷方式，并写入「应用和功能」卸载项。\n"
         "  卸载：设置 → 应用 → 发票二维码工具 → 卸载，或控制面板。\n\n"
         "两版功能完全一致，按使用场景选择即可。\n"
-    ).format(tag=new_tag.lstrip("v"), url=PROJECT_URL)
+    ).format(tag=new_tag.lstrip("v"), url=PROJECT_URL, site=SITE_URL)
     with open(os.path.join(ASSET_DIR, "InvoiceQR_Usage.txt"), "w", encoding="utf-8") as f:
         f.write(usage)
+
+    # 客户端自动更新元数据：随 Release 上传，服务器脚本抄到站点 /updates/qr.json。
+    # 客户端先读那份（国内快），读不到才回退 GitHub API。
+    ver = new_tag.lstrip("v")
+
+    def _sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    update_meta = {
+        "app": "qr",
+        "name": APP_NAME,
+        "version": ver,
+        "asset": portable_name,
+        "notes": changelog,
+        "url": "{}/{}".format(SERVER_FILES, portable_name),
+        "fallback_url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
+        "release_url": "{}/releases/tag/{}".format(PROJECT_URL, new_tag),
+        "site_url": SITE_URL + "/",
+        "size": os.path.getsize(PORTABLE_OUT),
+        "sha256": _sha256(PORTABLE_OUT),
+        "published": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "setup_url": "{}/{}".format(SERVER_FILES, installer_name),
+        "setup_fallback_url": "{}/releases/download/{}/{}".format(
+            PROJECT_URL, new_tag, installer_name),
+    }
+    with open(os.path.join(ASSET_DIR, "update.json"), "w", encoding="utf-8") as f:
+        json.dump(update_meta, f, ensure_ascii=False, indent=2)
     print("资源已生成:", ASSET_DIR)
     return portable_name, installer_name
 
@@ -582,6 +624,12 @@ def update_website(new_tag):
          "releases/download/{}/InvoiceQRDownloader_{}.exe".format(new_tag, ver)),
         (r"releases/download/v[\d.]+/InvoiceQRInstaller[_v]*[\d.]+\.exe",
          "releases/download/{}/InvoiceQRInstaller_{}.exe".format(new_tag, ver)),
+        # 下载直链已改为自有服务器（国内直连，见 2026-09-22）：刷 files/ 下的文件名版本号。
+        # 上面两条 GitHub 正则在页面里已无匹配（保留是为了兼容旧页面副本）。
+        (r"files/InvoiceQRDownloader[_v]*[\d.]+\.exe",
+         "files/InvoiceQRDownloader_{}.exe".format(ver)),
+        (r"files/InvoiceQRInstaller[_v]*[\d.]+\.exe",
+         "files/InvoiceQRInstaller_{}.exe".format(ver)),
     ])
     print("[网页] 官网版本数据已同步 -> {} | 日期 {} | {} MB".format(new_tag, today, size_mb))
 
@@ -640,6 +688,8 @@ def publish(new_tag, token):
         ("InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
         ("InvoiceQR_Usage.txt", "text/plain; charset=utf-8"),
         ("InvoiceQR_Changelog.txt", "text/plain; charset=utf-8"),
+        # 自动更新元数据（服务器定时脚本抄到站点 /updates/qr.json，客户端优先读它）
+        ("update.json", "application/json; charset=utf-8"),
     ]:
         p = os.path.join(ASSET_DIR, fn)
         if not os.path.exists(p):

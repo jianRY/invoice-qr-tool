@@ -938,8 +938,11 @@ class UpdateProgressDialog:
         self.txt.append(text, None)
 
 
-def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
+def _start_update_flow(root: tk.Tk, download_urls, version: tuple):
     """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。
+
+    download_urls 是候选下载源列表（自有服务器直链 → GitHub 直链），
+    依次尝试直到成功，见 iqr_update.get_latest_release / perform_update。
 
     取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
     """
@@ -951,7 +954,7 @@ def _start_update_flow(root: tk.Tk, download_url: str, version: tuple):
         def on_event(ev):
             dlg.emit(**ev)          # emit 只入队，由主线程 _poll 消费
         try:
-            perform_update(download_url, version, on_event=on_event, cancel=dlg.cancel)
+            perform_update(download_urls, version, on_event=on_event, cancel=dlg.cancel)
         except Exception as e:
             # 兜底：工作线程异常退出就再没人报 done，进度框会卡在「不可关闭」状态
             dlg.emit({"type": "detail", "text": f"更新过程出错：{e}"})
@@ -999,7 +1002,7 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
                 messagebox.showinfo(
                     "检查更新", "暂时无法连接到更新服务器（或当前已是最新）。")
             return
-        version, download_url, notes = result
+        version, download_urls, notes = result
         if version <= _parse_version(__VERSION__):
             if manual:
                 messagebox.showinfo("检查更新", f"当前已是最新版本 v{__VERSION__}。")
@@ -1014,7 +1017,7 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
         )
         if ok:
-            _start_update_flow(root, download_url, version)
+            _start_update_flow(root, download_urls, version)
     finally:
         _end_update_check()
 
