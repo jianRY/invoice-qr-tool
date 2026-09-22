@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import requests
@@ -34,10 +35,187 @@ GITHUB_LATEST_RELEASE_URL = (
 )
 
 # 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）。
-# 2026-09-22 起：检查更新优先读它（国内快），GitHub 只作兜底。
+# 2026-09-22 定位调整：**退为兜底**。正常路径走 GitHub 加速镜像。
 SITE_URL = "http://47.116.64.26:8888"
 SERVER_UPDATE_JSON = SITE_URL + "/updates/qr.json"
 SERVER_FILES = SITE_URL + "/files"
+
+# Release 附件里的 update.json（发版脚本上传时固定叫这个名字）——
+# 带 sha256/size，是完整性校验的唯一依据，故优先于 GitHub API。
+RELEASE_UPDATE_JSON = (
+    "https://github.com/%s/%s/releases/latest/download/update.json"
+    % (GITHUB_REPO_OWNER, GITHUB_REPO_NAME)
+)
+
+# ---------------- GitHub 加速镜像（2026-09-22 新增） ----------------
+# 起因：实测裸网直连 GitHub 只有 3.7 KB/s（基本等于不可用），必须走公共加速镜像；
+# 而镜像之间也差近 10 倍 —— 同一次实测：gh-proxy.com 439.6 KB/s、
+# ghfast.top 222.8 KB/s、ghproxy.net 45.6 KB/s。所以下载前并发探测量一小段、
+# 按实测速度择优，而不是死按固定顺序硬试（硬试会一头撞在最慢的源上干等超时）。
+#
+# ⚠️ 三条硬约束（改这里之前先读）：
+#   ① 镜像属第三方服务，随时可能失效 —— 本轮实测 9 个常见候选里 6 个已经死了
+#      （ghproxy.cc / hub.gitmirror.com / gh.llkk.cc / github.moeyy.xyz /
+#        ghproxy.cfd / hk.gh-proxy.com 全部拿不到连接）。
+#      所以列表**硬编码在客户端、靠发版换源**，不写进 update.json。
+#   ② 探测失败的源一律**不丢弃**，只排到最后继续尝试（探测失败 ≠ 不能下载）。
+#   ③ GitHub 原站与自有服务器直链永远保留在候选里兜底。
+MIRROR_PREFIXES = (
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+)
+
+PROBE_BYTES = 256 * 1024        # 探测时最多读取的字节数
+PROBE_TIMEOUT = 4               # 单源探测最长等待秒数
+MIN_USEFUL_SPEED = 50 * 1024    # B/s：低于此速度视为「探不到」，排最后但仍会尝试
+
+_UA = "InvoiceQRDownloader"
+
+
+def _is_github_url(url) -> bool:
+    """是否为 GitHub 上的地址（只有这类才值得拼加速镜像前缀）。"""
+    u = str(url or "")
+    return "github.com/" in u or "githubusercontent.com/" in u
+
+
+def _mirror_variants(url) -> list:
+    """给一个 GitHub 直链生成全部镜像版本；非 GitHub 链接返回空列表。
+
+    镜像用法就是「把原始完整 URL 直接拼在前缀后面」，
+    raw.githubusercontent.com 与 github.com/releases/... 实测都支持。
+    """
+    if not _is_github_url(url):
+        return []
+    return [p + url for p in MIRROR_PREFIXES]
+
+
+def _source_label(url) -> str:
+    """给人看的源名（进度框与日志里显示）。"""
+    u = str(url or "")
+    for p in MIRROR_PREFIXES:
+        if u.startswith(p):
+            return "加速镜像 %s" % p.split("//")[1].strip("/")
+    if _is_github_url(u):
+        return "GitHub 原站"
+    try:
+        return u.split("//")[1].split("/")[0]
+    except IndexError:
+        return u[:30]
+
+
+def _probe_speed(url, nbytes: int = PROBE_BYTES, timeout: int = PROBE_TIMEOUT) -> float:
+    """拉一小段（Range）测速，返回 KB/s；失败或超时返回 0.0 —— 绝不抛异常。
+
+    只读 256KB 就断开，几十 MB 的包不会因为测速被白下。
+    """
+    headers = {"User-Agent": _UA, "Range": "bytes=0-%d" % (nbytes - 1)}
+    try:
+        t0 = time.monotonic()
+        got = 0
+        resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
+        try:
+            if resp.status_code not in (200, 206):
+                return 0.0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got >= nbytes or time.monotonic() - t0 > timeout:
+                    break
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        dt = time.monotonic() - t0
+        if got <= 0 or dt <= 0:
+            return 0.0
+        return got / 1024.0 / dt
+    except Exception:
+        return 0.0
+
+
+def order_download_urls(urls, timeout: int = PROBE_TIMEOUT, on_event=None) -> list:
+    """把候选下载地址展开成「实测最快优先」的有序列表。
+
+    展开规则：
+      · GitHub 直链 → 生成全部镜像版本作为**加速候选**放前面，原链留作兜底
+      · 非 GitHub 地址（自有服务器直链）→ 一律排**最后**，只作兜底
+      · 去重保序
+
+    返回顺序 = 实际尝试顺序。下载前并发探测各加速候选的速度并按快慢重排；
+    探测失败的源排在最后但**不会丢弃**（详见 MIRROR_PREFIXES 上方注释②）。
+    """
+    def emit(ev):
+        if on_event:
+            on_event(ev)
+
+    fast, gh_tail, other = [], [], []
+
+    def _add(bucket, u):
+        u = (u or "").strip()
+        if u and u not in fast and u not in gh_tail and u not in other:
+            bucket.append(u)
+
+    for u in (urls or []):
+        u = (u or "").strip()
+        if not u:
+            continue
+        if _is_github_url(u):
+            for m in _mirror_variants(u):
+                _add(fast, m)
+            _add(gh_tail, u)       # GitHub 原站：排在镜像之后、自有服务器之前
+        else:
+            _add(other, u)         # 自有服务器：**永远最后兜底**（不随元数据字段顺序漂移）
+
+    if not fast:
+        return gh_tail + other     # 没有可加速的源，直接用原顺序（不白等一次探测）
+
+    emit({"type": "stage", "text": "正在选择最快的下载源…"})
+    speeds = {}
+    lock = threading.Lock()
+
+    def _one(u):
+        s = _probe_speed(u, timeout=timeout)
+        with lock:
+            speeds[u] = s
+
+    threads = [threading.Thread(target=_one, args=(u,), daemon=True) for u in fast]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 2)
+
+    emit({"type": "detail", "text": "加速源测速：" + "、".join(
+        "%s %.0f KB/s" % (_source_label(u), speeds.get(u, 0.0)) for u in fast)})
+
+    usable = [u for u in fast if speeds.get(u, 0.0) >= MIN_USEFUL_SPEED / 1024.0]
+    unusable = [u for u in fast if u not in usable]
+    usable.sort(key=lambda u: -speeds.get(u, 0.0))
+    return usable + unusable + gh_tail + other
+
+
+def _meta_candidates():
+    """检查更新的元数据候选源，按「GitHub 加速镜像 → GitHub 原站 → 自有服务器」排序。
+
+    为什么 update.json 必须排在 GitHub API 之前：
+        只有 update.json 带 sha256，是完整性校验的唯一依据；
+        API 不返回该字段，优先走 API 等于每次都把校验跳过。
+    """
+    out, seen = [], set()
+
+    def _add(u, label):
+        u = (u or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append((u, label))
+
+    for m in _mirror_variants(RELEASE_UPDATE_JSON):
+        _add(m, _source_label(m))
+    _add(RELEASE_UPDATE_JSON, _source_label(RELEASE_UPDATE_JSON))
+    _add(SERVER_UPDATE_JSON, "自有服务器")
+    return out
 
 
 def _parse_version(tag: str) -> tuple:
@@ -51,7 +229,7 @@ def _parse_version(tag: str) -> tuple:
     return tuple(nums)
 
 
-def _get_json(url: str, timeout: int = 8):
+def _get_json(url: str, timeout: int = 5):
     """取一份 JSON；失败一律返回 None（检查更新不能因为某个源挂了就把程序搞卡）。"""
     headers = {"User-Agent": "InvoiceQRDownloader", "Accept": "application/json"}
     resp = requests.get(url, headers=headers, timeout=timeout)
@@ -126,23 +304,24 @@ def _from_github_api():
 def get_latest_release():
     """查询最新版本，返回 (version, download_urls, notes, sha256) 或 None。
 
-    download_urls 是**候选下载源列表**，按顺序尝试：
-        [0] 自有服务器直链（国内快，支持 Range）
-        [1] GitHub Release 直链（服务器没同步到 / 不可达时兜底）
-    调用方把整个列表交给 perform_update()，由它在下载层逐个试；
+    download_urls 是**候选下载源列表**，交给 perform_update() 逐个尝试；
+    perform_update 下载前还会把它展开成镜像并通过测速择优（见 order_download_urls）。
     已同步的 sha256 也一并传下去做完整性校验。
 
-    检查顺序（2026-09-22 改为双源，起因：用户反馈 GitHub 拉包慢、易超时）：
-        ① 自有服务器 /updates/qr.json —— 秒回，国内直连
-        ② GitHub API releases/latest —— 兜底
+    检查顺序（2026-09-22 改为「GitHub 加速镜像优先」）：
+        ① 加速镜像 + Release 附件 update.json  —— 最快，且带 sha256
+        ② GitHub 原站 Release 附件 update.json
+        ③ 自有服务器 /updates/qr.json           —— 兜底
+        ④ GitHub API releases/latest           —— 最后兜底（不返回 sha256）
     发布附件仍须命名为 InvoiceQRDownloader_<版本>.exe（ASCII，避免中文名被剥离）。
     """
-    try:
-        got = _parse_update_json(_get_json(SERVER_UPDATE_JSON))
-        if got:
-            return got
-    except Exception:
-        pass
+    for url, source in _meta_candidates():
+        try:
+            got = _parse_update_json(_get_json(url))
+            if got:
+                return got
+        except Exception:
+            continue
     return _from_github_api()
 
 
@@ -226,8 +405,9 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
     """下载最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
     并把旧的 EXE 移动到回收站。
 
-    download_urls: 候选下载源列表（取自 get_latest_release），**逐个尝试直到成功**——
-        首选自有服务器直链，失败自动切 GitHub 直链；单个源网络抖动不影响整体更新。
+    download_urls: 候选下载源列表（取自 get_latest_release），**逐个尝试直到成功**。
+        进入下载前会展开 GitHub 加速镜像并并发测速择优，按实测速度从快到慢尝试；
+        GitHub 原站与自有服务器直链留在最后兜底。
         为兼容旧调用，也可以直接传一个字符串 URL。
     sha256: 更新包期望的 SHA256（取自 update.json，小写十六进制）。非空时下载完先校验，
         不一致就当次更新失败并丢弃半截包——网络中途断流 / 缓存坏包不会再被装上。
@@ -298,6 +478,11 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
         emit({"type": "detail", "text": "下载失败：没有可用的下载源。"})
         emit({"type": "done", "ok": False})
         return False
+    # 展开加速镜像 + 并发测速择优；择优本身出错就退回原顺序，绝不因此中断更新
+    try:
+        urls = order_download_urls(urls, on_event=on_event)
+    except Exception as e:
+        emit({"type": "detail", "text": f"选择下载源时出错，改用原顺序重试：{e}"})
 
     for idx, url in enumerate(urls, 1):
         if _cancelled():
@@ -305,7 +490,8 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
             return False
         if idx > 1:
             emit({"type": "stage", "text": f"正在切换备用下载源（{idx}/{len(urls)}）…"})
-            emit({"type": "detail", "text": f"上一个源不可用，改从备用源下载：{url[:64]}"})
+            emit({"type": "detail",
+                  "text": f"上一个源不可用，改从备用源下载：{_source_label(url)}"})
             _last_w[0] = 0          # 换源后进度从 0 重新计数，速度采样一并重置
             _last_t[0] = time.time()
         try:

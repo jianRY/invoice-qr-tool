@@ -80,40 +80,101 @@ ASSET_DIR = os.path.join(ROOT, "outputs", "release_assets")
 WEBSITE_DIR = os.path.join(ROOT, "website")   # 官网静态页（宝塔脚本 git pull 后自动部署）
 VERSION_FILE = os.path.join(ROOT, "VERSION")
 LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
-PROXY = "http://127.0.0.1:10808"
+# 代理：不再硬编码（2026-09-22 重构，见下方 pick_proxy 的说明）
+PROXY = None
 
 # 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）：
-#   /updates/qr.json 客户端自动更新优先读它（国内快）
+#   /updates/qr.json 客户端自动更新**兜底**读它（主源已改为 GitHub 加速镜像）
 #   /files/<资产名>   双 exe 由服务器定时脚本从 Release 镜像过去
-# GitHub 只作兜底。update.json 由本脚本生成并作为 Release 附件上传。
+# 2026-09-22 调整：update.json 的 url 改放 GitHub Release 直链（客户端会再展开
+# 加速镜像并测速择优），自有服务器直链改放 fallback_url 兜底。
 SITE_URL = "http://47.116.64.26:8888"
 SERVER_FILES = SITE_URL + "/files"
 
-# 代理全局生效（urllib / git 都用）。
-# ⚠️ 不能用 setdefault：WorkBuddy 沙箱会在环境里注入它自己的代理
-#    （实测 http_proxy/https_proxy = http://127.0.0.1:61290，对 github.com 一律
-#     返回 `CONNECT tunnel failed, response 502`），setdefault 会被这个已存在的值
-#     挡住而**静默失效** —— 表现为构建/签名全成功、一到 push 就 502（v4.10.0 实测）。
-#    故这里必须**强制覆盖**；仅在代理端口探测不通时才退回环境原值。
-def _proxy_alive(proxy=PROXY, timeout=2.0):
-    try:
-        host_port = proxy.split("://", 1)[-1]
-        host, port = host_port.rsplit(":", 1)
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
+# 代理全局生效（urllib / requests / git 都用）。
+#
+# ⚠️ 2026-09-22 重构：不再硬编码 127.0.0.1:10808，也不再只靠「端口能不能连」判断。
+#    旧实现的两个坑，都实际踩过：
+#      ① 硬编码端口 —— 代理一关或换端口，发版就卡在最后一步 git push 上
+#         （打包/签名/元数据全做完了才失败，最亏）；
+#      ② `_proxy_alive()` 只做 TCP 连接 —— 10808 端口当时**能连但出不了网**，
+#         被判为「可用」，结果 push 报 `Could not connect to server`。
+#    现在改为：逐个候选**真去访问一次 GitHub API**，谁能用就用谁；全不行就直连。
+#    （沙箱注入的 http_proxy 端口会变，所以必须实测、不能写死。）
+def _proxy_candidates():
+    """代理候选，按优先级；None 表示「不用代理、直连」。
+
+    ① RELEASE_PROXY 环境变量 —— 显式指定，最高优先级；**空串表示强制直连**
+    ② 本机代理软件常用端口（10808 / 10809 / 7890 / 7897）
+    ③ 环境变量里的 https_proxy / http_proxy
+    ④ None（直连）
+
+    为什么环境变量代理排在**后面**：这类变量常由沙箱/其他工具注入，可能只放行了
+    api.github.com，对 github.com 的 CONNECT 隧道会拒（2026-09-22 实测：环境里的
+    127.0.0.1:62577 访问 api 返回 200、访问 github.com 返回 000），拿它 push 必挂。
+    本机代理软件（Clash 等）的端口才是真正能出网的通道。
+    """
+    explicit = os.environ.get("RELEASE_PROXY")
+    if explicit is not None:
+        return [explicit.strip() or None]
+    out = []
+    for port in (10808, 10809, 7890, 7897):
+        u = "http://127.0.0.1:%d" % port
+        if u not in out:
+            out.append(u)
+    for k in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        v = (os.environ.get(k) or "").strip()
+        if v and v not in out:
+            out.append(v)
+    out.append(None)
+    return out
 
 
-USE_PROXY = _proxy_alive()
-if USE_PROXY:
-    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        _prev = os.environ.get(_k)
-        if _prev and _prev != PROXY:
-            print("[代理] 环境变量 {}={} 已强制覆盖为 {}".format(_k, _prev, PROXY))
-        os.environ[_k] = PROXY
-else:
-    print("[代理] {} 不可达，保持环境原值（直连）".format(PROXY))
+def _proxy_works(proxy, timeout=5):
+    """实测该代理能否访问 GitHub；proxy=None 时测直连。
+
+    ⚠️ 两个域名**都必须通**才算可用：
+      · api.github.com —— 建 Release、传资产走它
+      · github.com     —— git push 走它（CONNECT 隧道到 443）
+    踩过的坑：某个代理只放行 api.github.com，于是被判为「可用」，
+    打包/签名全成功，最后 git push 报 CONNECT tunnel failed 502。
+    """
+    for url in ("https://api.github.com", "https://github.com"):
+        try:
+            handlers = ([urllib.request.ProxyHandler({"http": proxy, "https": proxy})]
+                        if proxy else [urllib.request.ProxyHandler({})])
+            op = urllib.request.build_opener(*handlers)
+            req = urllib.request.Request(url, headers={"User-Agent": "release-probe"})
+            with op.open(req, timeout=timeout) as resp:
+                if getattr(resp, "status", 0) != 200:
+                    return False
+        except Exception:  # noqa: BLE001
+            return False
+    return True
+
+
+def pick_proxy():
+    """挑第一个实测能用的代理并写进环境变量；返回选中的值（None = 直连）。"""
+    global PROXY
+    for cand in _proxy_candidates():
+        if _proxy_works(cand):
+            PROXY = cand
+            break
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        prev = os.environ.get(k)
+        if PROXY:
+            if prev and prev != PROXY:
+                print("[代理] 环境变量 {}={} → {}".format(k, prev, PROXY))
+            os.environ[k] = PROXY
+        else:
+            if prev:
+                print("[代理] 清除环境变量 {}={}（改用直连）".format(k, prev))
+            os.environ.pop(k, None)
+    print("[代理] {}".format(PROXY if PROXY else "不使用（直连）"))
+    return PROXY
+
+
+PROXY = pick_proxy()
 
 
 
@@ -277,7 +338,11 @@ def git_env():
 
 def git(*args, check=True, capture=True):
     # 代理用 `-c` 显式传给 git：不依赖环境变量，沙箱注入的代理也拦不住。
-    proxy_args = ["-c", "http.proxy=" + PROXY, "-c", "https.proxy=" + PROXY] if USE_PROXY else []
+    # 代理按 pick_proxy() 实测结果注入；PROXY 为 None 时**显式传空值强制直连**，
+    # 免得仓库里残留的 http.proxy 把 git 带向一条死路
+    # （git config 的优先级高于环境变量，见文件上方说明）。
+    proxy_args = (["-c", "http.proxy=" + PROXY, "-c", "https.proxy=" + PROXY] if PROXY
+                  else ["-c", "http.proxy=", "-c", "https.proxy="])
     r = subprocess.run(
         [GIT] + proxy_args + list(args), capture_output=capture, text=True,
         encoding="utf-8", errors="replace", env=git_env(),
@@ -582,16 +647,18 @@ def make_assets(new_tag):
         "version": ver,
         "asset": portable_name,
         "notes": changelog,
-        "url": "{}/{}".format(SERVER_FILES, portable_name),
-        "fallback_url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
+        # url = 主源（GitHub Release 直链，客户端再展开加速镜像择优）
+        # fallback_url = 兜底源（自有服务器直链）—— 语义 2026-09-22 调换过，别改回去
+        "url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
+        "fallback_url": "{}/{}".format(SERVER_FILES, portable_name),
         "release_url": "{}/releases/tag/{}".format(PROJECT_URL, new_tag),
         "site_url": SITE_URL + "/",
         "size": os.path.getsize(PORTABLE_OUT),
         "sha256": _sha256(PORTABLE_OUT),
         "published": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "setup_url": "{}/{}".format(SERVER_FILES, installer_name),
-        "setup_fallback_url": "{}/releases/download/{}/{}".format(
+        "setup_url": "{}/releases/download/{}/{}".format(
             PROJECT_URL, new_tag, installer_name),
+        "setup_fallback_url": "{}/{}".format(SERVER_FILES, installer_name),
     }
     with open(os.path.join(ASSET_DIR, "update.json"), "w", encoding="utf-8") as f:
         json.dump(update_meta, f, ensure_ascii=False, indent=2)
