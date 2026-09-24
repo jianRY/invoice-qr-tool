@@ -34,18 +34,16 @@ GITHUB_LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
 )
 
-# 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）。
-# 2026-09-22 定位调整：**退为兜底**。正常路径走 GitHub 加速镜像。
-SITE_URL = "http://47.116.64.26:8888"
-SERVER_UPDATE_JSON = SITE_URL + "/updates/qr.json"
-SERVER_FILES = SITE_URL + "/files"
-
 # Release 附件里的 update.json（发版脚本上传时固定叫这个名字）——
 # 带 sha256/size，是完整性校验的唯一依据，故优先于 GitHub API。
 RELEASE_UPDATE_JSON = (
     "https://github.com/%s/%s/releases/latest/download/update.json"
     % (GITHUB_REPO_OWNER, GITHUB_REPO_NAME)
 )
+
+# ⚠️ 2026-09-24 起：更新链路**全部收在 GitHub**，不再依赖任何自有服务器。
+# （原先的 47.116.64.26 直链已移除：update.json 本就挂在 Release 附件里，
+#   自有服务器那份只是冗余副本，还得额外维护同步，删掉少一个失联点。）
 
 # ---------------- GitHub 加速镜像（2026-09-22 新增） ----------------
 # 起因：实测裸网直连 GitHub 只有 3.7 KB/s（基本等于不可用），必须走公共加速镜像；
@@ -59,11 +57,23 @@ RELEASE_UPDATE_JSON = (
 #        ghproxy.cfd / hk.gh-proxy.com 全部拿不到连接）。
 #      所以列表**硬编码在客户端、靠发版换源**，不写进 update.json。
 #   ② 探测失败的源一律**不丢弃**，只排到最后继续尝试（探测失败 ≠ 不能下载）。
-#   ③ GitHub 原站与自有服务器直链永远保留在候选里兜底。
+#   ③ GitHub 原站直链永远保留在候选里兜底。
 MIRROR_PREFIXES = (
     "https://gh-proxy.com/",
     "https://ghfast.top/",
     "https://ghproxy.net/",
+)
+
+# 能代理 **API 查询** 的镜像（与下载用的不是同一批，别混用）。
+#
+# ⚠️ 实测（2026-09-24）「下载」与「API 查询」的可用站点并不重合：
+#     · 下载：gh-proxy.com / ghfast.top / ghproxy.net 三个都行
+#     · API ：只有 gh-proxy.com 能代理 api.github.com；
+#             ghfast.top 与 ghproxy.net 对 API 一律返回 403
+#   好在 api.github.com 直连在国内本来就能通（约 0.8s），所以这里只放一个兜底，
+#   顺序是「直连优先 → 再试镜像」（见 _api_url_candidates）。
+API_MIRROR_PREFIXES = (
+    "https://gh-proxy.com/",
 )
 
 PROBE_BYTES = 256 * 1024        # 探测时最多读取的字节数
@@ -141,7 +151,8 @@ def order_download_urls(urls, timeout: int = PROBE_TIMEOUT, on_event=None) -> li
 
     展开规则：
       · GitHub 直链 → 生成全部镜像版本作为**加速候选**放前面，原链留作兜底
-      · 非 GitHub 地址（自有服务器直链）→ 一律排**最后**，只作兜底
+      · 非 GitHub 地址 → **一律丢弃**（2026-09-24 起：更新链路全收在 GitHub，
+        不再需要自有服务器兜底；万一 update.json 里混进了旧字段，也不去踩它）
       · 去重保序
 
     返回顺序 = 实际尝试顺序。下载前并发探测各加速候选的速度并按快慢重排；
@@ -151,11 +162,11 @@ def order_download_urls(urls, timeout: int = PROBE_TIMEOUT, on_event=None) -> li
         if on_event:
             on_event(ev)
 
-    fast, gh_tail, other = [], [], []
+    fast, gh_tail = [], []
 
     def _add(bucket, u):
         u = (u or "").strip()
-        if u and u not in fast and u not in gh_tail and u not in other:
+        if u and u not in fast and u not in gh_tail:
             bucket.append(u)
 
     for u in (urls or []):
@@ -165,12 +176,11 @@ def order_download_urls(urls, timeout: int = PROBE_TIMEOUT, on_event=None) -> li
         if _is_github_url(u):
             for m in _mirror_variants(u):
                 _add(fast, m)
-            _add(gh_tail, u)       # GitHub 原站：排在镜像之后、自有服务器之前
-        else:
-            _add(other, u)         # 自有服务器：**永远最后兜底**（不随元数据字段顺序漂移）
+            _add(gh_tail, u)       # GitHub 原站：排在镜像之后兜底
+        # 非 GitHub 地址：丢弃（见 docstring）
 
     if not fast:
-        return gh_tail + other     # 没有可加速的源，直接用原顺序（不白等一次探测）
+        return gh_tail             # 没有可加速的源，直接用原顺序（不白等一次探测）
 
     emit({"type": "stage", "text": "正在选择最快的下载源…"})
     speeds = {}
@@ -193,15 +203,18 @@ def order_download_urls(urls, timeout: int = PROBE_TIMEOUT, on_event=None) -> li
     usable = [u for u in fast if speeds.get(u, 0.0) >= MIN_USEFUL_SPEED / 1024.0]
     unusable = [u for u in fast if u not in usable]
     usable.sort(key=lambda u: -speeds.get(u, 0.0))
-    return usable + unusable + gh_tail + other
+    return usable + unusable + gh_tail
 
 
 def _meta_candidates():
-    """检查更新的元数据候选源，按「GitHub 加速镜像 → GitHub 原站 → 自有服务器」排序。
+    """检查更新的元数据候选源，按「GitHub 加速镜像 → GitHub 原站」排序。
 
     为什么 update.json 必须排在 GitHub API 之前：
         只有 update.json 带 sha256，是完整性校验的唯一依据；
         API 不返回该字段，优先走 API 等于每次都把校验跳过。
+
+    ⚠️ update.json 是 **Release 附件**（不是仓库文件），所以它同样能用
+       `releases/latest/download/` 这个稳定地址取，且能被加速镜像代理。
     """
     out, seen = [], set()
 
@@ -214,7 +227,6 @@ def _meta_candidates():
     for m in _mirror_variants(RELEASE_UPDATE_JSON):
         _add(m, _source_label(m))
     _add(RELEASE_UPDATE_JSON, _source_label(RELEASE_UPDATE_JSON))
-    _add(SERVER_UPDATE_JSON, "自有服务器")
     return out
 
 
@@ -263,17 +275,54 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
+# Release 正文里写 sha256 的约定格式，由发版脚本自动追加，例如：
+#     SHA256: 90f1ed78078ddbd1a1b2c3...
+# 客户端解析出来作为额外校验来源（update.json 读不到时的保险）。
+_SHA256_IN_BODY_RE = re.compile(r"SHA256[:\s]+([0-9a-fA-F]{64})")
+
+
+def _sha256_from_notes(notes: str) -> str:
+    """从 Release 正文里抠出 SHA256（小写）；没有则返回空串。"""
+    m = _SHA256_IN_BODY_RE.search(notes or "")
+    return m.group(1).lower() if m else ""
+
+
+def _api_url_candidates():
+    """API 查询候选：直连优先，再试能代理 API 的镜像。
+
+    实测（2026-09-24）：api.github.com 直连在国内能通（约 0.8s），
+    所以直连排第一；镜像只作兜底 —— 多数 gh-proxy 系镜像**不代理 API**，
+    这里只放实测确认可用的那一个（见 API_MIRROR_PREFIXES）。
+    """
+    out, seen = [], set()
+    for u in [GITHUB_LATEST_RELEASE_URL] + [p + GITHUB_LATEST_RELEASE_URL
+                                            for p in API_MIRROR_PREFIXES]:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def _from_github_api():
-    """兜底源：GitHub API。只有它能在 update.json 拿不到时给出更新说明。"""
+    """兜底源：GitHub API。只有它能在 update.json 拿不到时给出更新说明。
+
+    直连不通时会自动改走能代理 API 的加速镜像（见 _api_url_candidates）。
+    另外会尝试从 Release 正文里解析 `SHA256: <64位>` —— 发版脚本会写进去，
+    这样即便 update.json 拿不到、走的是 API 路径，也依然能校验完整性。
+    """
     headers = {"User-Agent": "InvoiceQRDownloader", "Accept": "application/vnd.github+json"}
-    try:
-        resp = requests.get(GITHUB_LATEST_RELEASE_URL, headers=headers, timeout=15)
-    except Exception:
-        return None
-    if resp.status_code != 200:
+    data = None
+    for u in _api_url_candidates():
+        try:
+            resp = requests.get(u, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                break
+        except Exception:
+            continue
+    if not isinstance(data, dict):
         return None
 
-    data = resp.json()
     tag = data.get("tag_name", "")
     version = _parse_version(tag)
     notes = data.get("body", "") or ""
@@ -297,8 +346,9 @@ def _from_github_api():
 
     if not download_url:
         return None
-    # GitHub API 不提供 SHA256，第四位留空（客户端跳过校验）
-    return version, [download_url], notes, ""
+    # API 本身不提供 SHA256，改为从 Release 正文里解析（发版脚本会写）；
+    # 解析不到就返回空串，客户端跳过校验（不影响更新）。
+    return version, [download_url], notes, _sha256_from_notes(notes)
 
 
 def get_latest_release():
@@ -308,11 +358,10 @@ def get_latest_release():
     perform_update 下载前还会把它展开成镜像并通过测速择优（见 order_download_urls）。
     已同步的 sha256 也一并传下去做完整性校验。
 
-    检查顺序（2026-09-22 改为「GitHub 加速镜像优先」）：
+    检查顺序（2026-09-24 起全部收在 GitHub，不再依赖自有服务器）：
         ① 加速镜像 + Release 附件 update.json  —— 最快，且带 sha256
-        ② GitHub 原站 Release 附件 update.json
-        ③ 自有服务器 /updates/qr.json           —— 兜底
-        ④ GitHub API releases/latest           —— 最后兜底（不返回 sha256）
+        ② GitHub 原站 Release 附件 update.json  —— 镜像全挂时兜底，同样带 sha256
+        ③ GitHub API releases/latest            —— 最后兜底（不返回 sha256，跳过校验）
     发布附件仍须命名为 InvoiceQRDownloader_<版本>.exe（ASCII，避免中文名被剥离）。
     """
     for url, source in _meta_candidates():

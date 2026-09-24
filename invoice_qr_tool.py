@@ -118,7 +118,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.1.2"
+__VERSION__ = "5.1.3"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -274,6 +274,22 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-24  v5.1.3
+- **更新链路全部收在 GitHub，不再依赖自有服务器**。原先「检查更新」还会去读
+  47.116.64.26 上的 /updates/qr.json，现在这条线彻底删掉了 —— 版本元数据本就挂在
+  Release 附件里（update.json），服务器那份只是冗余副本，还得额外维护同步，
+  删掉少一个失联点。自有服务器现在只服务官网的手动下载按钮，与自动更新无关。
+- **检查更新的元数据同样走加速镜像**：update.json 经 gh-proxy.com / ghfast.top /
+  ghproxy.net 读取，原站兜底；查不到才退回 GitHub API。实测「查询」与「下载」能用的
+  镜像并不重合 —— 下载三家都行，但代理 api.github.com 只有 gh-proxy.com 支持，
+  所以 API 那条路是「直连优先（实测约 0.8 秒）→ gh-proxy 镜像兜底」。
+- **Release 正文新增 SHA256 摘要**。GitHub API 本身不提供 sha256 字段，以前走 API
+  兜底时只能跳过完整性校验；现在发版会把主程序摘要写进 Release 正文末尾
+  （`SHA256: <64位>`），客户端从正文解析出来照样能校验。走加速镜像下载也验得了，
+  镜像站万一回了个 HTML 拦截页或有中间篡改都能挡住。
+- 说明：本次改动只影响「检查更新 / 下载新版本」这条链路，发票识别、去重、汇总
+  等主功能与 v5.1.2 完全一致。旧版本客户端要升到本版才会用上新的更新逻辑。
 
 2026-09-22  v5.1.2
 - **更新下载改为「GitHub 加速镜像优先，自有服务器兜底」** —— 下载前先对
@@ -970,9 +986,11 @@ class UpdateProgressDialog:
 def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str = ""):
     """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。
 
-    download_urls 是候选下载源列表（自有服务器直链 → GitHub 直链），
-    依次尝试直到成功，见 iqr_update.get_latest_release / perform_update。
-    sha256 为期望的更新包摘要（取自 update.json），非空时下载完先校验再替换。
+    download_urls 是候选下载源列表（GitHub Release 直链，perform_update 会再展开成
+    各加速镜像并测速择优），依次尝试直到成功，见 iqr_update.get_latest_release /
+    perform_update。
+    sha256 为期望的更新包摘要（取自 Release 附件 update.json，兜底路径由 Release
+    正文的 `SHA256:` 行解析而来），非空时下载完先校验再替换。
 
     取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
     """

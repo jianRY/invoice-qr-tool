@@ -8,9 +8,16 @@
   2. 构建「卸载程序」exe（onefile）
   3. 构建「可安装版」exe（onefile，内嵌单文件版主程序 + 卸载程序）
   4. 三个 exe 全部走 sign.py 自签名（SHA256 + RFC3161 时间戳）
-  5. 生成 Usage / Changelog 文本
+  5. 生成 Usage / Changelog 文本（Changelog 末尾追加主程序 SHA256，供客户端校验）
   6. 同步官网 website/ 的版本号 / 下载直链 / 日期 / 体积（宝塔脚本拉取后即展示新版网页）
   7. （--publish 时）git push（走代理）→ 打 tag → 在 GitHub 创建 Release 并上传双 exe
+
+自动更新链路（2026-09-24 起全部收在 GitHub，不再依赖自有服务器）：
+  · 元数据：Release 附件 update.json（含版本号 + sha256）
+  · 读取：客户端经公共加速镜像拉取（gh-proxy.com / ghfast.top / ghproxy.net），
+    直连 github.com 与 GitHub API 仅作兜底
+  · 校验：sha256 优先取 update.json；兜底路径从 Release 正文的 `SHA256:` 行解析
+  · 自有服务器 47.116.64.26 现在只服务官网手动下载按钮
 
 安全护栏：
   - 本地目标版本必须 > GitHub 线上最新版本，否则拒绝发布（防止用旧代码覆盖新版）。
@@ -84,12 +91,14 @@ LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 PROXY = None
 
 # 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）：
-#   /updates/qr.json 客户端自动更新**兜底**读它（主源已改为 GitHub 加速镜像）
 #   /files/<资产名>   双 exe 由服务器定时脚本从 Release 镜像过去
-# 2026-09-22 调整：update.json 的 url 改放 GitHub Release 直链（客户端会再展开
-# 加速镜像并测速择优），自有服务器直链改放 fallback_url 兜底。
+#
+# ⚠️ 2026-09-24 起**只服务官网的手动下载按钮**，不再参与自动更新：
+#    自动更新链路已全部收在 GitHub（update.json 是 Release 附件，客户端经加速镜像读它）。
+#    原先往这里推 /updates/qr.json 的那条线已删；SITE_URL 现在仅用于
+#    ① 生成 InvoiceQR_Usage.txt 里的「国内直连」下载地址
+#    ② 官网 download.html 的按钮链接（由 update_website 改写）
 SITE_URL = "http://47.116.64.26:8888"
-SERVER_FILES = SITE_URL + "/files"
 
 # 代理全局生效（urllib / requests / git 都用）。
 #
@@ -606,8 +615,26 @@ def make_assets(new_tag):
     shutil.copy2(PORTABLE_OUT, os.path.join(ASSET_DIR, portable_name))
     shutil.copy2(INSTALLER_OUT, os.path.join(ASSET_DIR, installer_name))
 
+    def _sha256(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # ⚠️ 顺序要紧：先算好主程序 SHA256，再生成 Release 正文 ——
+    #    正文里要追加 `SHA256: <64位>`，客户端走 GitHub API 兜底时靠它校验完整性
+    #    （API 不提供 sha256 字段，只能从正文抠）。详见 iqr_update._sha256_from_notes。
+    portable_sha = _sha256(PORTABLE_OUT)
+
     # Changelog（= Release 正文）优先取源码「更新记录」本版段落，git log 兜底
     changelog = _release_body(new_tag, portable_name, installer_name)
+    # 摘要追加在正文末尾，独立成段，便于客户端正则定位（也方便用户肉眼核对）
+    changelog += (
+        "\n## 文件校验\n\n"
+        "```\nSHA256: {}\n```\n"
+        "\n> 上面是 `{}` 的 SHA256。走 GitHub 加速镜像下载时可用它核对文件是否完整、未被篡改。\n"
+    ).format(portable_sha, portable_name)
     with open(os.path.join(ASSET_DIR, "InvoiceQR_Changelog.txt"), "w", encoding="utf-8") as f:
         f.write(changelog)
 
@@ -630,16 +657,11 @@ def make_assets(new_tag):
     with open(os.path.join(ASSET_DIR, "InvoiceQR_Usage.txt"), "w", encoding="utf-8") as f:
         f.write(usage)
 
-    # 客户端自动更新元数据：随 Release 上传，服务器脚本抄到站点 /updates/qr.json。
-    # 客户端先读那份（国内快），读不到才回退 GitHub API。
+    # 客户端自动更新元数据：作为 Release 附件上传（固定叫 update.json）。
+    # ⚠️ 2026-09-24 起客户端**只从 GitHub 读**（经加速镜像拉这个附件），
+    #    不再读自有服务器的 /updates/qr.json —— 故 fallback_url / site_url
+    #    等指向服务器的字段已删除，别再加回来（加了也没人读）。
     ver = new_tag.lstrip("v")
-
-    def _sha256(path):
-        h = hashlib.sha256()
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
 
     update_meta = {
         "app": "qr",
@@ -647,18 +669,15 @@ def make_assets(new_tag):
         "version": ver,
         "asset": portable_name,
         "notes": changelog,
-        # url = 主源（GitHub Release 直链，客户端再展开加速镜像择优）
-        # fallback_url = 兜底源（自有服务器直链）—— 语义 2026-09-22 调换过，别改回去
+        # url 与 setup_url 均为 GitHub Release 直链；
+        # 客户端会再展开成各加速镜像并测速择优（见 iqr_update.order_download_urls）。
         "url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
-        "fallback_url": "{}/{}".format(SERVER_FILES, portable_name),
         "release_url": "{}/releases/tag/{}".format(PROJECT_URL, new_tag),
-        "site_url": SITE_URL + "/",
         "size": os.path.getsize(PORTABLE_OUT),
-        "sha256": _sha256(PORTABLE_OUT),
+        "sha256": portable_sha,
         "published": time.strftime("%Y-%m-%d %H:%M:%S"),
         "setup_url": "{}/releases/download/{}/{}".format(
             PROJECT_URL, new_tag, installer_name),
-        "setup_fallback_url": "{}/{}".format(SERVER_FILES, installer_name),
     }
     with open(os.path.join(ASSET_DIR, "update.json"), "w", encoding="utf-8") as f:
         json.dump(update_meta, f, ensure_ascii=False, indent=2)
@@ -786,7 +805,7 @@ def publish(new_tag, token):
         ("InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
         ("InvoiceQR_Usage.txt", "text/plain; charset=utf-8"),
         ("InvoiceQR_Changelog.txt", "text/plain; charset=utf-8"),
-        # 自动更新元数据（服务器定时脚本抄到站点 /updates/qr.json，客户端优先读它）
+        # 自动更新元数据（客户端经 GitHub 加速镜像读这个附件拿版本号 + sha256）
         ("update.json", "application/json; charset=utf-8"),
     ]:
         p = os.path.join(ASSET_DIR, fn)
