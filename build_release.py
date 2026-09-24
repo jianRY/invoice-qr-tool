@@ -12,12 +12,12 @@
   6. 同步官网 website/ 的版本号 / 下载直链 / 日期 / 体积（宝塔脚本拉取后即展示新版网页）
   7. （--publish 时）git push（走代理）→ 打 tag → 在 GitHub 创建 Release 并上传双 exe
 
-自动更新链路（2026-09-24 起全部收在 GitHub，不再依赖自有服务器）：
-  · 元数据：Release 附件 update.json（含版本号 + sha256）
-  · 读取：客户端经公共加速镜像拉取（gh-proxy.com / ghfast.top / ghproxy.net），
-    直连 github.com 与 GitHub API 仅作兜底
+自动更新链路（2026-09-24 定稿：镜像优先，GitHub 与官网下载双双兜底）：
+  · 元数据：Release 附件 update.json（含版本号 + sha256），经加速镜像读取
+  · 下载顺序：加速镜像（gh-proxy.com / ghfast.top / ghproxy.net，实测择优）
+    → GitHub 原站直链 → 官网自有服务器
   · 校验：sha256 优先取 update.json；兜底路径从 Release 正文的 `SHA256:` 行解析
-  · 自有服务器 47.116.64.26 现在只服务官网手动下载按钮
+  · 自有服务器 47.116.64.26 同时服务官网手动下载按钮与自动更新的最后兜底
 
 安全护栏：
   - 本地目标版本必须 > GitHub 线上最新版本，否则拒绝发布（防止用旧代码覆盖新版）。
@@ -91,14 +91,14 @@ LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 PROXY = None
 
 # 自有下载站（阿里云 47.116.64.26，见「下载服务器」项目）：
-#   /files/<资产名>   双 exe 由服务器定时脚本从 Release 镜像过去
+#   /files/<资产名>           双 exe 由服务器定时脚本从 Release 镜像过去
+#   /updates/qr.json          客户端**最后**兜底的元数据源（由服务器脚本生成）
 #
-# ⚠️ 2026-09-24 起**只服务官网的手动下载按钮**，不再参与自动更新：
-#    自动更新链路已全部收在 GitHub（update.json 是 Release 附件，客户端经加速镜像读它）。
-#    原先往这里推 /updates/qr.json 的那条线已删；SITE_URL 现在仅用于
-#    ① 生成 InvoiceQR_Usage.txt 里的「国内直连」下载地址
-#    ② 官网 download.html 的按钮链接（由 update_website 改写）
+# 用途（2026-09-24 定稿）：官网手动下载按钮直接指向 /files/；
+# 自动更新里的角色是「最末兜底」—— 下载顺序为 加速镜像 → GitHub 原站 → 这里。
+# 客户端只在镜像与原站全挂时才会用到这台服务器。
 SITE_URL = "http://47.116.64.26:8888"
+SERVER_FILES = SITE_URL + "/files"
 
 # 代理全局生效（urllib / requests / git 都用）。
 #
@@ -669,15 +669,19 @@ def make_assets(new_tag):
         "version": ver,
         "asset": portable_name,
         "notes": changelog,
-        # url 与 setup_url 均为 GitHub Release 直链；
-        # 客户端会再展开成各加速镜像并测速择优（见 iqr_update.order_download_urls）。
+        # url / setup_url = 主源（GitHub Release 直链，客户端再展开加速镜像择优）
+        # fallback_url / setup_fallback_url = 兜底源（官网自有服务器直链）
+        #   客户端最终顺序：加速镜像 → GitHub 原站 → 官网服务器（见 order_download_urls）
         "url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
+        "fallback_url": "{}/{}".format(SERVER_FILES, portable_name),
         "release_url": "{}/releases/tag/{}".format(PROJECT_URL, new_tag),
+        "site_url": SITE_URL + "/",
         "size": os.path.getsize(PORTABLE_OUT),
         "sha256": portable_sha,
         "published": time.strftime("%Y-%m-%d %H:%M:%S"),
         "setup_url": "{}/releases/download/{}/{}".format(
             PROJECT_URL, new_tag, installer_name),
+        "setup_fallback_url": "{}/{}".format(SERVER_FILES, installer_name),
     }
     with open(os.path.join(ASSET_DIR, "update.json"), "w", encoding="utf-8") as f:
         json.dump(update_meta, f, ensure_ascii=False, indent=2)
