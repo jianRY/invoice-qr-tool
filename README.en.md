@@ -11,15 +11,19 @@ A single-file Windows desktop tool that **batch-processes invoice / receipt imag
    - **A single image with 2+ QR codes downloads one PDF per code.** They are named `原名_第1页.pdf`, `原名_第2页.pdf` … numbered **top-to-bottom, left-to-right** on the image, and that order is stable across runs so a re-run never swaps the two files. A single-QR image keeps the plain `原名.pdf` name (unchanged from older versions).
    - **Re-running the same folder never re-downloads.** Valid PDFs already on disk are reused, and the tool remembers each QR URL's invoice fingerprint in `PDF/_去重索引.json`, so it skips the request entirely. From the 2nd run on, the download count is 0 — renaming the images does not defeat it.
    - **Deleting the caches still leaves re-runs at zero requests.** Both `PDF/_去重索引.json` and `PDF/_图片指纹.json` are session-only scratch files: they are deleted automatically when the run finishes (including when you press Stop). To keep re-runs request-free anyway, the tool falls back on relations that are derivable from the file system alone: a page image rendered from a source PDF knows which PDF it came from, and byte-identical images in the same batch (the same invoice saved twice) are paired up so only the first one makes a request.
-   - **Duplicate invoices leave the original image behind.** If a download turns out to be byte-for-byte identical to an invoice PDF you already have (meaning a second download entry point exists, or the platform changed the URL), the tool copies that invoice's **original image** into `重复票据/` (DuplicateInvoices) with a `重复-` prefix, so you can eyeball which one it was. The original image and the stored PDF are both left untouched. The same invoice photographed twice (same QR URL) counts as known de-duplication — it is reused, never re-downloaded, and never dumped into that folder.
+   - **Duplicate invoices leave the original image behind.** If a download turns out to be byte-for-byte identical to an invoice PDF you already have (meaning a second download entry point exists, or the platform changed the URL), the tool copies that invoice's **original image** into `未识别/` (Unrecognized) with a `重复-` prefix, so you can eyeball which one it was. The original image and the stored PDF are both left untouched. The same invoice photographed twice (same QR URL) counts as known de-duplication — it is reused, never re-downloaded, and never flagged as a duplicate.
 3. QR code is **pure digits** → ignored.
-4. No QR / unrecognizable → the image is copied to `未识别/` (`Unrecognized/`) with a `未识别-` prefix.
-5. URL but **no downloadable PDF** (single QR) → copied to `未识别/` with a `未下载-` prefix.
-6. **An image with several QR codes where only some downloaded successfully** → the whole image is copied to `未识别/` with a **`部分未识别-`** prefix. The PDFs that *did* download are kept — they are valid invoices and must not be thrown away.
+4. No QR on the image → copied to `未识别/` (`Unrecognized/`) with a `无-` prefix.
+5. QR present but **no downloadable PDF** (not a URL / nothing to download / network failure) → copied to `未识别/` with a `非票-` prefix.
+6. **An image with 2+ QR codes** → any problematic code is tagged with its position on the image (top-to-bottom, matching `原名_第N页.pdf`). Codes sharing the same reason merge their numbers; different reasons are listed separately. The whole image is copied **once**, and the PDFs that *did* download are kept — they are valid invoices and must not be thrown away.
+   - 2nd and 3rd both failed → `未识别/第二、三非票-<original>`
+   - 2nd failed, 3rd duplicate → `未识别/第二非票、第三重复-<original>`
+
+   A single-QR image gets no position number.
 7. Optional toggle: **open the folder automatically** when done.
 8. Optional toggle: **convert downloaded PDFs to images** (long edge 2000px, short edge auto), saved to `PDF/图片/` as `原名_第N页.png`.
 9. Optional toggle: **summarize invoices into Excel** when done. Currently tuned for **Jiangsu Province medical fee receipt** templates, extracting: payer, receipt number, issue date, total amount (lowercase), and medical insurance pooled-fund payment, plus **critical-illness insurance payment** / **medical assistance payment** (conditional columns, emitted only when recognized); outputs `PDF/发票汇总_时间戳.xlsx`. Its leftmost column is a **serial number** (序号: 1, 2, 3…), which makes it easy to tell which copy a row is; the `是否重复` column cross-references those serial numbers (e.g. 「与序号3、5重复」); to its right sit two blocks — **「统计（剔重后）」** (receipt count / total amount / pooled-fund total /〔critical-illness total〕/〔medical assistance total〕/ compensable amount, all computed **after removing duplicate receipts**, i.e. only the 1st copy of each receipt number) and **「重复票据」** (duplicate count / duplicate amount total / per-category duplicate totals, counting only the 2nd and later copies). Duplicate detection runs **inside the tool**, not through Excel formulas: receipt numbers are 15+ digits and spreadsheet `COUNTIF`/`SUMIF` coerce numeric-looking text to numbers, truncating them to 15 significant digits and misjudging every receipt as the same one (see changelog v4.9.0).
-10. Problem images are **copied** (never moved) into a `未识别` folder with a status prefix (`未下载-` / `未识别-` / `部分未识别-` / `其它-`); successfully processed images keep their original filenames, and the originals are always left untouched. PDFs already downloaded are **reused instead of downloaded again** on a re-run (same for already-converted images).
+10. Problem images are **copied** (never moved) into a `未识别` folder with a status prefix (`无-` / `非票-` / `重复-`, plus a position number such as `第二` when the image holds several QR codes); successfully processed images keep their original filenames, and the originals are always left untouched. PDFs already downloaded are **reused instead of downloaded again** on a re-run (same for already-converted images).
 11. When processing finishes, a **results summary** popup (also written to the log) reports: total images recognized, how many downloaded a PDF, **how many reused an existing PDF (not re-downloaded)**, **how many were duplicates of an invoice already downloaded**, how many recognized-but-no-PDF, how many pure-digit-ignored, and how many failed to recognize.
 
 ## Usage
@@ -43,12 +47,11 @@ The top bar also has **Usage**, **Changelog**, and **Check for Updates** entries
 | --- | --- |
 | URL + download OK (single QR) | `PDF/<original>.pdf`; the original image keeps its name |
 | URL + download OK (2+ QR codes) | `PDF/<original>_第1页.pdf`, `<original>_第2页.pdf` … (one per code) |
-| Multi-QR, only some downloaded | successful PDFs kept; whole image copied to `未识别/部分未识别-<original>` |
-| URL + no PDF available (single QR) | copied to `未识别/未下载-<original>` |
+| No QR on the image | copied to `未识别/无-<original>` |
+| QR present but no downloadable PDF | copied to `未识别/非票-<original>` (not a URL / nothing to download / network failure) |
+| Content identical to an existing invoice | copied to `未识别/重复-<original>` |
+| Multi-QR with some codes failing | successful PDFs kept; whole image copied **once** with position numbers:<br>`未识别/第二、三非票-<original>` (2nd & 3rd both failed)<br>`未识别/第二非票、第三重复-<original>` (2nd failed, 3rd duplicate) |
 | Pure-digit QR | ignored |
-| No / unrecognizable QR | copied to `未识别/未识别-<original>` |
-| QR present but not a URL | copied to `未识别/其它-<original>` |
-| Content identical to an existing invoice | copied to `重复票据/重复-<original>` |
 
 ## Auto-update & rollback
 
