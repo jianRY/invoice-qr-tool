@@ -10,11 +10,10 @@
      命名为「原始图片名_第1页.pdf / _第2页.pdf …」（编号稳定可复现）；
 3. 识别结果的归类与文件处理：
    - 成功识别并下载到 PDF：原图片文件名保持不变；
-   - 一张图有多个二维码、其中部分下载成功部分失败：
-     复制一份到「未识别」文件夹，文件名前加「部分未识别-」（已下成的 PDF 保留）；
-   - 识别到网址但无可下载的 PDF（单二维码时沿用「未下载-」前缀）；
-   - 未识别到任何二维码：复制一份到「未识别」文件夹，文件名前加「未识别-」；
-   - 其它情况（识别到二维码但非网址等）：复制一份到「未识别」文件夹，文件名前加「其它-」；
+   - 有问题的图一律复制一份到「未识别」文件夹（原图保留不动），前缀说明原因：
+     「无-」图上没有二维码 /「非票-」有码但下不到 PDF /「重复-」内容与已有发票相同；
+   - 一张图有多个二维码时，出问题的码带**序号**（按图上从上到下，与 PDF 的「_第N页」对应），
+     同因合并、异因逐项：「第二、三非票-原名」「第二非票、第三重复-原名」；
 4. 可选任务完成后打开文件夹；
 5. 可选将下载的 PDF 转换为 JPG 图片（长边 2000px，短边自适应）；
 6. 可选任务完成后汇总发票（对 PDF 文件夹内发票 PDF 提取字段并生成 Excel，
@@ -89,20 +88,79 @@ SUPPORTED_PDF_EXTS = (".pdf",)
 # 「PDF 前置转换」子文件夹名：只要目标文件夹里出现 PDF，就把 PDF 转出的图片与原有图片
 # 一起收进这个子文件夹，再在其中按原逻辑处理（输出 PDF/ 未识别/ 汇总表也都落在它里面）。
 POSTPROCESS_DIR_NAME = "处理后"
-# 「重复票据」子文件夹：重新下载回来才发现与已有 PDF 内容一模一样的发票，
-# 把它的**原始图片**复制一份进去，方便人工过目（原图保留不动）。
-DUP_DIR_NAME = "重复票据"
+# 问题图片的统一去处：一律复制一份到「未识别」子文件夹，文件名前加状态前缀。
+# （2026-09-26 起「重复票据」文件夹已废弃，重复票据也不再单开一个夹，全部并入这里。）
+STATUS_DIR_NAME = "未识别"
+
+# 状态前缀 —— 目标是一眼看出「哪个二维码、什么原因」没成功。
+# 语义标签（不带横杠）单独定义，多二维码拼接序号时要用到；前缀 = 标签 + "-"。
+TAG_NONE = "无"           # 图上根本没有二维码
+TAG_NOT_TICKET = "非票"   # 有二维码，但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）
+TAG_DUPLICATE = "重复"    # 码能下，但下回来的内容与已有 PDF 完全相同
+
+PREFIX_NONE = TAG_NONE + "-"
+PREFIX_NOT_TICKET = TAG_NOT_TICKET + "-"
+PREFIX_DUPLICATE = TAG_DUPLICATE + "-"
+
+# ⚠️ 多二维码（一图 ≥2 码）时，**每个出问题的码**都要在前缀里标出它在图上的序号：
+#    序号 = 按「从上到下、从左到右」排序后的位置，与 PDF 的「_第N页」编号严格对应，
+#    这样「第二非票-」能直接对上「原名_第2页.pdf」，不会张冠李戴。
+#    规则：整图**只复制一份**，前缀按「同因合并序号、异因逐项」拼接，组间按最小序号排：
+#      第 2、3、4 个都是非票  → 「第二、三、四非票-原名.jpg」
+#      第 2 非票、第 3 重复   → 「第二非票、第三重复-原名.jpg」
+#    单二维码不加序号（只有一个码，加「第一」纯属噪音），直接用 PREFIX_*。
+SEP_MULTI = "、"
+
+_CN_DIGITS = "零一二三四五六七八九"
 
 
-# 状态前缀：把“未下载 / 未识别 / 其它”的图片复制到「未识别」子文件夹时加在文件名前
-PREFIX_UNRECOGNIZED = "未识别-"  # 未识别到任何二维码
-PREFIX_NOT_DOWNLOADED = "未下载-"  # 识别到网址但无可下载的 PDF（单二维码时沿用）
-PREFIX_OTHER = "其它-"           # 其它情况（识别到二维码但内容非网址等）
-PREFIX_DUPLICATE = "重复-"        # 内容与已有发票完全相同（重复票据）
-# 一张图里识别到多个二维码，其中**部分**下载成功、部分失败（网址无效 / 无 PDF / 网络失败）。
-# 归类仍然是「未识别」（整张图需要人工过目），但用独立前缀把原因说清楚：
-# 「未识别-」= 图上根本没有能用的码；「部分未识别-」= 有一部分成了、有一部分没成。
-PREFIX_PARTIAL = "部分未识别-"
+def _cn_num(n: int) -> str:
+    """序号转中文数字：1→一、11→十一、21→二十一。
+
+    用在多二维码的前缀里（「第二非票-」），与建哥的习惯写法一致。
+    100 以上极少出现在票据图上，超出范围就原样用阿拉伯数字，绝不抛异常。
+    """
+    if n <= 0:
+        return str(n)
+    if n < 10:
+        return _CN_DIGITS[n]
+    if n < 20:
+        return "十" + (_CN_DIGITS[n % 10] if n % 10 else "")
+    if n < 100:
+        return _CN_DIGITS[n // 10] + "十" + (_CN_DIGITS[n % 10] if n % 10 else "")
+    return str(n)
+
+
+def _build_problem_prefix(items: list, multi: bool) -> str:
+    """把「出问题的子项」拼成文件名前缀（含结尾的「-」）。
+
+    ``items`` 形如 ``[(序号, 标签), ...]``——序号是该码在图上的位置（1 起，从上到下），
+    标签取 ``TAG_NOT_TICKET`` / ``TAG_DUPLICATE``。
+    单二维码（``multi=False``）不加序号，只用标签，如 ``非票-``；
+    多二维码按「同因合并序号、异因逐项」拼接，组间按组内最小序号排序，如
+    ``第二、三非票、第四重复-``。
+
+    调用方保证 ``items`` 非空（没有出问题的子项时压根不该复制原图）。
+    """
+    if not items:
+        return ""
+    if not multi:
+        # 单码最多只有一个子项出问题，取第一个即可（去重防止极端情况下重复）
+        seen = []
+        for _, tag in items:
+            if tag not in seen:
+                seen.append(tag)
+        return "".join(t + "-" for t in seen)
+    groups: dict = {}
+    for idx, tag in items:
+        groups.setdefault(tag, []).append(idx)
+    ordered = sorted(groups.items(), key=lambda kv: min(kv[1]))
+    parts = []
+    for tag, idxs in ordered:
+        # 「第」加在每个原因组前面：「第二、三非票、第四重复-」
+        seq = SEP_MULTI.join(_cn_num(i) for i in sorted(idxs))
+        parts.append(f"第{seq}{tag}")
+    return SEP_MULTI.join(parts) + "-"
 
 # 一张图里识别到多个二维码时，第 N 个二维码对应的 PDF 命名：原文件名 + 本后缀。
 # 例：发票照片.jpg 上有两个码 → 发票照片_第1页.pdf、发票照片_第2页.pdf。
@@ -140,13 +198,18 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
      与 PDF 页面上的详情链），内容相同的重复副本会自动合并，最终只留一份。
    - **重跑同一个文件夹不会重新下载**：已下载过且完好的 PDF 直接复用；软件还会记住
      每个网址对应的发票内容，下次连请求都不发（详见文末【说明】）。
-3. 识别结果归类与文件处理（后三类仅做“复制”，原图片始终保留在原始文件夹中不动）：
+3. 识别结果归类与文件处理：**成功的不动，有问题的复制一份到「未识别」文件夹**
+   （只是复制，原图片始终保留在原始文件夹中，不会被改名或移动）。
    - 成功识别并下载到 PDF：原图片文件名保持不变。
-   - 一张图有多个二维码、**部分下载成功、部分失败**：整图复制一份到「未识别」文件夹，
-     文件名前加「部分未识别-」（已下成的 PDF 照常保留在「PDF」里）。
-   - 识别到网址但无可下载的 PDF（单二维码时）：复制一份到「未识别」文件夹，文件名前加「未下载-」。
-   - 未识别到任何二维码：复制一份到「未识别」文件夹，文件名前加「未识别-」。
-   - 其它情况（识别到二维码但内容非网址等）：复制一份到「未识别」文件夹，文件名前加「其它-」。
+   - 有问题的图按原因加前缀，一眼看出是什么问题：
+     · 「无-」  —— 图上没有二维码；
+     · 「非票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
+     · 「重复-」—— 下回来的内容与已有发票完全相同。
+   - 一张图有 2 个及以上二维码时，出问题的码会带**序号**（按二维码在图上的位置从上到
+     下编号，与「原名_第N页.pdf」严格对应），同因合并、异因逐项：
+       第 2、3 个都非票       → 「第二、三非票-原名」
+       第 2 非票、第 3 个重复 → 「第二非票、第三重复-原名」
+     整图**只复制一份**，已经下成的那几份 PDF 照常保留在「PDF」里。
 4. 可选：处理完成后自动打开文件夹。
 5. 可选：将下载的 PDF 转为 JPG 图片（长边 2000px，短边自适应），保存到「PDF/图片」。
 6. 可选：处理完成后汇总发票（生成 Excel）。对「PDF」文件夹内所有发票 PDF，
@@ -203,8 +266,9 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    报一次「已完成 x / y 张」，卡住也能一眼看出还在跑。
    要中止就点「开始处理」右侧的「停止」；日志卡右上角有「清空日志」。
    「使用说明 / 更新记录」「检查更新」在顶栏右侧。
-5. 处理完成后，PDF 在「PDF」文件夹，转换图片在「PDF/图片」，问题图片的副本在「未识别」文件夹，
-   重复票据的原图副本在「重复票据」文件夹，汇总表在「PDF/发票汇总_*.xlsx」。
+5. 处理完成后，PDF 在「PDF」文件夹，转换图片在「PDF/图片」，
+   所有问题图片的副本（「无- / 非票- / 重复-」）都在「未识别」文件夹，
+   汇总表在「PDF/发票汇总_*.xlsx」。
 
 【自动更新】
 - 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「是」即自动
@@ -225,11 +289,12 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 含 PDF（自动）         → 新建「处理后」，PDF 转「原名_1.jpg / 原名_2.jpg …」+ 复制原有图片进
 - 网址 + 下载成功      → PDF/<原名>.pdf，原图片文件名保持不变
 - 一张图 2 个以上二维码 → PDF/<原名>_第1页.pdf、<原名>_第2页.pdf …（每个二维码各一份）
-- 多二维码但部分失败   → 已成功的 PDF 保留；整图复制到「未识别/部分未识别-<原名>」
-- 网址 + 无 PDF 可下载 → 复制一份到「未识别/未下载-<原名>」（单二维码时）
-- 未识别到二维码       → 复制一份到「未识别/未识别-<原名>」
-- 识别到二维码但非网址 → 复制一份到「未识别/其它-<原名>」
-- 内容与已有发票相同   → 复制一份到「重复票据/重复-<原名>」（原图保留不动，便于人工核对）
+- 图上无二维码         → 复制一份到「未识别/无-<原名>」
+- 有码但下不到 PDF     → 复制一份到「未识别/非票-<原名>」（非网址 / 无 PDF / 网络失败）
+- 内容与已有发票相同   → 复制一份到「未识别/重复-<原名>」
+- 多二维码有码出问题   → 已成功的 PDF 保留；整图**只复一份**，前缀带序号：
+                          第2、3个都非票   → 「未识别/第二、三非票-<原名>」
+                          第2非票、第3重复 → 「未识别/第二非票、第三重复-<原名>」
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
 - 过程中临时文件       → PDF/_去重索引.json（记录「网址 → 发票内容指纹」，供重跑时免发请求）
                          PDF/_图片指纹.json（记录「图片内容 → 已保存 PDF」，供改名后重跑免发请求）
@@ -264,9 +329,9 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
   · 以上都没命中时，才发一次请求确认内容，确认后发现与已有发票相同即合并、不重复保存。
 - **重复票据会留下原图**：如果重新下载回来才发现某张发票与已有 PDF 内容一模一样
   （说明它还有第二个下载入口，或网址已被平台改动），软件会把这张发票的**原始图片**
-  复制一份到「重复票据」文件夹，文件名前加「重复-」，方便你人工核对到底是哪张；
+  复制一份到「未识别」文件夹、文件名前加「重复-」，方便你人工核对到底是哪张；
   原图与已下载的 PDF 都保持不动。同一张发票被拍多张图（二维码网址相同）属**已知去重**，
-  只复用不重复下载，也不会往「重复票据」里塞 —— 避免这个文件夹被噪声撑大。
+  只复用不重复下载，也不会标「重复-」—— 免得「未识别」文件夹被噪声撑大。
 - 「汇总发票」这一步保持单线程：它用 pdfplumber 解析 PDF，属纯 Python 计算，
   并发实测没有收益（1.0×）。
 - 单文件 EXE，无需安装，双击即用。
@@ -274,6 +339,20 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-26  v5.2.0
+- **问题图片的改名规则改为「原因 + 序号」，一眼看出是哪个二维码、什么原因没成**。
+  按原因加前缀：
+  · 「无-」  —— 图上没有二维码；
+  · 「非票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
+  · 「重复-」—— 下回来的内容与已有发票完全相同。
+- **一张图有多个二维码时，出问题的码按位置编号**（从上到下，与「原名_第N页.pdf」对应），
+  同一原因合并号码、不同原因分开列：
+  · 第 2、3 个都下不到 PDF     →「第二、三非票-原名」
+  · 第 2 个下不到、第 3 个重复 →「第二非票、第三重复-原名」
+  单二维码不加序号；整张图只复制一份，已下成的 PDF 照常保留。
+- **问题图片统一放在「未识别」文件夹**，不必再跑两个文件夹找问题图。
+- 本次只改「问题图片的命名与归类」，发票 PDF 的下载、去重与汇总主流程与 v5.1.3 一致。
 
 2026-09-24  v5.1.3
 - **更新下载改为「GitHub 加速镜像优先，GitHub 直链与官网下载双双兜底」**。下载前先对
@@ -1768,9 +1847,9 @@ _KIND_LABEL = {
     "success": "✓ 已下载 PDF",
     "skipped": "✓ 已存在（跳过下载）",
     "duplicate": "✓ 已存在（未重新下载）",
-    "no_pdf": "⚠ 有二维码未下成（复制到未识别/部分未识别-）",
-    "unrecognized": "✗ 未识别到二维码",
-    "other": "· 其它情况（二维码非网址）",
+    "no_pdf": "⚠ 有二维码未下成（复制到未识别/）",
+    "unrecognized": "✗ 图上无二维码",
+    "other": "· 二维码非网址（复制到未识别/）",
     "error": "✗ 处理出错",
 }
 
@@ -1782,7 +1861,7 @@ def _copy_to_unrecognized(folder: str, fpath: str, fname: str, prefix: str):
     并发安全：目标名固定为「前缀 + 原文件名」，同一张图片只会被处理一次，
     不存在两个线程写同一个目标文件的情况。
     """
-    return _copy_original_into(folder, "未识别", fpath, fname, prefix)
+    return _copy_original_into(folder, STATUS_DIR_NAME, fpath, fname, prefix)
 
 
 def _remove_dedup_cache(pdf_dir: str, log=None, file_name: str = CACHE_FILE_NAME) -> bool:
@@ -1811,7 +1890,8 @@ def _remove_dedup_cache(pdf_dir: str, log=None, file_name: str = CACHE_FILE_NAME
 def _copy_original_into(folder: str, sub: str, fpath: str, fname: str, prefix: str):
     """把原图复制一份到 ``folder/sub/``，文件名前加 prefix；**原图保留不动**。
 
-    「未识别」与「重复票据」两个文件夹共用这一个内核，行为完全一致：文件夹不存在就新建，
+    仅供「未识别」文件夹使用（「重复票据」夹已于 2026-09-26 废弃，重复票据也并入这里）：
+    文件夹不存在就新建，
     重名自动加序号让位（同名前缀下不可能撞，但外部往里丢过东西时要能兜住）。
 
     返回 (目标路径或 None, 日志行列表)。并发安全：目标名只由「前缀 + 原文件名」决定，
@@ -1977,22 +2057,28 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     （N 按二维码在图上从上到下、从左到右的顺序，见 ``detect_qr_codes``）。
     单二维码时保持旧命名「原文件名.pdf」不变 —— 向后兼容，不污染历史文件。
 
-    只要**有一个**二维码没下成，整张图就算「部分未识别」，原图复制到
-    「未识别/部分未识别-原名」；已经下成的那几份 PDF 照常保留（是有效票据，不该丢）。
-    「未识别-」的含义收窄为「图上没有任何可用二维码」。
+    **问题图一律复制一份到「未识别/」，前缀说明「哪个码、什么原因」**
+    （2026-09-26 重做；原先整图只有一个笼统前缀，多码图看不出是第几个码出的问题）：
+      · 图上无二维码              → 「无-原名」
+      · 有码但下不到 PDF / 非网址  → 「非票-原名」
+      · 下回来发现内容与已有相同   → 「重复-原名」
+      · 多码图按「从上到下」排序，出问题的码带序号，同因合并、异因逐项：
+        第 2、3 个都非票 →「第二、三非票-原名」；第 2 非票、第 3 重复
+        →「第二非票、第三重复-原名」。序号与 PDF 的「_第N页」严格对应。
+    整图**只复制一份**，已下成的 PDF 照常保留（是有效票据，不该丢）。
 
     关键设计：**不写任何共享状态**。统计、进度、日志全部通过返回值交回主线程汇总，
     所以无论多少路并发都不会出现计数竞态，也不需要加锁。
 
     返回 {"fname", "kind", "dup_hit", "elapsed", "lines"}，
     kind ∈ success / no_pdf / unrecognized / other / error / cancelled。
-    dup_hit=True 表示这是一张「重复票据」（内容与已有发票完全相同），原图已复制到
-    「重复票据」文件夹 —— 用独立字段而非塞进 kind，是为了不新增状态、不动既有统计口径。
+    dup_hit=True 表示这张图里有子项「重下回来才发现内容重复」，前缀已标「重复」——
+    用独立字段而非塞进 kind，是为了不新增状态、不动既有统计口径。
     """
     t0 = time.perf_counter()
     fpath = os.path.join(ctx.folder, fname)
     lines: list = []
-    dup_hit = False      # 本次是否「重下回来才发现内容重复」（要复制原图到「重复票据」）
+    dup_hit = False      # 本次是否有子项「重下回来才发现内容重复」（前缀要标「重复」）
 
     def finish(kind: str) -> dict:
         return {
@@ -2019,7 +2105,7 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
         codes = []
 
     if not codes:
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_UNRECOGNIZED)
+        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NONE)
         lines.extend(msgs)
         return finish("unrecognized")
 
@@ -2033,8 +2119,10 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
             urls.append(candidate)
 
     if not urls:
-        lines.append(f"  -> 识别到 {len(codes)} 个二维码但均非网址，归入「其它」")
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_OTHER)
+        lines.append(
+            f"  -> 识别到 {len(codes)} 个二维码但均非网址，归入「非票」"
+        )
+        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_TICKET)
         lines.extend(msgs)
         return finish("other")
 
@@ -2084,36 +2172,44 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     bad_items = [r for r in results if not r["ok"]]
     pdf_count = len(ok_items)
 
-    # 4) 部分（或全部）失败 → 整图归入「未识别/部分未识别-原名」，已下成的 PDF 保留
-    if bad_items:
-        for r in bad_items:
-            prefix = "" if not multi else f"[第{r['idx']}页] "
-            lines.append(f"  {prefix}-> 未下载成功：{r['reason']}")
-        if ok_items:
-            lines.append(
-                f"  -> {len(ok_items)} 个已下成、{len(bad_items)} 个未下成："
-                f"整图归入「未识别」（{PREFIX_PARTIAL}…）"
-            )
-        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_PARTIAL)
-        lines.extend(msgs)
-        # 已下成的照常做后续转图（不能因为同图另一个码失败就把有效票据也丢掉）
-        _convert_downloaded(ctx, results, lines)
-        return finish("no_pdf")
+    # 4) 汇总本图的「问题子项」。两类都算问题，各自带原因标签：
+    #      · 失败（非网址 / 无 PDF / 网络失败）→ 非票
+    #      · 下回来发现内容与已有 PDF 相同     → 重复
+    #    多码图按图上序号标注（与 PDF 的「_第N页」对应），同因合并序号、异因逐项列出。
+    problems: list = []
+    for r in bad_items:
+        tag = "" if not multi else f"[第{r['idx']}页] "
+        lines.append(f"  {tag}-> 未下载成功：{r['reason']}")
+        problems.append((r["idx"] if multi else 0, TAG_NOT_TICKET))
+    for r in results:
+        # 只有「重下回来才发现重复」才算：说明出现了另一个下载入口或网址失效，
+        # 稍后多半得人工核一眼。单纯同网址复用（同一发票拍多张图）属于已知去重，
+        # 不标「重复」，免得「未识别」文件夹被噪声撑大。
+        if r["ok"] and r.get("dup_hit"):
+            dup_hit = True
+            problems.append((r["idx"] if multi else 0, TAG_DUPLICATE))
 
-    # 5) 全部成功（含全部复用）
-    if any(r["dup_hit"] for r in results):
-        # 只有「重下回来才发现重复」这一种才把原图留证：说明出现了另一个下载入口
-        # 或网址失效，稍后多半得人工核一眼。单纯同网址复用（同一发票拍多张图）
-        # 属于已知去重，不往「重复票据」里塞，免得文件夹被噪声撑大。
-        # 一张图上命中多次也只复制一次（同一个原图没法对应多份留证）。
-        dup_hit = True
-        _, msgs = _copy_original_into(
-            ctx.folder, DUP_DIR_NAME, fpath, fname, PREFIX_DUPLICATE
-        )
+    # 5) 有问题子项 → **整图只复制一份**到「未识别/」，前缀说明是哪个码、什么原因
+    if problems:
+        prefix = _build_problem_prefix(problems, multi)
+        if bad_items:
+            if ok_items:
+                lines.append(
+                    f"  -> {len(ok_items)} 个已下成、{len(bad_items)} 个未下成："
+                    f"整图归入「未识别」（{prefix}…）"
+                )
+            else:
+                lines.append(f"  -> 全部未下成：整图归入「未识别」（{prefix}…）")
+        else:
+            lines.append(f"  -> 内容与已有发票相同：原图归入「未识别」（{prefix}…）")
+        _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, prefix)
         lines.extend(msgs)
 
+    # 已下成的照常做后续转图（不能因为同图另一个码失败就把有效票据也丢掉）
     _convert_downloaded(ctx, results, lines)
 
+    if problems and bad_items:
+        return finish("no_pdf")
     # 全部走「复用」路径 → duplicate；只要有一份是这次真正下的 → success
     reused_all = all(r["reused"] for r in results)
     return finish("duplicate" if reused_all else "success")
@@ -2619,9 +2715,9 @@ def _process_folder_impl(
         "=== 识别结果统计 ===",
         f"总计识别图片：{stats['total']} 张",
         f"✓ 成功识别并下载 PDF（原文件名不变）：{stats['success']} 张",
-        f"⚠ 有二维码未下载成功（复制到未识别/，{PREFIX_PARTIAL}…）：{stats['no_pdf']} 张",
-        f"✗ 未识别到二维码（复制到未识别/，未识别-）：{stats['unrecognized']} 张",
-        f"· 其它情况（复制到未识别/，其它-）：{stats['other']} 张",
+        f"⚠ 有二维码但未下到 PDF（复制到未识别/，「{PREFIX_NOT_TICKET}」前缀）：{stats['no_pdf']} 张",
+        f"✗ 图上没有二维码（复制到未识别/，「{PREFIX_NONE}」前缀）：{stats['unrecognized']} 张",
+        f"· 二维码非网址（复制到未识别/，「{PREFIX_NOT_TICKET}」前缀）：{stats['other']} 张",
     ]
     pos = 3
     if stats["skipped"]:
@@ -2640,7 +2736,7 @@ def _process_folder_impl(
         pos += 1
     if dup_shots:
         summary.append(
-            f"✓ 重复票据（内容与已有发票相同，原图已复制到「{DUP_DIR_NAME}」/"
+            f"✓ 重复票据（内容与已有发票相同，原图已复制到「{STATUS_DIR_NAME}」/"
             f"{PREFIX_DUPLICATE}…）：{dup_shots} 张"
         )
     if stats["multi_qr"]:
@@ -3065,9 +3161,9 @@ class InvoiceQrToolApp:
             "本次识别结果统计：\n\n"
             f"总计识别图片：{s['total']} 张\n"
             f"成功下载 PDF（原文件名不变）：{s['success']} 张\n"
-            f"有二维码未下载成功（复制到未识别/，部分未识别-）：{s['no_pdf']} 张\n"
-            f"未识别到二维码（未识别-）：{s['unrecognized']} 张\n"
-            f"其它情况（其它-）：{s['other']} 张"
+            f"有二维码但未下到 PDF（非票-）：{s['no_pdf']} 张\n"
+            f"图上没有二维码（无-）：{s['unrecognized']} 张\n"
+            f"二维码非网址（非票-）：{s['other']} 张"
         )
         if s.get("error"):
             msg += f"\n处理出错（详见日志）：{s['error']} 张"
