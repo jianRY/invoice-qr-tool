@@ -423,9 +423,18 @@ def send_to_recycle_bin(path: str) -> bool:
             return True
         except Exception:
             return False
+    _co_ok = False
     try:
         import ctypes
         from ctypes import wintypes
+
+        # SHFileOperation 走 Shell / COM：在**非主线程**里调用（新版启动后由后台线程回收
+        # 旧 exe）必须先初始化 COM 单元，否则会直接失败返回非 0，文件根本不会进回收站。
+        # 只在该线程首次初始化成功（S_OK=0）时才配对 CoUninitialize。
+        try:
+            _co_ok = (ctypes.windll.ole32.CoInitialize(None) == 0)
+        except Exception:
+            _co_ok = False
 
         FO_DELETE = 0x0003
         FOF_ALLOWUNDO = 0x0040
@@ -461,6 +470,13 @@ def send_to_recycle_bin(path: str) -> bool:
         return res == 0 or not os.path.exists(path)
     except Exception:
         return False
+    finally:
+        # 与上面的 CoInitialize 配对，避免后台线程反复回收时 COM 引用计数失衡。
+        if _co_ok:
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
 
 
 def perform_update(download_urls, latest_version: tuple, on_event=None,
@@ -640,11 +656,25 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
         # 启动新版本并把“当前（旧）exe 路径”交给它回收；随后退出旧进程，
         # 交由新进程在旧进程释放文件后把旧 exe 移入回收站。
         try:
+            # ⚠️ PyInstaller 6.9+ 起：用当前 exe 启动「会活过本进程」的子进程时，必须显式
+            #     设 PYINSTALLER_RESET_ENVIRONMENT=1，并清掉本进程的解包环境变量 —— 否则
+            #     子进程可能复用本进程的临时解包目录（%TEMP%\_MEIxxxx），而本进程退出时会把
+            #     该目录删掉：新版窗口看着正常，一用到懒加载的 cv2 / zxing-cpp / pymupdf 就
+            #     「点了没反应」，正是「更新完自动打开的版本莫名卡住」的成因之一。
+            #     同时把工作目录固定为 exe 所在目录，与用户双击启动完全一致。
+            child_env = dict(os.environ)
+            child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            for _k in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
+                       "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS", "_MEIPASS2"):
+                child_env.pop(_k, None)
             subprocess.Popen(
                 [new_exe, "--recycle-old", current_exe],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                cwd=target_dir,
+                env=child_env,
+                close_fds=True,
             )
             return True
         except Exception as e:

@@ -93,6 +93,10 @@ outputs/
   └─ 发票二维码工具.exe       # packaged artifact (single file; see GitHub Releases)
 ```
 
+On startup the app writes `运行日志.txt` (run log) next to the executable — a live record of
+startup, engine initialisation and processing, kept even after the window is closed. Send it
+along when reporting an issue; it can be deleted at any time.
+
 ## Tech stack
 
 - Python 3.13 + `tkinter` (GUI)

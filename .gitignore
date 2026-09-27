@@ -23,3 +23,5 @@ outputs/
 .last_release_commit
 # CLI 自检（--test）在程序目录写的运行日志，属临时产物
 test_run.log
+# GUI 版实时落盘的运行日志（排查卡死用），属临时产物
+运行日志.txt

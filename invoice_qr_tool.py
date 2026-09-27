@@ -335,10 +335,21 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 「汇总发票」这一步保持单线程：它用 pdfplumber 解析 PDF，属纯 Python 计算，
   并发实测没有收益（1.0×）。
 - 单文件 EXE，无需安装，双击即用。
+- **遇到问题时，请把程序目录下的「运行日志.txt」发回来**：软件会把启动、识别引擎初始化、
+  处理过程实时写进该文件（窗口关掉也不会丢），便于快速定位问题。
 """
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-27  v5.2.1
+- **修复「更新完自动打开的新版本会卡住、必须关掉重开才能用」的问题**：
+  · 新版启动时不再等待旧版本文件被释放，窗口立即出现；
+  · 启动新版时不再沿用旧版本的临时运行环境，避免新版缺运行组件；
+  · 打开后即自动完成识别引擎初始化，日志里会显示「识别引擎就绪」。
+- **新增运行日志**：程序目录下实时写入「运行日志.txt」，记录启动、初始化与处理过程；
+  遇到问题可直接把该文件发回来定位。
+- 发票识别、下载、去重与汇总主流程与 v5.2.0 完全一致。
 
 2026-09-26  v5.2.0
 - **问题图片的改名规则改为「原因 + 序号」，一眼看出是哪个二维码、什么原因没成**。
@@ -1111,6 +1122,58 @@ def _ui_post(root, fn):
     ``root.after`` / ``messagebox`` —— 那属于跨线程操作 Tk，可能偶发卡死或崩溃。
     """
     _UI_QUEUE.put(fn)
+
+
+# ─────────────────────── 运行日志落盘 ───────────────────────
+# GUI 版原先只在界面里滚日志，窗口一关就什么都不剩 —— 出问题时用户手上没有任何可发回
+# 的现场。这里把同一条日志实时追加到 exe 同目录的「运行日志.txt」（失败静默）。
+_RUN_LOG_PATH = None
+
+
+def _run_log_path() -> str:
+    """运行日志文件路径：打包后与 exe 同目录；开发时为本脚本所在目录。"""
+    global _RUN_LOG_PATH
+    if _RUN_LOG_PATH:
+        return _RUN_LOG_PATH
+    try:
+        base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        base = os.getcwd()
+    _RUN_LOG_PATH = os.path.join(base, "运行日志.txt")
+    return _RUN_LOG_PATH
+
+
+def _append_run_log(text: str) -> None:
+    """追加一行运行日志到磁盘。目录只读 / 被占用等情况一律静默跳过，绝不影响主流程。
+
+    文件超过 2 MB 时清空重写，避免长期使用后无限膨胀。
+    """
+    try:
+        p = _run_log_path()
+        if os.path.isfile(p) and os.path.getsize(p) > 2 * 1024 * 1024:
+            with open(p, "w", encoding="utf-8"):
+                pass
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+
+
+def _preload_engine() -> None:
+    """预加载识别 / 转图用的重型扩展（与 detect_qr_codes、_convert_downloaded 同一批）。
+
+    cv2 / numpy / zxing-cpp / pymupdf 在 onefile 包里是从临时解包目录加载的几十 MB DLL，
+    磁盘慢或被安全软件实时扫描时会拖很久。放到启动后的后台线程预热，就把这段等待从
+    「点了开始处理之后、毫无提示地卡住」提前到「刚打开、并在日志里有进度可看」。
+    """
+    import cv2          # noqa: F401
+    import numpy        # noqa: F401
+    try:
+        import zxingcpp  # noqa: F401
+    except Exception:
+        pass
+    import pymupdf      # noqa: F401
 
 
 def _begin_update_check() -> bool:
@@ -2785,7 +2848,7 @@ class InvoiceQrToolApp:
     # 滚动越来越卡、也白占内存。超过就裁掉最早的，只留最近的这些行。
     _LOG_MAX_LINES = 5000
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, recycle_old: str | None = None):
         self.root = root
         self.root.title(f"发票二维码识别下载工具 v{__VERSION__}")
         K.setup_scale(self.root)          # 按实际 DPI 推导缩放比（150% → 1.5）
@@ -2822,6 +2885,12 @@ class InvoiceQrToolApp:
         self._pump_ui()
         # 关闭窗口时若任务还在跑，先让用户确认（避免误关导致半途而废）
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 后台预热识别引擎：把加载重型扩展的等待从「点了开始处理之后」提前到启动期，
+        # 日志里有进度可看，不再是毫无提示地卡住（详见 _preload_engine）。
+        threading.Thread(target=self._warmup_engine, daemon=True).start()
+        # 上一版本交给本进程的「回收旧 exe」任务：等窗口出来后在后台做（见 _recycle_old_async）
+        if recycle_old:
+            self._recycle_old_async(recycle_old)
         # 启动后静默检查更新（仅发现新版本时弹窗，无网络/无更新时不打扰）
         threading.Thread(
             target=_silent_startup_check, args=(self.root,), daemon=True
@@ -3063,6 +3132,40 @@ class InvoiceQrToolApp:
         # 级别按**正文**判定（tag_for 会自动跳过 [HH:MM:SS] 前缀），
         # 这样「=== / ✓ / ⚠ / ✗」的着色规则不会因加了时间戳而失效。
         self.log_view.append(f"[{now}] {msg}", K.LogView.tag_for(msg))
+        # 同步落盘：窗口一关日志就没了的旧行为，让「卡住」这类问题无从查证。
+        _append_run_log(f"[{now}] {msg}")
+
+    def _recycle_old_async(self, old_path: str):
+        """后台把上一版本的 exe 送进回收站（等旧进程释放文件，最多约 20 秒）。
+
+        由上一版本以 `--recycle-old "<旧exe>"` 启动本进程时触发。以前这段跑在 tk.Tk()
+        之前，旧进程释放文件慢时会干等最多 20 秒、窗口迟迟不出现 —— 看起来就像「更新完
+        自动打开的版本卡住了」。现在窗口先出来，回收在后台悄悄做。
+        """
+        def work():
+            for _ in range(40):
+                if not os.path.exists(old_path):
+                    return
+                if send_to_recycle_bin(old_path):
+                    _ui_post(self.root, lambda: self._log(
+                        f"旧版本已移入回收站：{os.path.basename(old_path)}"))
+                    return
+                time.sleep(0.5)
+            _ui_post(self.root, lambda: self._log(
+                "旧版本文件暂时无法移入回收站，可稍后手动删除。"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _warmup_engine(self):
+        """后台预热识别引擎，并把耗时写进日志 —— 让「第一次识别慢」有迹可循。"""
+        t0 = time.monotonic()
+        try:
+            _preload_engine()
+        except Exception as e:
+            _ui_post(self.root, lambda e=e: self._log(f"⚠ 识别引擎初始化失败：{e}"))
+            return
+        dt = time.monotonic() - t0
+        _ui_post(self.root, lambda dt=dt: self._log(
+            f"✓ 识别引擎就绪（初始化用时 {dt:.1f} 秒）"))
 
     def _poll_log(self):
         if self._closing:
@@ -3296,18 +3399,25 @@ def _cli_pdf2img(folder: str) -> None:
 def main():
     args = sys.argv[1:]
 
-    # “回收旧版本”模式：由上一版本以 --recycle-old "<旧exe>" 启动本进程，
-    # 等旧进程退出后再把旧 exe 移入回收站（避免删除正在运行的自身文件被系统锁定）。
+    _append_run_log("=" * 66)
+    _append_run_log(f"启动 v{__VERSION__}  参数={args}")
+    try:
+        _append_run_log(f"程序路径={sys.executable}")
+        _append_run_log(f"工作目录={os.getcwd()}")
+    except Exception:
+        pass
+
+    # “回收旧版本”：由上一版本以 --recycle-old "<旧exe>" 启动本进程，等旧进程释放文件后
+    # 再把旧 exe 移入回收站（避免删除正在运行的自身文件被系统锁定）。
+    # ⚠️ 这里只解析、不执行：该动作以前跑在 tk.Tk() 之前，旧进程释放文件慢时会干等最多
+    #    20 秒，窗口迟迟不出现 —— 用户看到的就是「更新完自动打开的版本卡住了」。现在交给
+    #    界面在窗口出现后、后台线程里做（见 InvoiceQrToolApp._recycle_old_async）。
+    recycle_old = None
     if "--recycle-old" in args:
         i = args.index("--recycle-old")
-        old_path = args[i + 1] if i + 1 < len(args) else None
-        if old_path and old_path.lower().endswith(".exe"):
-            for _ in range(40):  # 最多约 20 秒，等旧进程释放文件
-                if not os.path.exists(old_path):
-                    break
-                if send_to_recycle_bin(old_path):
-                    break
-                time.sleep(0.5)
+        p = args[i + 1] if i + 1 < len(args) else None
+        if p and p.lower().endswith(".exe"):
+            recycle_old = p
 
     # 清理早期更新机制遗留的临时文件
     _cleanup_legacy_update_artifacts()
@@ -3334,7 +3444,7 @@ def main():
 
     setup_app_id()          # 必须在 tk.Tk() 之前，任务栏才会认本程序的图标与身份
     root = tk.Tk()
-    app = InvoiceQrToolApp(root)
+    app = InvoiceQrToolApp(root, recycle_old=recycle_old)
     root.mainloop()
 
 
