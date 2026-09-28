@@ -53,6 +53,21 @@ for node in tree.body:
                 if val is not None:
                     ns[t.id] = val
 
+# 第一遍补：GITHUB_REPO_OWNER / GITHUB_REPO_NAME 定义在 iqr_update.py，本文件只是
+# `from iqr_update import ...`，只解析本文件会取不到 → f-string 插值成空串，
+# 文档里的仓库地址会变成 https://github.com// 。故把依赖模块的模块级字符串常量并入 ns。
+for _mod in ("iqr_update",):
+    _mod_path = os.path.join(ROOT, _mod + ".py")
+    if not os.path.isfile(_mod_path):
+        continue
+    for node in ast.parse(open(_mod_path, encoding="utf-8").read()).body:
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id not in ns:
+                    val = _str_value(node.value, ns)
+                    if val is not None:
+                        ns[t.id] = val
+
 # 第二遍：抽取目标文案
 out = {}
 for node in tree.body:

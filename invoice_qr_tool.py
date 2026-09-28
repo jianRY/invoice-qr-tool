@@ -4,6 +4,8 @@
 发票二维码识别下载工具
 功能：
 1. 识别指定文件夹内图片中的二维码（全部图片均识别，不再按网址去重）；
+   自动**递归遍历其中的子文件夹**，逐个跑同一套流程（程序自建的「处理后」「未识别」
+   「PDF」会跳过，不会把上一轮的产物再处理一遍）；
 2. 若二维码为网址，则下载对应 PDF 到同目录 PDF 文件夹下：
    - 一张图只有 1 个二维码：文件名与原始图片相同（原名.pdf）；
    - 一张图有 2 个及以上二维码：每个二维码各下一份，
@@ -11,9 +13,9 @@
 3. 识别结果的归类与文件处理：
    - 成功识别并下载到 PDF：原图片文件名保持不变；
    - 有问题的图一律复制一份到「未识别」文件夹（原图保留不动），前缀说明原因：
-     「无-」图上没有二维码 /「非票-」有码但下不到 PDF /「重复-」内容与已有发票相同；
+     「无码-」图上没有二维码 /「无票-」有码但下不到 PDF /「重复-」内容与已有发票相同；
    - 一张图有多个二维码时，出问题的码带**序号**（按图上从上到下，与 PDF 的「_第N页」对应），
-     同因合并、异因逐项：「第二、三非票-原名」「第二非票、第三重复-原名」；
+     同因合并、异因逐项：「第二、三无票-原名」「第二无票、第三重复-原名」；
 4. 可选任务完成后打开文件夹；
 5. 可选将下载的 PDF 转换为 JPG 图片（长边 2000px，短边自适应）；
 6. 可选任务完成后汇总发票（对 PDF 文件夹内发票 PDF 提取字段并生成 Excel，
@@ -94,20 +96,25 @@ STATUS_DIR_NAME = "未识别"
 
 # 状态前缀 —— 目标是一眼看出「哪个二维码、什么原因」没成功。
 # 语义标签（不带横杠）单独定义，多二维码拼接序号时要用到；前缀 = 标签 + "-"。
-TAG_NONE = "无"           # 图上根本没有二维码
-TAG_NOT_TICKET = "非票"   # 有二维码，但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）
+TAG_NONE = "无码"         # 图上根本没有二维码
+TAG_NOT_TICKET = "无票"   # 有二维码，但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）
 TAG_DUPLICATE = "重复"    # 码能下，但下回来的内容与已有 PDF 完全相同
 
 PREFIX_NONE = TAG_NONE + "-"
 PREFIX_NOT_TICKET = TAG_NOT_TICKET + "-"
 PREFIX_DUPLICATE = TAG_DUPLICATE + "-"
 
+# 程序自建目录：自动遍历子文件夹时**必须剪枝跳过**，否则会把上一轮的产物
+# （转出来的页面图、未识别副本、下载好的 PDF）再当成输入处理一遍，越滚越多。
+# 注意「PDF/图片」不用单列 —— 「PDF」被跳过后它自然进不来。
+RESERVED_DIR_NAMES = frozenset({POSTPROCESS_DIR_NAME, STATUS_DIR_NAME, "PDF"})
+
 # ⚠️ 多二维码（一图 ≥2 码）时，**每个出问题的码**都要在前缀里标出它在图上的序号：
 #    序号 = 按「从上到下、从左到右」排序后的位置，与 PDF 的「_第N页」编号严格对应，
-#    这样「第二非票-」能直接对上「原名_第2页.pdf」，不会张冠李戴。
+#    这样「第二无票-」能直接对上「原名_第2页.pdf」，不会张冠李戴。
 #    规则：整图**只复制一份**，前缀按「同因合并序号、异因逐项」拼接，组间按最小序号排：
-#      第 2、3、4 个都是非票  → 「第二、三、四非票-原名.jpg」
-#      第 2 非票、第 3 重复   → 「第二非票、第三重复-原名.jpg」
+#      第 2、3、4 个都是无票  → 「第二、三、四无票-原名.jpg」
+#      第 2 无票、第 3 重复   → 「第二无票、第三重复-原名.jpg」
 #    单二维码不加序号（只有一个码，加「第一」纯属噪音），直接用 PREFIX_*。
 SEP_MULTI = "、"
 
@@ -117,7 +124,7 @@ _CN_DIGITS = "零一二三四五六七八九"
 def _cn_num(n: int) -> str:
     """序号转中文数字：1→一、11→十一、21→二十一。
 
-    用在多二维码的前缀里（「第二非票-」），与项目组的习惯写法一致。
+    用在多二维码的前缀里（「第二无票-」），与项目组的习惯写法一致。
     100 以上极少出现在票据图上，超出范围就原样用阿拉伯数字，绝不抛异常。
     """
     if n <= 0:
@@ -136,9 +143,9 @@ def _build_problem_prefix(items: list, multi: bool) -> str:
 
     ``items`` 形如 ``[(序号, 标签), ...]``——序号是该码在图上的位置（1 起，从上到下），
     标签取 ``TAG_NOT_TICKET`` / ``TAG_DUPLICATE``。
-    单二维码（``multi=False``）不加序号，只用标签，如 ``非票-``；
+    单二维码（``multi=False``）不加序号，只用标签，如 ``无票-``；
     多二维码按「同因合并序号、异因逐项」拼接，组间按组内最小序号排序，如
-    ``第二、三非票、第四重复-``。
+    ``第二、三无票、第四重复-``。
 
     调用方保证 ``items`` 非空（没有出问题的子项时压根不该复制原图）。
     """
@@ -157,7 +164,7 @@ def _build_problem_prefix(items: list, multi: bool) -> str:
     ordered = sorted(groups.items(), key=lambda kv: min(kv[1]))
     parts = []
     for tag, idxs in ordered:
-        # 「第」加在每个原因组前面：「第二、三非票、第四重复-」
+        # 「第」加在每个原因组前面：「第二、三无票、第四重复-」
         seq = SEP_MULTI.join(_cn_num(i) for i in sorted(idxs))
         parts.append(f"第{seq}{tag}")
     return SEP_MULTI.join(parts) + "-"
@@ -176,7 +183,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.2.1"
+__VERSION__ = "5.3.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -202,13 +209,13 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    （只是复制，原图片始终保留在原始文件夹中，不会被改名或移动）。
    - 成功识别并下载到 PDF：原图片文件名保持不变。
    - 有问题的图按原因加前缀，一眼看出是什么问题：
-     · 「无-」  —— 图上没有二维码；
-     · 「非票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
+     · 「无码-」  —— 图上没有二维码；
+     · 「无票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
      · 「重复-」—— 下回来的内容与已有发票完全相同。
    - 一张图有 2 个及以上二维码时，出问题的码会带**序号**（按二维码在图上的位置从上到
      下编号，与「原名_第N页.pdf」严格对应），同因合并、异因逐项：
-       第 2、3 个都非票       → 「第二、三非票-原名」
-       第 2 非票、第 3 个重复 → 「第二非票、第三重复-原名」
+       第 2、3 个都无票       → 「第二、三无票-原名」
+       第 2 无票、第 3 个重复 → 「第二无票、第三重复-原名」
      整图**只复制一份**，已经下成的那几份 PDF 照常保留在「PDF」里。
 4. 可选：处理完成后自动打开文件夹。
 5. 可选：将下载的 PDF 转为 JPG 图片（长边 2000px，短边自适应），保存到「PDF/图片」。
@@ -253,10 +260,15 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
     转出的页面命名为「原文件名_1.jpg / 原文件名_2.jpg …」（按页码递增）。
     「处理后」每次处理都会**清空重建**，不会带入上一次的遗留结果；
     命名冲突会自动加后缀区分；单个 PDF 损坏 / 加密时只跳过该份，不中断整体。
+13. **自动遍历子文件夹**：选中一个总文件夹后，软件会自动扫描它下面的所有子文件夹，
+    对**每个含图片或 PDF 的文件夹**逐个跑完整流程 —— 各自的「PDF」「未识别」与汇总表
+    都落在它自己里面，互不干扰。软件自己生成的「处理后」「未识别」「PDF」会被跳过，
+    所以反复运行也**不会把上一轮的产物再处理一遍**。
 
 【使用步骤】
-1. 把待处理的图片（和/或 PDF）放在同一个文件夹里。
-2. 打开本软件，点「浏览…」选择该文件夹。
+1. 把待处理的图片（和/或 PDF）放在同一个文件夹里；如果按批次 / 单位分放在子文件夹里，
+   软件会自动逐个处理，不用一个个点。
+2. 打开本软件，点「浏览…」选择该文件夹（可以是总文件夹，子文件夹会自动遍历）。
 3. 按需勾选：
    - 处理完成后打开文件夹
    - 将下载的 PDF 转换为图片（JPG，长边 2000px）
@@ -267,8 +279,9 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    要中止就点「开始处理」右侧的「停止」；日志卡右上角有「清空日志」。
    「使用说明 / 更新记录」「检查更新」在顶栏右侧。
 5. 处理完成后，PDF 在「PDF」文件夹，转换图片在「PDF/图片」，
-   所有问题图片的副本（「无- / 非票- / 重复-」）都在「未识别」文件夹，
-   汇总表在「PDF/发票汇总_*.xlsx」。
+   所有问题图片的副本（「无码- / 无票- / 重复-」）都在「未识别」文件夹，
+   汇总表在「PDF/发票汇总_*.xlsx」。这些结果都落在**各自被处理的文件夹**里，
+   且每个被处理的文件夹内会有一份「运行日志.txt」记录该文件夹的处理过程。
 
 【自动更新】
 - 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「是」即自动
@@ -285,16 +298,17 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
   随后自动切换到新版本，安全且无损，不再需要复杂的覆盖/备份/回滚机制。
 
 【输出规则速查】
-（注：只要文件夹里含 PDF，以下输出全部落在「处理后」子文件夹内 —— 即 目标文件夹\处理后\…）
+（注 1：下面这些路径都是**相对每一个被处理的文件夹**说的；自动遍历子文件夹时，各文件夹各有一套。
+  注 2：只要该文件夹里含 PDF，以下输出全部落在它的「处理后」子文件夹内 —— 即 该文件夹\处理后\…）
 - 含 PDF（自动）         → 新建「处理后」，PDF 转「原名_1.jpg / 原名_2.jpg …」+ 复制原有图片进
 - 网址 + 下载成功      → PDF/<原名>.pdf，原图片文件名保持不变
 - 一张图 2 个以上二维码 → PDF/<原名>_第1页.pdf、<原名>_第2页.pdf …（每个二维码各一份）
-- 图上无二维码         → 复制一份到「未识别/无-<原名>」
-- 有码但下不到 PDF     → 复制一份到「未识别/非票-<原名>」（非网址 / 无 PDF / 网络失败）
+- 图上无二维码         → 复制一份到「未识别/无码-<原名>」
+- 有码但下不到 PDF     → 复制一份到「未识别/无票-<原名>」（非网址 / 无 PDF / 网络失败）
 - 内容与已有发票相同   → 复制一份到「未识别/重复-<原名>」
 - 多二维码有码出问题   → 已成功的 PDF 保留；整图**只复一份**，前缀带序号：
-                          第2、3个都非票   → 「未识别/第二、三非票-<原名>」
-                          第2非票、第3重复 → 「未识别/第二非票、第三重复-<原名>」
+                          第2、3个都无票   → 「未识别/第二、三无票-<原名>」
+                          第2无票、第3重复 → 「未识别/第二无票、第三重复-<原名>」
 - 勾选转图             → PDF/图片/<原名>_第N页.jpg（JPG 格式，长边 2000px）
 - 过程中临时文件       → PDF/_去重索引.json（记录「网址 → 发票内容指纹」，供重跑时免发请求）
                          PDF/_图片指纹.json（记录「图片内容 → 已保存 PDF」，供改名后重跑免发请求）
@@ -335,12 +349,23 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 - 「汇总发票」这一步保持单线程：它用 pdfplumber 解析 PDF，属纯 Python 计算，
   并发实测没有收益（1.0×）。
 - 单文件 EXE，无需安装，双击即用。
-- **遇到问题时，请把程序目录下的「运行日志.txt」发回来**：软件会把启动、识别引擎初始化、
-  处理过程实时写进该文件（窗口关掉也不会丢），便于快速定位问题。
+- **遇到问题时，请把出问题那个文件夹里的「运行日志.txt」发回来**：软件会把启动、识别引擎
+  初始化与处理过程实时写进**正在处理的那个文件夹**（窗口关掉也不会丢），便于快速定位问题。
 """
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-09-28  v5.3.0
+- **支持自动处理子文件夹**：选中一个总文件夹后，软件会自动遍历它下面所有子文件夹，
+  逐个完成识别、下载、去重与汇总 —— 每个子文件夹的「PDF」「未识别」与汇总表都落在
+  它自己里面，互不干扰。分文件夹存放的发票，现在一次就能跑完。
+- **运行日志改放在正在处理的文件夹里**：每个被处理的文件夹内生成一份「运行日志.txt」，
+  记录该文件夹的处理过程；不再写到程序所在目录（软件放在桌面时，桌面不会再平白多出
+  日志文件）。遇到问题时，把对应文件夹里的这份日志发回来即可。
+- **问题图片前缀更名**：「无码-」（图上没有二维码）/「无票-」（有二维码但下不到 PDF）/
+  「重复-」（内容与已有发票相同）—— 原来的「无-」「非票-」含义不变，只是说法更直观。
+- 发票的下载、去重与汇总口径与 v5.2.1 完全一致。
 
 2026-09-27  v5.2.1
 - **修复「更新完自动打开的新版本会卡住、必须关掉重开才能用」的问题**：
@@ -354,13 +379,13 @@ CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 2026-09-26  v5.2.0
 - **问题图片的改名规则改为「原因 + 序号」，一眼看出是哪个二维码、什么原因没成**。
   按原因加前缀：
-  · 「无-」  —— 图上没有二维码；
-  · 「非票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
+  · 「无码-」  —— 图上没有二维码；
+  · 「无票-」—— 有二维码但下不到 PDF（非网址 / 解析不出可下载内容 / 网络失败）；
   · 「重复-」—— 下回来的内容与已有发票完全相同。
 - **一张图有多个二维码时，出问题的码按位置编号**（从上到下，与「原名_第N页.pdf」对应），
   同一原因合并号码、不同原因分开列：
-  · 第 2、3 个都下不到 PDF     →「第二、三非票-原名」
-  · 第 2 个下不到、第 3 个重复 →「第二非票、第三重复-原名」
+  · 第 2、3 个都下不到 PDF     →「第二、三无票-原名」
+  · 第 2 个下不到、第 3 个重复 →「第二无票、第三重复-原名」
   单二维码不加序号；整张图只复制一份，已下成的 PDF 照常保留。
 - **问题图片统一放在「未识别」文件夹**，不必再跑两个文件夹找问题图。
 - 本次只改「问题图片的命名与归类」，发票 PDF 的下载、去重与汇总主流程与 v5.1.3 一致。
@@ -1126,38 +1151,65 @@ def _ui_post(root, fn):
 
 # ─────────────────────── 运行日志落盘 ───────────────────────
 # GUI 版原先只在界面里滚日志，窗口一关就什么都不剩 —— 出问题时用户手上没有任何可发回
-# 的现场。这里把同一条日志实时追加到 exe 同目录的「运行日志.txt」（失败静默）。
-_RUN_LOG_PATH = None
+# 的现场。现在把同一条日志实时追加进**正在处理的那个文件夹**（「运行日志.txt」）：
+#   ① 每个被处理的文件夹各带一份，现场跟着结果走，不用再去别处找；
+#   ② 不再写到 exe 所在目录 —— 程序放在桌面时，不会平白在桌面落一个日志文件。
+RUN_LOG_NAME = "运行日志.txt"
+# 还没绑定目标文件夹时的日志（启动记录、引擎预热…）先攒在内存，绑定后补写进去，
+# 这样每份日志都带完整的启动上下文。
+_RUN_LOG_DIR = None
+_RUN_LOG_BUFFER: list = []
+_RUN_LOG_BUFFER_MAX = 800
+# ⚠️ 写入必须串行化：`open(p, "a")` 每次都是一个独立句柄，两个线程同时写同一个文件时
+#    底层的编码缓冲会**交错**，整行被从中撕开 —— 文件变成非法 UTF-8，读出来直接
+#    UnicodeDecodeError（现场直接废掉）。主界面的 _log() 与后台预热 / 回收线程都可能
+#    触发写盘，这里统一加锁兜住。
+_RUN_LOG_LOCK = threading.Lock()
 
 
-def _run_log_path() -> str:
-    """运行日志文件路径：打包后与 exe 同目录；开发时为本脚本所在目录。"""
-    global _RUN_LOG_PATH
-    if _RUN_LOG_PATH:
-        return _RUN_LOG_PATH
+def bind_run_log_dir(folder) -> None:
+    """把运行日志切到指定文件夹；启动期攒下的日志会先补写进去。
+
+    由界面线程在处理每个文件夹开始时调用（worker 通过 log_queue 的 "logdir" 事件通知）。
+    目标不存在或不可写时静默降级为「只在界面显示」，绝不影响主流程。
+    """
+    global _RUN_LOG_DIR
     try:
-        base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-                else os.path.dirname(os.path.abspath(__file__)))
+        _RUN_LOG_DIR = folder if (folder and os.path.isdir(folder)) else None
     except Exception:
-        base = os.getcwd()
-    _RUN_LOG_PATH = os.path.join(base, "运行日志.txt")
-    return _RUN_LOG_PATH
+        _RUN_LOG_DIR = None
+    if _RUN_LOG_DIR:
+        for line in list(_RUN_LOG_BUFFER):
+            _write_run_log(line)
+
+
+def _write_run_log(text: str) -> None:
+    """追加一行到当前目标文件夹的「运行日志.txt」。任何异常都静默吞掉。
+
+    文件超过 2 MB 时清空重写，避免长期使用后无限膨胀。
+    整个「检查大小 → 写入」放在同一把锁里，多线程写入不会互相撕开行。
+    """
+    if not _RUN_LOG_DIR:
+        return
+    try:
+        p = os.path.join(_RUN_LOG_DIR, RUN_LOG_NAME)
+        with _RUN_LOG_LOCK:
+            if os.path.isfile(p) and os.path.getsize(p) > 2 * 1024 * 1024:
+                with open(p, "w", encoding="utf-8"):
+                    pass
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+    except Exception:
+        pass
 
 
 def _append_run_log(text: str) -> None:
-    """追加一行运行日志到磁盘。目录只读 / 被占用等情况一律静默跳过，绝不影响主流程。
-
-    文件超过 2 MB 时清空重写，避免长期使用后无限膨胀。
-    """
-    try:
-        p = _run_log_path()
-        if os.path.isfile(p) and os.path.getsize(p) > 2 * 1024 * 1024:
-            with open(p, "w", encoding="utf-8"):
-                pass
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(text + "\n")
-    except Exception:
-        pass
+    """记录一行运行日志：已绑定目标文件夹就落盘，否则先攒在内存里等绑定。"""
+    if _RUN_LOG_DIR:
+        _write_run_log(text)
+        return
+    if len(_RUN_LOG_BUFFER) < _RUN_LOG_BUFFER_MAX:
+        _RUN_LOG_BUFFER.append(text)
 
 
 def _preload_engine() -> None:
@@ -2122,12 +2174,12 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 
     **问题图一律复制一份到「未识别/」，前缀说明「哪个码、什么原因」**
     （2026-09-26 重做；原先整图只有一个笼统前缀，多码图看不出是第几个码出的问题）：
-      · 图上无二维码              → 「无-原名」
-      · 有码但下不到 PDF / 非网址  → 「非票-原名」
+      · 图上无二维码              → 「无码-原名」
+      · 有码但下不到 PDF / 非网址  → 「无票-原名」
       · 下回来发现内容与已有相同   → 「重复-原名」
       · 多码图按「从上到下」排序，出问题的码带序号，同因合并、异因逐项：
-        第 2、3 个都非票 →「第二、三非票-原名」；第 2 非票、第 3 重复
-        →「第二非票、第三重复-原名」。序号与 PDF 的「_第N页」严格对应。
+        第 2、3 个都无票 →「第二、三无票-原名」；第 2 无票、第 3 重复
+        →「第二无票、第三重复-原名」。序号与 PDF 的「_第N页」严格对应。
     整图**只复制一份**，已下成的 PDF 照常保留（是有效票据，不该丢）。
 
     关键设计：**不写任何共享状态**。统计、进度、日志全部通过返回值交回主线程汇总，
@@ -2183,7 +2235,7 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 
     if not urls:
         lines.append(
-            f"  -> 识别到 {len(codes)} 个二维码但均非网址，归入「非票」"
+            f"  -> 识别到 {len(codes)} 个二维码但均非网址，归入「无票」"
         )
         _, msgs = _copy_to_unrecognized(ctx.folder, fpath, fname, PREFIX_NOT_TICKET)
         lines.extend(msgs)
@@ -2236,7 +2288,7 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
     pdf_count = len(ok_items)
 
     # 4) 汇总本图的「问题子项」。两类都算问题，各自带原因标签：
-    #      · 失败（非网址 / 无 PDF / 网络失败）→ 非票
+    #      · 失败（非网址 / 无 PDF / 网络失败）→ 无票
     #      · 下回来发现内容与已有 PDF 相同     → 重复
     #    多码图按图上序号标注（与 PDF 的「_第N页」对应），同因合并序号、异因逐项列出。
     problems: list = []
@@ -2528,6 +2580,57 @@ def prepare_target_folder(
     return target, info
 
 
+def _zero_stats(workers: int) -> dict:
+    """一份全零的统计（字段与正常流程完全一致），供早退路径与聚合使用。"""
+    return {
+        "total": 0, "success": 0, "skipped": 0, "duplicate": 0, "no_pdf": 0,
+        "unrecognized": 0, "other": 0, "error": 0, "cancelled": 0, "dup_shots": 0,
+        "multi_qr": 0, "extra_pdfs": 0, "workers": max(1, int(workers)), "elapsed": 0.0,
+    }
+
+
+# 多文件夹聚合时逐项相加的统计字段（elapsed / workers 单独处理）
+_SUMMABLE_STATS = (
+    "total", "success", "skipped", "duplicate", "no_pdf", "unrecognized",
+    "other", "error", "cancelled", "dup_shots", "multi_qr", "extra_pdfs",
+)
+
+
+def _iter_target_folders(root: str) -> list:
+    """递归收集需要处理的文件夹（含 root 自身）：里面只要有图片或 PDF 就算一个目标。
+
+    递归到任意层级，但会**剪枝跳过**程序自建的目录（「处理后」/「未识别」/「PDF」）——
+    否则上一轮转出来的页面图、未识别副本、已下载的 PDF 会被当成新输入再跑一遍，
+    每跑一次就多滚一层。
+
+    结果排序返回，保证多次运行的顺序一致（日志与进度可复现）。
+    """
+    targets = []
+    for cur, dirs, files in os.walk(root):
+        # 原地改写 dirs 才是有效剪枝：os.walk 会照着这份列表继续往下走
+        dirs[:] = sorted(d for d in dirs if d not in RESERVED_DIR_NAMES)
+        lows = [f.lower() for f in files]
+        if any(f.endswith(SUPPORTED_IMAGE_EXTS) or f.endswith(SUPPORTED_PDF_EXTS)
+               for f in lows):
+            targets.append(cur)
+    return sorted(targets)
+
+
+def _count_pending(folder: str) -> int:
+    """数一个文件夹里的「待处理文件数」（图片 + PDF），只用于全局进度的预估基数。"""
+    n = 0
+    try:
+        for f in os.listdir(folder):
+            if not os.path.isfile(os.path.join(folder, f)):
+                continue
+            low = f.lower()
+            if low.endswith(SUPPORTED_IMAGE_EXTS) or low.endswith(SUPPORTED_PDF_EXTS):
+                n += 1
+    except Exception:
+        return 0
+    return n
+
+
 def process_folder(
     folder: str,
     open_after: bool,
@@ -2537,18 +2640,105 @@ def process_folder(
     cancel: "CancelToken | None" = None,
     workers: int = DEFAULT_WORKERS,
     preconvert: bool = True,
+    recursive: bool = True,
 ):
-    """处理整个文件夹（对外入口，见下方 _process_folder_impl）。
+    """处理整个文件夹（对外入口）。
+
+    会自动**递归遍历所选文件夹里的子文件夹**，对每个「含图片或 PDF」的文件夹跑同一套
+    识别流程（各自的 PDF/、未识别/、汇总表都落在它自己里面）；跳过程序自建的
+    「处理后」/「未识别」/「PDF」，不会把上一轮的产物再处理一遍。
 
     ⚠️ 这里必须保证「无论发生什么，最后一定有 ("done",) 入队」：界面靠它复位按钮与
     状态，漏一次就永久卡在「处理中…」，只能重启软件（打包后没有控制台，异常也看不见）。
-    所以把兜底放在最外层，业务逻辑全在 _process_folder_impl 里。
+    所以把兜底放在最外层，单文件夹的业务逻辑全在 _process_folder_impl 里。
     """
+    def log(msg):
+        log_queue.put(("log", msg))
+
+    def finish(stats=None):
+        if stats is not None:
+            log_queue.put(("stats", dict(stats)))
+        log_queue.put(("done",))
+
     try:
-        _process_folder_impl(
-            folder, open_after, convert_pdf, summarize, log_queue,
-            cancel=cancel, workers=workers, preconvert=preconvert,
-        )
+        workers = max(1, int(workers))
+    except Exception:
+        workers = DEFAULT_WORKERS
+    cancel = cancel if cancel is not None else CancelToken()
+
+    try:
+        if not folder or not os.path.isdir(folder):
+            log("错误：请选择一个有效的文件夹路径。")
+            finish()
+            return
+
+        try:
+            targets = _iter_target_folders(folder) if recursive else [folder]
+        except Exception as e:
+            log(f"扫描子文件夹出错（{e}），改为只处理所选文件夹。")
+            targets = [folder]
+
+        if not targets:
+            log("没有找到含图片或 PDF 的文件夹，本次没有可处理的内容。")
+            # 与「文件夹里没有图片」那条路一样收尾：上一轮可能留下去重索引 → 一并清理，
+            # 保持「跑完即干净」（残索引会在换一批图后误导重跑）。
+            root_pdf_dir = os.path.join(folder, "PDF")
+            _remove_dedup_cache(root_pdf_dir, log=log)
+            _remove_dedup_cache(root_pdf_dir, log=log, file_name=SHOT_CACHE_FILE_NAME)
+            finish(_zero_stats(workers))
+            return
+
+        total_folders = len(targets)
+        if total_folders > 1:
+            log(f"共发现 {total_folders} 个待处理文件夹（含子文件夹），将逐个处理：")
+            shown = 0
+            for t in targets:
+                if shown >= 40:
+                    log(f"  · …其余 {total_folders - shown} 个略")
+                    break
+                rel = os.path.relpath(t, folder)
+                log(f"  · {'（所选文件夹本身）' if rel == '.' else rel}")
+                shown += 1
+
+        grand_total = sum(_count_pending(t) for t in targets)
+        base_done = 0
+        agg = _zero_stats(workers)
+        t_start = time.perf_counter()
+
+        for idx, target in enumerate(targets, 1):
+            if cancel.cancelled:
+                break
+            if total_folders > 1:
+                rel = os.path.relpath(target, folder)
+                log("")
+                log(f"=== [{idx}/{total_folders}] {'（所选文件夹本身）' if rel == '.' else rel} ===")
+            sub = _process_folder_impl(
+                target, False, convert_pdf, summarize, log_queue,
+                cancel=cancel, workers=workers, preconvert=preconvert,
+                base_done=base_done, grand_total=grand_total,
+            ) or _zero_stats(workers)
+            for key in _SUMMABLE_STATS:
+                agg[key] += sub.get(key, 0) or 0
+            base_done += _count_pending(target)
+
+        agg["elapsed"] = time.perf_counter() - t_start
+
+        if total_folders > 1:
+            log("")
+            log("=== 全部文件夹处理完成 ===")
+            log(f"共处理 {total_folders} 个文件夹、{agg['total']} 张图片；"
+                f"成功下载 {agg['success']} 张、未下成 {agg['no_pdf']} 张、"
+                f"无二维码 {agg['unrecognized']} 张。")
+
+        # 打开文件夹只在全部结束后做一次：多文件夹时逐个子文件夹弹窗口会把桌面刷屏
+        if open_after and not cancel.cancelled:
+            try:
+                os.startfile(folder)
+                log(f"已打开文件夹：{folder}")
+            except Exception as e:
+                log(f"打开文件夹失败：{e}")
+
+        finish(agg)
     except Exception as e:
         try:
             log_queue.put(("log", f"处理过程出现未预期的错误，本次任务已中止：{e}"))
@@ -2566,8 +2756,21 @@ def _process_folder_impl(
     cancel: "CancelToken | None" = None,
     workers: int = DEFAULT_WORKERS,
     preconvert: bool = True,
+    base_done: int = 0,
+    grand_total: int = 0,
 ):
-    """处理整个文件夹：每张图片一个任务并发执行，结果由本线程统一汇总。
+    """处理**单个**文件夹：每张图片一个任务并发执行，结果由本线程统一汇总。
+
+    ⚠️ 自己不往队列里放 ("stats",) / ("done",)：统计以**返回值**交给外层
+    process_folder，由它在全部文件夹跑完后统一入队一次 —— 多文件夹时界面只该收到
+    一份汇总，否则结束弹窗会弹好几次、按钮也会被反复复位。
+
+    base_done / grand_total 用于多文件夹时的**全局进度**：把本文件夹内部的
+    「第 current / total 张」换算成「全局第 base_done+current 张 / 共 grand_total 张」。
+    两者都为 0（单文件夹调用）时保持原来的 per-folder 进度语义。
+
+    open_after 在本函数内**不生效**（打开文件夹由外层在全部结束后统一做一次，
+    否则多文件夹会逐个子文件夹弹窗口刷屏）；保留该参数只为兼容既有调用签名。
 
     前置步骤（preconvert=True 时）：目标文件夹里只要有 PDF，就先做「PDF → JPG」转换，
     并把转换结果与原有图片一起收进「处理后」子文件夹，再在该子文件夹内执行后续全部流程；
@@ -2581,15 +2784,22 @@ def _process_folder_impl(
 
     def progress(current: int, total: int):
         # 第 4 位是并发路数：界面已不再展示，保留在队列里供诊断用
-        log_queue.put(("progress", current, total, workers))
+        if grand_total:
+            log_queue.put(("progress", min(base_done + current, grand_total),
+                           grand_total, workers))
+        else:
+            log_queue.put(("progress", base_done + current, total, workers))
 
     cancel = cancel if cancel is not None else CancelToken()
     workers = max(1, int(workers))
 
     if not folder or not os.path.isdir(folder):
         log("错误：请选择一个有效的文件夹路径。")
-        log_queue.put(("done",))
-        return
+        return _zero_stats(workers)
+
+    # 运行日志跟着**正在处理的这个文件夹**走。这里要在「前置转换」之前通知：转换后
+    # folder 会变成「处理后」子目录，而用户想找的日志始终在他自己那个文件夹里。
+    log_queue.put(("logdir", folder))
 
     # ★ 前置：PDF → JPG 转换（有 PDF 时才动作；全图片直接跳过）
     source_pdfs: list = []
@@ -2606,8 +2816,7 @@ def _process_folder_impl(
             _remove_dedup_cache(os.path.join(folder, "PDF"), log=log)
             _remove_dedup_cache(os.path.join(folder, "PDF"), log=log,
                                 file_name=SHOT_CACHE_FILE_NAME)
-            log_queue.put(("done",))
-            return
+            return _zero_stats(workers)
 
     pdf_dir = os.path.join(folder, "PDF")
     img_dir = os.path.join(pdf_dir, "图片") if convert_pdf else None
@@ -2633,14 +2842,7 @@ def _process_folder_impl(
         # 注意：此处尚未创建 dedup 台账，只做文件级清理，不要去碰 dedup。
         _remove_dedup_cache(pdf_dir, log=log)
         _remove_dedup_cache(pdf_dir, log=log, file_name=SHOT_CACHE_FILE_NAME)
-        log_queue.put(("stats", {
-            "total": 0, "success": 0, "skipped": 0, "no_pdf": 0, "unrecognized": 0,
-            "other": 0, "error": 0, "cancelled": 0, "dup_shots": 0,
-            "multi_qr": 0, "extra_pdfs": 0,
-            "workers": workers, "elapsed": 0.0,
-        }))
-        log_queue.put(("done",))
-        return
+        return _zero_stats(workers)
 
     # 输出基名唯一化：避免 a.jpg 与 a.png 同时写同一个 a.pdf（并发下会写坏文件）
     out_bases = _unique_out_bases(files)
@@ -2817,30 +3019,20 @@ def _process_folder_impl(
     for line in summary:
         log(line)
 
-    # 把结构化统计传给 GUI（用于结束弹窗）
-    log_queue.put(("stats", dict(stats)))
-
     if cancel.cancelled:
-        log("已停止：跳过汇总与打开文件夹。再次点「开始处理」会接着处理剩余图片，"
+        log("已停止：跳过汇总。再次点「开始处理」会接着处理剩余图片，"
             "汇总时会扫描 PDF 文件夹里的全部发票，已下载的结果不会丢失。")
-    else:
-        if summarize:
-            log("--- 开始汇总发票 ---")
-            try:
-                out = summarize_invoices(pdf_dir, log=log)
-                if out:
-                    log(f"发票汇总已生成：{os.path.basename(out)}")
-            except Exception as e:
-                log(f"汇总发票出错：{e}")
+    elif summarize:
+        log("--- 开始汇总发票 ---")
+        try:
+            out = summarize_invoices(pdf_dir, log=log)
+            if out:
+                log(f"发票汇总已生成：{os.path.basename(out)}")
+        except Exception as e:
+            log(f"汇总发票出错：{e}")
 
-        if open_after:
-            try:
-                os.startfile(folder)
-                log("已打开目标文件夹。")
-            except Exception as e:
-                log(f"打开文件夹失败：{e}")
-
-    log_queue.put(("done",))
+    # 统计以返回值交给外层 process_folder 统一入队（多文件夹时界面只该收到一份汇总）
+    return stats
 
 
 class InvoiceQrToolApp:
@@ -3175,6 +3367,9 @@ class InvoiceQrToolApp:
                 item = self.log_queue.get_nowait()
                 if item[0] == "log":
                     self._log(item[1])
+                elif item[0] == "logdir":
+                    # worker 开始处理一个新文件夹：运行日志跟着切到该文件夹去
+                    bind_run_log_dir(item[1])
                 elif item[0] == "progress":
                     current, total = item[1], item[2]
                     # 第 4 位是并发路数：界面已不再展示，保留在队列里供诊断用
@@ -3264,9 +3459,9 @@ class InvoiceQrToolApp:
             "本次识别结果统计：\n\n"
             f"总计识别图片：{s['total']} 张\n"
             f"成功下载 PDF（原文件名不变）：{s['success']} 张\n"
-            f"有二维码但未下到 PDF（非票-）：{s['no_pdf']} 张\n"
-            f"图上没有二维码（无-）：{s['unrecognized']} 张\n"
-            f"二维码非网址（非票-）：{s['other']} 张"
+            f"有二维码但未下到 PDF（{PREFIX_NOT_TICKET}）：{s['no_pdf']} 张\n"
+            f"图上没有二维码（{PREFIX_NONE}）：{s['unrecognized']} 张\n"
+            f"二维码非网址（{PREFIX_NOT_TICKET}）：{s['other']} 张"
         )
         if s.get("error"):
             msg += f"\n处理出错（详见日志）：{s['error']} 张"
@@ -3310,6 +3505,9 @@ class InvoiceQrToolApp:
         self.progress.set_value(0)
         self.progress_var.set("正在准备…")
         self._start_elapsed_timer()
+        # 新一轮开始：先解开上一轮的日志绑定，否则开头这几行会写进上一轮那个文件夹；
+        # 随后 worker 进入每个文件夹时会通过 "logdir" 事件重新绑定。
+        bind_run_log_dir(None)
         self._log("=== 开始处理 ===")
 
         self.worker_thread = threading.Thread(
