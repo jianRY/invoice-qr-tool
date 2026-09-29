@@ -785,18 +785,15 @@ def make_assets(new_tag):
         "asset": portable_name,
         "notes": changelog,
         # url / setup_url = 主源（GitHub Release 直链，客户端再展开加速镜像择优）
-        # fallback_url / setup_fallback_url = 兜底源（官网自有服务器直链）
-        #   客户端最终顺序：加速镜像 → GitHub 原站 → 官网服务器（见 order_download_urls）
+        # ⚠️ 不写入 fallback_url / site_url：update.json 是**随 Release 公开的资产**，
+        #    把私有更新地址写进去等于把它公开。客户端只走 url + 加速镜像。
         "url": "{}/releases/download/{}/{}".format(PROJECT_URL, new_tag, portable_name),
-        "fallback_url": "{}/{}".format(SERVER_FILES, portable_name),
         "release_url": "{}/releases/tag/{}".format(PROJECT_URL, new_tag),
-        "site_url": SITE_URL + "/",
         "size": os.path.getsize(PORTABLE_OUT),
         "sha256": portable_sha,
         "published": time.strftime("%Y-%m-%d %H:%M:%S"),
         "setup_url": "{}/releases/download/{}/{}".format(
             PROJECT_URL, new_tag, installer_name),
-        "setup_fallback_url": "{}/{}".format(SERVER_FILES, installer_name),
     }
     with open(os.path.join(ASSET_DIR, "update.json"), "w", encoding="utf-8") as f:
         json.dump(update_meta, f, ensure_ascii=False, indent=2)
