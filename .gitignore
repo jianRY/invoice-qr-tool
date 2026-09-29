@@ -21,6 +21,14 @@ outputs/
 # ---- 敏感/自动生成（不入库） ----
 .github_token
 .last_release_commit
+# 签名证书、私钥与口令（放用户级 ~/.workbuddy/signing/，任何情况下都不入库）
+signing/
+*.pfx
+*.p12
+pfx_pass.txt
+# 一次性开发脚本 / 本地补丁（含本机绝对路径，不入库）
+make_update.py
+*.local.py
 # CLI 自检（--test）在程序目录写的运行日志，属临时产物
 test_run.log
 # GUI 版实时落盘的运行日志（排查卡死用），属临时产物

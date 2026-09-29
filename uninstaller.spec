@@ -2,10 +2,12 @@
 
 
 a = Analysis(
-    ['D:/dev/发票处理/installer_src/app_uninstaller.py'],
-    pathex=[],
+    ['installer_src/app_uninstaller.py'],
+    # spec 所在目录加入搜索路径；下方路径一律用**相对项目根**的写法，
+    # 避免把本机绝对路径写进公开仓库（克隆到任何目录都能构建）。
+    pathex=[SPECPATH],
     binaries=[],
-    datas=[('D:/dev/发票处理/app_icon.ico', '.')],
+    datas=[('app_icon.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,5 +38,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-    icon=['D:/dev/发票处理/app_icon.ico'],
+    icon=['app_icon.ico'],
 )

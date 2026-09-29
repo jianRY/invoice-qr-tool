@@ -17,7 +17,7 @@
   · 下载顺序：加速镜像（gh-proxy.com / ghfast.top / ghproxy.net，实测择优）
     → GitHub 原站直链 → 官网自有服务器
   · 校验：sha256 优先取 update.json；兜底路径从 Release 正文的 `SHA256:` 行解析
-  · 自有服务器 download.internal 同时服务官网手动下载按钮与自动更新的最后兜底
+  · 自有下载站同时服务官网手动下载按钮与自动更新的最后兜底（地址见 iqr_update.SITE_URL）
 
 安全护栏：
   - 本地目标版本必须 > GitHub 线上最新版本，否则拒绝发布（防止用旧代码覆盖新版）。
@@ -43,6 +43,7 @@ import os
 import re
 import sys
 import json
+import glob
 import shutil
 import subprocess
 import urllib.request
@@ -53,6 +54,9 @@ import uuid
 import time
 
 # ---------------- 路径常量 ----------------
+#
+# ⚠️ 本文件属**公开仓库**。禁止写入本机绝对路径（用户名 / 私人目录 / 其他项目名）——
+#    这类信息一律「运行时推导」或「环境变量覆盖」，见下方三个 _pick_* 函数。
 def _pick_git():
     """挑选可用的 git 可执行文件。
 
@@ -60,20 +64,68 @@ def _pick_git():
     remote-https helper —— 补 GIT_EXEC_PATH 只会把报错变成「静默失败」
     （returncode=128、stdout/stderr 全空），无人值守发版时会误判成功。
     系统 Git 的 helper 位于 mingw64/libexec/git-core，布局正确，实测可用。
+
+    PortableGit（WorkBuddy 内置）的版本目录名不固定，故按 `~` 展开后通配扫描，
+    不写死具体版本号。
     """
-    for c in (r"C:\Program Files\Git\cmd\git.exe",
-              r"C:\Program Files (x86)\Git\cmd\git.exe",
-              r"C:\Users\<user>\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git.exe"):
+    cands = [r"C:\Program Files\Git\cmd\git.exe",
+             r"C:\Program Files (x86)\Git\cmd\git.exe"]
+    cands += sorted(glob.glob(os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "binaries", "PortableGit",
+        "versions", "*", "mingw64", "bin", "git.exe")), reverse=True)
+    for c in cands:
         if os.path.isfile(c):
             return c
     return "git"
 
 
+def _pick_wcred(git_path):
+    """git-credential-wincred.exe 的位置。
+
+    git 的安装布局不止一种，逐一探测：与 git 同级、Git for Windows 的
+    mingw64/bin 与 mingw64/libexec/git-core、WorkBuddy 内置 PortableGit
+    （版本目录名不固定，用通配扫描）。全找不到才交回 PATH 查找。
+    """
+    cands = []
+    if git_path and git_path != "git":
+        d = os.path.dirname(git_path)
+        base = os.path.dirname(d)      # 例如 .../Git/cmd -> .../Git
+        cands.append(os.path.join(d, "git-credential-wincred.exe"))
+        for sub in ("mingw64/bin", "mingw64/libexec/git-core"):
+            cands.append(os.path.join(base, *sub.split("/"),
+                                      "git-credential-wincred.exe"))
+    cands += sorted(glob.glob(os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "binaries", "PortableGit",
+        "versions", "*", "mingw64", "bin", "git-credential-wincred.exe")), reverse=True)
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return "git-credential-wincred"
+
+
+def _pick_sign_py(root):
+    """exe 自签名脚本位置。
+
+    优先环境变量 IQR_SIGN_PY；否则依次找项目内 signing/ 与用户级 ~/.workbuddy/signing/。
+    证书、私钥与密码与该脚本同级，**绝不入库**。
+    """
+    cands = []
+    env = os.environ.get("IQR_SIGN_PY")
+    if env:
+        cands.append(env)
+    cands.append(os.path.join(root, "signing", "sign.py"))
+    cands.append(os.path.join(os.path.expanduser("~"), ".workbuddy", "signing", "sign.py"))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return cands[0]
+
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 VENV_PY = os.path.join(ROOT, "envs", "default", "Scripts", "python.exe")
 GIT = _pick_git()
-WCRED = r"C:\Users\<user>\.workbuddy\binaries\PortableGit\versions\1.2.0\mingw64\bin\git-credential-wincred.exe"
-SIGN_PY = r"<redacted-path>\.pybuild_cache\signing\sign.py"
+WCRED = _pick_wcred(GIT)
+SIGN_PY = _pick_sign_py(ROOT)
 APP_NAME = "发票二维码工具"
 PROJECT_URL = "https://github.com/jianRY/invoice-qr-tool"
 OWNER = "jianRY"
@@ -90,14 +142,20 @@ LAST_RELEASE_COMMIT = os.path.join(ROOT, ".last_release_commit")
 # 代理：不再硬编码（2026-09-22 重构，见下方 pick_proxy 的说明）
 PROXY = None
 
-# 自有下载站（阿里云 download.internal，见「更新源」项目）：
-#   /files/<资产名>           双 exe 由服务器定时脚本从 Release 镜像过去
-#   /updates/qr.json          客户端**最后**兜底的元数据源（由服务器脚本生成）
+# 自有下载站：地址的唯一来源是 iqr_update.SITE_URL（客户端与发版脚本共用同一个值，
+# 避免两处各写一份、改一处漏一处）。
+#   /files/<资产名>     双 exe 由服务器定时脚本从 Release 镜像过去
+#   /updates/qr.json    客户端**最后**兜底的元数据源（由服务器脚本生成）
 #
 # 用途（2026-09-24 定稿）：官网手动下载按钮直接指向 /files/；
 # 自动更新里的角色是「最末兜底」—— 下载顺序为 加速镜像 → GitHub 原站 → 这里。
 # 客户端只在镜像与原站全挂时才会用到这台服务器。
-SITE_URL = "http://download.internal:8888"
+# ⚠️ 客户端必须知道该地址才能下载，故无法从公开源码中隐藏；
+#    服务器侧安全依赖自身加固（面板访问限制、SSH 端口、防火墙），不依赖此处保密。
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from iqr_update import SITE_URL   # noqa: E402
+
 SERVER_FILES = SITE_URL + "/files"
 
 # 代理全局生效（urllib / requests / git 都用）。

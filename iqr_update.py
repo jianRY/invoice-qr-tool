@@ -41,10 +41,12 @@ RELEASE_UPDATE_JSON = (
     % (GITHUB_REPO_OWNER, GITHUB_REPO_NAME)
 )
 
-# 自有下载站（阿里云 download.internal，见「更新源」项目）。
+# 自有下载站（官网手动下载与自动更新的最末兜底源）。
 # 2026-09-24 定位：**最末兜底**。官网的手动下载按钮直接指向它（国内直连快），
-# 自动更新则把它放在「加速镜像 → GitHub 原站」之后兜底 —— 万一镜像全挂、
+# 自动更新则把它放在「加速镜像 → GitHub 原站」之后 —— 万一镜像全挂、
 # GitHub 也连不上，还能从这台服务器把更新包拉下来。
+# ⚠️ 客户端必须知道该地址才能下载，无法从公开源码中隐藏；
+#    服务器安全靠自身加固（面板访问限制 / SSH 端口 / 防火墙），不依赖此处保密。
 SITE_URL = "http://download.internal:8888"
 SERVER_FILES = SITE_URL + "/files"
 SERVER_UPDATE_JSON = SITE_URL + "/updates/qr.json"
