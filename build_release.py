@@ -156,7 +156,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from iqr_update import SITE_URL   # noqa: E402
 
-SERVER_FILES = SITE_URL + "/files"
+SERVER_FILES = (SITE_URL + "/files") if SITE_URL else ""
 
 # 代理全局生效（urllib / requests / git 都用）。
 #

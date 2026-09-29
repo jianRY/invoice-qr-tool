@@ -33,3 +33,9 @@ make_update.py
 test_run.log
 # GUI 版实时落盘的运行日志（排查卡死用），属临时产物
 运行日志.txt
+
+# 本机私有端点（源站地址等，绝不入库）
+_endpoints.py
+
+# 构建缓存与本机配置（含自有站地址，绝不入库）
+.pybuild_cache/

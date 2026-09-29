@@ -47,9 +47,12 @@ RELEASE_UPDATE_JSON = (
 # GitHub 也连不上，还能从这台服务器把更新包拉下来。
 # ⚠️ 客户端必须知道该地址才能下载，无法从公开源码中隐藏；
 #    服务器安全靠自身加固（面板访问限制 / SSH 端口 / 防火墙），不依赖此处保密。
-SITE_URL = "http://download.internal:8888"
-SERVER_FILES = SITE_URL + "/files"
-SERVER_UPDATE_JSON = SITE_URL + "/updates/qr.json"
+try:
+    from _endpoints import SITE_URL          # 本机私有，.gitignore 已排除
+except Exception:
+    SITE_URL = ""
+SERVER_FILES = (SITE_URL + "/files") if SITE_URL else ""
+SERVER_UPDATE_JSON = (SITE_URL + "/updates/qr.json") if SITE_URL else ""
 
 # 更新链路优先级（2026-09-24 定稿）：
 #   下载：加速镜像（实测择优）→ GitHub 原站直链 → 官网自有服务器
