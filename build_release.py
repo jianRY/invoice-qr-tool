@@ -447,6 +447,63 @@ def push_or_fail(remote, ref, what, attempts=5):
             (last.stdout or "").strip()[-800:], (last.stderr or "").strip()[-800:]))
 
 
+# ---------------- 提交前敏感信息闸门 ----------------
+# ⚠️ 本仓库公开：开发机信息/凭据一旦推上去，历史就洗不掉（要 force push 重写、
+#    协作者重新 clone）。所以命中时是**中止发布**，不是警告。
+SENSITIVE_RULES = (
+    (r"[Cc]:[\\/]+Users[\\/]+[A-Za-z0-9_.\-]{2,}", "本机用户目录"),
+    (r"(?i)[a-z]:[\\/]+workbuddy[\\/]", "本地开发盘路径"),
+    (r"(?i)\bgh[pousr]_[A-Za-z0-9]{20,}\b", "GitHub 令牌"),
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥内容"),
+    (r"(?i)\b(password|passwd|pwd|secret|api[_-]?key)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']",
+     "疑似硬编码凭据"),
+)
+# 不该出现在公开仓库里的文件名
+SENSITIVE_PATHS = (r"(?i)\.(pfx|pvk|pem|key)$", r"(?i)token\.txt$",
+                   r"(?i)local_config\.json$", r"(?i)^\.env", r"(?i)gh_token")
+# 放行：模板 / 占位符（不是真值）
+SENSITIVE_ALLOW = (r"x-access-token:%s@", r"[Cc]:[\\/]+Users[\\/]+<")
+
+
+def scan_staged_sensitive():
+    """扫描暂存内容，命中开发机信息/凭据就返回告警列表（空列表 = 干净）。
+
+    只看 diff 的新增行，避免被历史内容反复报错；文件名单独查一遍，
+    防止 *.pfx / token.txt / local_config.json 被误加进来。
+    """
+    hits = []
+    names = git("diff", "--cached", "--name-only", check=False).stdout or ""
+    for n in names.splitlines():
+        n = n.strip().strip('"')
+        if n and any(re.search(p, n) for p in SENSITIVE_PATHS):
+            hits.append(("不该入库的文件", n))
+    diff = git("diff", "--cached", "-U0", check=False).stdout or ""
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:]
+        if any(re.search(a, body) for a in SENSITIVE_ALLOW):
+            continue
+        for pat, label in SENSITIVE_RULES:
+            for m in re.finditer(pat, body):
+                hits.append((label, m.group(0)[:70]))
+    return hits
+
+
+def guard_staged(where):
+    """公开仓库的硬闸门：提交前扫一遍暂存内容，命中就中止发布。"""
+    if os.environ.get("IQR_SKIP_SCAN"):
+        return
+    hits = scan_staged_sensitive()
+    if not hits:
+        return
+    print("[闸门] ⚠ 暂存内容命中敏感信息（{}），已中止发布（共 {} 处）：".format(where, len(hits)))
+    for label, seg in hits[:20]:
+        print("        · {} -> {}".format(label, seg))
+    raise RuntimeError(
+        "[闸门] 敏感信息拦截：修掉后重新发布；确认是误报可临时设 IQR_SKIP_SCAN=1 跳过。")
+
+
 def current_branch():
     return git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
 
@@ -889,6 +946,7 @@ def publish(new_tag, token):
     with open(LAST_RELEASE_COMMIT, "w", encoding="utf-8") as f:
         f.write(head_commit() + "\n")
     git("add", "-A", check=False)
+    guard_staged("发布基线提交")
     r = git("commit", "-m", "chore: 记录 {} 发布提交".format(new_tag), check=False)
     if r.returncode == 0:
         try:
@@ -993,6 +1051,7 @@ def main():
             return
         write_version(new_tag.lstrip("v"))
         git("add", "-A", check=False)
+        guard_staged("发布提交")
         git("commit", "-m", "release: {}".format(new_tag), check=False)
         git("tag", new_tag, check=False)
         publish(new_tag, token)
