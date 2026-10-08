@@ -3,6 +3,16 @@ build/
 dist/
 __pycache__/
 
+# ---- PyInstaller 自动生成的 spec（不入库） ----
+# ⚠️ build_release.py 用命令行参数构建卸载程序 / 安装程序时，PyInstaller 会在
+#    **当前目录自动生成** uninstaller.spec 与 发票二维码工具_安装程序.spec，
+#    而它写进去的是**绝对路径**（形如 D:/<盘符>/.../installer_src/xxx.py）。
+#    这两个文件曾因此反复把本机路径带回仓库（2026-09-29 清过一次，
+#    2026-10-09 发版前又被隐私闸门拦下）。它们是可随时重建的中间产物，
+#    故一律不入库 —— 主程序那份「发票二维码工具.spec」是手写的，仍正常入库。
+uninstaller.spec
+发票二维码工具_安装程序.spec
+
 # ---- 项目私有记忆（不入库） ----
 .workbuddy/
 
@@ -21,6 +31,9 @@ outputs/
 # ---- 敏感/自动生成（不入库） ----
 .github_token
 .last_release_commit
+# 用户设置（源码运行时生成在程序目录；打包后在 exe 目录，属用户本地数据）
+settings.json
+settings.json.tmp
 # 签名证书、私钥与口令（放用户级 ~/.workbuddy/signing/，任何情况下都不入库）
 signing/
 *.pfx

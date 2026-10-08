@@ -10,6 +10,7 @@ PyInstaller 打包会沿 import 自动收集，spec 无需改动。
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -484,8 +485,78 @@ def send_to_recycle_bin(path: str) -> bool:
                 pass
 
 
+# ---------------- 用户设置（整段与项目无关，可复制到其他项目的更新模块） ----------------
+# 目前只存一项：「更新后是否自动删除旧版本文件」。
+# 放在**程序同目录**（绿色便携，拷到 U 盘也跟着走）；装到 Program Files 时该目录
+# 只读，写入会失败 —— 此时静默降级为「本次生效、不落盘」，绝不影响更新本身。
+#
+# ⚠️ 路径**不能**用 os.path.dirname(sys.executable)：源码直接运行时那是 python.exe 的
+#    安装目录（通常只读），设置根本写不进去。打包后 PyInstaller 会置 sys.frozen。
+SETTINGS_FILE = "settings.json"
+DEFAULT_DELETE_OLD = True      # 默认勾选 = 维持既有行为（更新完自动把旧版送回收站）
+
+
+def _app_dir() -> str:
+    """程序所在目录：打包后是 exe 目录，源码运行时是本文件所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def settings_path() -> str:
+    """设置文件的绝对路径。"""
+    return os.path.join(_app_dir(), SETTINGS_FILE)
+
+
+def load_settings() -> dict:
+    """读取设置字典。文件不存在 / 内容损坏 / 无权限一律返回空字典，绝不抛异常 ——
+    配置文件出问题不该让软件起不来。"""
+    try:
+        p = settings_path()
+        if not os.path.isfile(p):
+            return {}
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> bool:
+    """写入设置。成功返回 True；失败返回 False（调用方据此降级，不打断更新）。
+
+    先写 .tmp 再 os.replace 原子替换 —— 避免写到一半被下一次读取撞见半个 JSON。
+    """
+    try:
+        p = settings_path()
+        parent = os.path.dirname(p)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def get_delete_old(default: bool = DEFAULT_DELETE_OLD) -> bool:
+    """读「更新后是否自动删除旧版本文件」。缺字段 / 类型不对一律退回 default。"""
+    v = load_settings().get("delete_old_version")
+    return default if v is None else bool(v)
+
+
+def set_delete_old(value: bool) -> bool:
+    """保存该项设置；返回是否真的落盘了（False = 目录只读，本次仍生效但不持久）。"""
+    data = load_settings()
+    data["delete_old_version"] = bool(value)
+    return save_settings(data)
+
+
 def perform_update(download_urls, latest_version: tuple, on_event=None,
-                   cancel=None, sha256: str = "") -> bool:
+                   cancel=None, sha256: str = "",
+                   delete_old: bool = DEFAULT_DELETE_OLD) -> bool:
     """下载最新版本的 EXE，保存到当前程序同一目录（文件名带版本号），
     并把旧的 EXE 移动到回收站。
 
@@ -496,6 +567,11 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
     sha256: 更新包期望的 SHA256（取自 update.json，小写十六进制）。非空时下载完先校验，
         不一致就当次更新失败并丢弃半截包——网络中途断流 / 缓存坏包不会再被装上。
         为空（GitHub API 兜底源、老元数据）则跳过校验。
+    delete_old: 更新成功后是否自动删除旧版本文件。True（默认，= 既有行为）把旧 exe
+        送进回收站；False 则原样留在程序目录，由用户自行处理。
+
+        实现上只是「给新进程带不带 --recycle-old 参数」—— 新进程没收到该参数就不会
+        回收任何文件，因此不需要新增任何删除逻辑。老调用方不传该参数即维持原行为。
 
     流程（cancel 只在能干净收尾的阶段生效）：
       ① 下载 → 可取消：立刻断开、删除半截 .part，等于什么都没发生；
@@ -654,8 +730,12 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
 
         emit({"type": "detail",
               "text": f"新版本已保存为：{os.path.basename(new_exe)}"})
-        emit({"type": "detail",
-              "text": "旧版本将被移入回收站；软件即将切换到新版本…"})
+        if delete_old:
+            emit({"type": "detail",
+                  "text": "旧版本将被移入回收站；软件即将切换到新版本…"})
+        else:
+            emit({"type": "detail",
+                  "text": f"按当前设置保留旧版本文件（未删除）：{os.path.basename(current_exe)}"})
         emit({"type": "done", "ok": True})
 
         # 启动新版本并把“当前（旧）exe 路径”交给它回收；随后退出旧进程，
@@ -672,8 +752,11 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
             for _k in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE",
                        "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS", "_MEIPASS2"):
                 child_env.pop(_k, None)
+            # delete_old=False 时**不带** --recycle-old：新进程据此什么也不回收，
+            # 旧 exe 就留在原目录里（见 main() 里对该参数的解析）。
+            launch_args = [new_exe, "--recycle-old", current_exe] if delete_old else [new_exe]
             subprocess.Popen(
-                [new_exe, "--recycle-old", current_exe],
+                launch_args,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

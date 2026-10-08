@@ -155,7 +155,10 @@ SKIN = PRESETS["标准"]
 def rr(cv, x1, y1, x2, y2, r, fill, tags=None):
     """圆角矩形填充：4 个扇形 + 2 个矩形拼合（outline 同色，避免接缝）。"""
     tags = tags or ()
-    r = max(0, r)
+    # ⚠️ 半径必须收敛到短边一半以内：控件被 grid/pack 压到宽或高小于 2r 时，
+    #    create_arc 的 x2<x1 / y2<y1 会画出翻转的扇形，圆角变成怪异的尖角。
+    #    （DPI 缩放后 u() 过的固定半径遇上小尺寸控件最容易触发）
+    r = max(0, min(int(r), (int(x2) - int(x1)) // 2 - 1, (int(y2) - int(y1)) // 2 - 1))
     kw = dict(fill=fill, outline=fill, tags=tags)
     d = 2 * r
     if r > 0:
@@ -181,10 +184,14 @@ def text_w(cv, text, font):
     return (b[2] - b[0]) if b else 0
 
 
-def shadow(cv, x1, y1, x2, y2, r, base_bg="#F4F6FA"):
-    """伪投影：卡片下方叠 3 层渐淡圆角块（Tk 无真阴影）。"""
+def shadow(cv, x1, y1, x2, y2, r, base_bg="#F4F6FA", tags=None):
+    """伪投影：卡片下方叠 3 层渐淡圆角块（Tk 无真阴影）。
+
+    ⚠️ tags 必须透传给 rr：Card 每次重绘只 delete("cardbg")，投影若不带 tag
+    就会一轮轮地留在画布上（旧投影还会盖在新卡片之上形成鬼影，且 item 数无限增长）。
+    """
     for i, tone in enumerate(("#E7EBF3", "#ECEFF6", "#F1F4F9"), start=1):
-        rr(cv, x1 + i, y1 + i + 1, x2 + i, y2 + i + 1, r, tone)
+        rr(cv, x1 + i, y1 + i + 1, x2 + i, y2 + i + 1, r, tone, tags)
 
 
 def logo_mark(cv, x, y, size, sk, fill=None, line_color="#FFFFFF"):
@@ -241,7 +248,7 @@ class Card(tk.Canvas):
         if w < 4 or h < 4:
             return
         if self.sk.shadow:
-            shadow(self, 0, 0, w - u(3), h - u(3), self.radius)
+            shadow(self, 0, 0, w - u(3), h - u(3), self.radius, tags=("cardbg",))
         rr_border(self, 0, 0, w - 1, h - 1, self.radius, self.sk.border,
                   self.sk.card, ("cardbg",))
         self.tag_lower("cardbg")

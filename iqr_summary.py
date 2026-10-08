@@ -209,34 +209,38 @@ def parse_invoice(pdf_path):
         with pdfplumber.open(pdf_path) as pdf:
             # 用 _Pages 包一层：8 个字段轮流查询，每页文本只规范化一次
             pages_words = _Pages([page.extract_words() for page in pdf.pages])
-    except Exception as e:
-        return fields, f"打开失败: {e}"
 
-    fields["交款人"] = _field_search(pages_words, [("交款人：", False)])
-    fields["票据号码"] = _field_search(
-        pages_words, [("票据号码：", False), ("所属电子票据号码:", False)])
-    raw_date = _field_search(pages_words, [("开票日期：", True)])
-    fields["开票日期"] = _normalize_date(raw_date) if raw_date else None
-    raw_amount = _field_search(pages_words, [("小写", False)])
-    lower = _to_num(raw_amount) if raw_amount else None
-    # 小写解析失败时，用「金额合计（大写）」兜底，避免金额漏识别
-    if lower is None:
-        raw_upper = _field_search(pages_words, [("大写", False)])
-        upper = _cn_capital_to_num(raw_upper) if raw_upper else None
-        if upper is not None:
-            lower = upper
-    fields["金额合计（小写）"] = lower
-    fields["医保统筹基金支付"] = _to_num(
-        _field_search(pages_words, [("医保统筹基金支付：", False)]))
-    # 大病保险支付：与「医保统筹基金支付」同属票据右下角的基金支付区，
-    # 版式与取值规则一致，故用同样的方式识别（全角/半角冒号由 _norm_colon 统一）。
-    # 识别到该栏（含 0.00）即记为数值；整份票据没有这一栏时为 None，
-    # 汇总表据此决定是否输出该列 —— 没识别到就整体忽略，不留空列。
-    fields["大病保险支付"] = _to_num(
-        _field_search(pages_words, [("大病保险支付：", False)]))
-    # 医疗救助支付：同区块、同版式，同样处理（识别到 0.00 也算"有这一类目"）
-    fields["医疗救助支付"] = _to_num(
-        _field_search(pages_words, [("医疗救助支付：", False)]))
+        # ⚠️ 字段提取也要在 try 内：畸形 / 损坏的 PDF 会返回缺字段的 word dict，
+        #    _field_search 里的 gather_line 会去访问 x["top"] / x["x0"] 而抛异常。
+        #    放在 try 外的话，一份坏票据会中断整个 for 循环 —— 前面已解析成功的
+        #    几十张全部白做。这里改成单张失败只跳过这一张。
+        fields["交款人"] = _field_search(pages_words, [("交款人：", False)])
+        fields["票据号码"] = _field_search(
+            pages_words, [("票据号码：", False), ("所属电子票据号码:", False)])
+        raw_date = _field_search(pages_words, [("开票日期：", True)])
+        fields["开票日期"] = _normalize_date(raw_date) if raw_date else None
+        raw_amount = _field_search(pages_words, [("小写", False)])
+        lower = _to_num(raw_amount) if raw_amount else None
+        # 小写解析失败时，用「金额合计（大写）」兜底，避免金额漏识别
+        if lower is None:
+            raw_upper = _field_search(pages_words, [("大写", False)])
+            upper = _cn_capital_to_num(raw_upper) if raw_upper else None
+            if upper is not None:
+                lower = upper
+        fields["金额合计（小写）"] = lower
+        fields["医保统筹基金支付"] = _to_num(
+            _field_search(pages_words, [("医保统筹基金支付：", False)]))
+        # 大病保险支付：与「医保统筹基金支付」同属票据右下角的基金支付区，
+        # 版式与取值规则一致，故用同样的方式识别（全角/半角冒号由 _norm_colon 统一）。
+        # 识别到该栏（含 0.00）即记为数值；整份票据没有这一栏时为 None，
+        # 汇总表据此决定是否输出该列 —— 没识别到就整体忽略，不留空列。
+        fields["大病保险支付"] = _to_num(
+            _field_search(pages_words, [("大病保险支付：", False)]))
+        # 医疗救助支付：同区块、同版式，同样处理（识别到 0.00 也算"有这一类目"）
+        fields["医疗救助支付"] = _to_num(
+            _field_search(pages_words, [("医疗救助支付：", False)]))
+    except Exception as e:
+        return fields, f"解析失败: {e}"
 
     return fields, None
 
@@ -476,6 +480,12 @@ def _write_summary_excel(rows, out_path, include_cond=()):
         row_idx = ws.max_row
         for c in range(1, ncols + 1):
             cell = ws.cell(row=row_idx, column=c)
+            # ⚠️ 明细里的文本全部来自 PDF / 文件名，属用户可控内容。openpyxl 见到
+            #    以 "=" 开头的字符串会把 data_type 判成 'f'（真公式）：既是安全隐患，
+            #    又因为 _inject_formula_cache 的缓存里没有它，非重算查看器里显示空白。
+            #    这里统一把文本格显式定为字符串类型，堵住公式注入。
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
             cell.border = _SUMMARY_BORDER
             cell.alignment = _SUMMARY_CENTER
         # 序号列写的是整数，套整数格式（不显示小数）
@@ -650,7 +660,10 @@ def summarize_invoices(pdf_folder: str, log=print):
             rows.append({"文件名": name, "交款人": "解析失败"})
             continue
         row = {"文件名": name}
-        for fld in _SUMMARY_BASE_FIELDS[1:] + list(_SUMMARY_COND_FIELDS):
+        # ⚠️ 用「按名字过滤」而不是 `_SUMMARY_BASE_FIELDS[1:]`：切片隐含
+        #    「文件名必须永远在第 0 位」，日后谁调整一下列顺序就会静默丢列/多列。
+        for fld in [x for x in _SUMMARY_BASE_FIELDS if x != "文件名"] \
+                + list(_SUMMARY_COND_FIELDS):
             v = fields.get(fld)
             row[fld] = v if v is not None else ""
         rows.append(row)
@@ -664,7 +677,14 @@ def summarize_invoices(pdf_folder: str, log=print):
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(pdf_folder, f"发票汇总_{ts}.xlsx")
-    _write_summary_excel(rows, out_path, include_cond=include_cond)
+    # ⚠️ 导出失败（表正被 WPS/Excel 打开 → PermissionError、目录只读、磁盘满…）
+    #    不能把异常抛回主流程：前面几十张 PDF 的解析就全白做了，而「汇总」只是
+    #    可选的附加步骤，PDF 本身早已下载妥当。降级为记日志 + 返回 None。
+    try:
+        _write_summary_excel(rows, out_path, include_cond=include_cond)
+    except Exception as e:
+        log(f"导出汇总表失败：{e}（若文件正被 Excel/WPS 打开，请关闭后重试）")
+        return None
     log(f"汇总完成：成功 {ok} / 共 {len(pdf_files)} 个。")
     if include_cond:
         for fld in include_cond:

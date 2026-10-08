@@ -70,6 +70,7 @@ from iqr_update import (
     GITHUB_REPO_OWNER, GITHUB_REPO_NAME,
     _parse_version, _version_str, _derive_base_name,
     get_latest_release, perform_update, send_to_recycle_bin,
+    get_delete_old, set_delete_old,
     _cleanup_legacy_update_artifacts,
 )
 
@@ -183,7 +184,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.3.1"
+__VERSION__ = "5.4.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -284,8 +285,11 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
    且每个被处理的文件夹内会有一份「运行日志.txt」记录该文件夹的处理过程。
 
 【自动更新】
-- 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「是」即自动
-  下载并安装（无需手动去网页下载）。
+- 软件启动后会静默检查 GitHub 上的最新版本；发现新版本时弹窗提示，点「立即更新」
+  即自动下载并安装（无需手动去网页下载）。
+- 弹窗里有一个「更新后自动删除旧版本文件」的勾选项，**默认勾选**：更新完成后旧
+  版本自动移入回收站；取消勾选则旧版本文件保留在程序目录，由你自行处理。
+  这个选择会被记住，重启后依然生效（点「以后再说」不会改动它）。
 - 也可随时点顶栏右侧的「检查更新」手动检查。
 - 更新源为公开仓库 jianRY/invoice-qr-tool 的 Release，无需任何账号或令牌。
 - 更新过程有「更新进度」提示框：展示阶段、进度条、下载速度、已下载大小与详细日志。
@@ -355,6 +359,21 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-10-09  v5.4.0
+- **「发现新版本」弹窗新增一个选项**：「更新后自动删除旧版本文件」，默认勾选。
+  · 勾选（默认）：与以前完全一样，更新完成后旧版本自动移入回收站；
+  · 不勾选：旧版本文件原样保留在程序目录，由你自行处理。
+  这个选择会被记住，重启后依然生效；点「以后再说」不会改动它。
+  更新说明改成可滚动显示，完整内容不必再被截断。
+- **修复：极端情况下可能丢掉已经下载好的 PDF**。上一轮的下载成果在搬回「处理后」
+  时若中途失败（文件被占用、磁盘异常等），会把还没搬成功的一起删掉。现在恢复失败
+  会保留暂存内容，并提示它在下一轮自动认领。
+- **修复：界面偶发永久卡在「处理中…」**。日志轮询中若出现任何意外，现在仍会继续
+  重排，「停止」按钮不会再失效、只能重启软件。
+- **修复：窗口尺寸变化后卡片下方会残留一层旧投影**，反复缩放会越叠越明显。
+- **修复：汇总表个别单元格可能被 Excel 当成公式**，以及个别异常票据会中断整批汇总。
+- 发票的识别、下载、去重与汇总口径与 v5.3.1 完全一致。
 
 2026-09-30  v5.3.1
 - **内部整理**：源码注释与文档中不再出现内部称呼与私有部署信息；
@@ -890,6 +909,126 @@ def _place_child_window(win, w: int, h: int) -> None:
     win.geometry("%dx%d+%d+%d" % (W, H, x, y))
 
 
+class UpdatePromptDialog:
+    """「发现新版本」提示框：版本信息 + 可滚动的更新说明 + 一个选项。
+
+    为什么不用 messagebox.askyesno：原生消息框放不下复选框，而「更新后要不要
+    删掉旧版本」必须让用户当场决定，故自绘一个模态窗。
+
+    用法（构造即阻塞，内部 wait_window）：
+        dlg = UpdatePromptDialog(root, new_ver, cur_ver, notes, delete_old=True)
+        if dlg.ok:  ...用 dlg.delete_old...
+
+    ⚠️ 本类只负责「收集选择」，**不写配置文件** —— 落盘由调用方在真正开始更新时
+       做，这样「以后再说 / 直接关窗」就不会误改用户的设置。
+    """
+
+    # 更新说明最多展示多少字符（内容来自 CHANGELOG，天然有界；这里只防异常超长）
+    NOTES_MAX_CHARS = 4000
+
+    def __init__(self, parent, new_version: str, cur_version: str,
+                 notes: str, delete_old: bool = True):
+        self.ok = False                    # 用户是否点了「立即更新」
+        self.delete_old = bool(delete_old) # 用户选的是否删除旧版本文件
+        self.win = tk.Toplevel(parent)
+        self.win.title("发现新版本")
+        _place_child_window(self.win, 560, 560)
+        self.win.resizable(False, False)
+        try:
+            self.win.transient(parent)
+            self.win.grab_set()
+            self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+            self.win.bind("<Escape>", lambda e: self._on_cancel())
+        except Exception:
+            pass
+        apply_window_icon(self.win)
+        self._build_widgets(new_version, cur_version, notes or "")
+        self.win.wait_window(self.win)     # 模态：窗口关掉前不返回
+
+    def _build_widgets(self, new_version, cur_version, notes):
+        sk = K.SKIN
+        K.style_ttk(sk)
+        self.win.configure(bg=sk.bg)
+        body = tk.Frame(self.win, bg=sk.bg)
+        body.pack(fill=tk.BOTH, expand=True, padx=K.u(12), pady=K.u(10))
+
+        # ⚠️ 按钮条与选项行先 pack（side=BOTTOM）：它们要钉在底部，说明卡片随后
+        #    吃掉剩余高度。顺序反了会被内容把按钮挤出可视区（同款教训见
+        #    UpdateProgressDialog._build_widgets 的按钮条注释）。
+        btn_row = tk.Frame(body, bg=sk.bg)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(K.u(10), 0))
+        K.RoundButton(btn_row, sk, "立即更新", self._on_install, kind="primary",
+                      width=112, height=34, font_size=sk.fs_body).pack(side=tk.RIGHT)
+        K.RoundButton(btn_row, sk, "以后再说", self._on_cancel, kind="ghost",
+                      width=104, height=34, font_size=sk.fs_body).pack(
+                          side=tk.RIGHT, padx=(0, K.u(8)))
+
+        self.delete_var = tk.BooleanVar(value=bool(self.delete_old))
+        opt = tk.Frame(body, bg=sk.bg)
+        opt.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, K.u(10)))
+        # ⚠️ 勾选框文案要短：K.RoundCheck 的画布宽度是固定的（u(400)），
+        #    文案过长会被直接截断。补充说明另起一行用小字标注。
+        K.RoundCheck(opt, sk, "更新后自动删除旧版本文件",
+                     self.delete_var).pack(anchor="w")
+        tk.Label(opt, text="不勾选则旧版本会保留在程序目录，由你自行处理",
+                 bg=sk.bg, fg=sk.faint, font=K.f(sk.fs_small)).pack(
+                     anchor="w", padx=(K.u(27), 0), pady=(K.u(2), 0))
+
+        # 标题卡：新版本号 + 当前版本号
+        card = K.Card(body, sk)
+        card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
+        head = tk.Frame(card.body, bg=sk.card)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="发现新版本 v%s" % new_version, bg=sk.card, fg=sk.text,
+                 font=K.f(sk.fs_body, True)).pack(side=tk.LEFT)
+        tk.Label(head, text="当前 v%s" % cur_version, bg=sk.card, fg=sk.muted,
+                 font=K.f(sk.fs_small)).pack(side=tk.RIGHT)
+
+        # 更新说明：长度不可控，用可滚动文本框（原 messagebox 只能截断前 600 字）
+        # ⚠️ 不额外加「更新内容」小标题：notes 本身就带 `## 更新内容` 之类的分级标题，
+        #    再套一层会与正文首行重复，看着像显示错了。
+        ncard = K.Card(body, sk)
+        ncard.pack(fill=tk.BOTH, expand=True)
+        wrap = tk.Frame(ncard.body, bg=sk.card)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        # ⚠️ 先以 NORMAL 建再插入、最后锁回 DISABLED：Text 一旦是 DISABLED，
+        #    insert() 会被静默忽略 —— 文本框看着就是空的。
+        txt = tk.Text(wrap, height=13, wrap="word", bd=0, highlightthickness=0,
+                      bg=sk.card, fg=sk.text, font=K.f(sk.fs_log),
+                      padx=K.u(2), pady=K.u(2), state=tk.NORMAL)
+        txt.insert(tk.END, notes.strip()[:self.NOTES_MAX_CHARS] or "（无更新说明）")
+        txt.configure(state=tk.DISABLED)
+        # 用 ui_kit.style_ttk 配好的 ttk 滚动条，别用原生 tk.Scrollbar（样式突兀）
+        sb = ttk.Scrollbar(wrap, orient="vertical", style="P.Vertical.TScrollbar",
+                            command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns", padx=(K.u(4), 0))
+
+    def _on_cancel(self):
+        """「以后再说」/ Esc / 点 ✕：不改设置，只关窗。"""
+        self.ok = False
+        self._close()
+
+    def _on_install(self):
+        """「立即更新」：取当前勾选状态交给调用方（配置由调用方落盘）。"""
+        self.delete_old = bool(self.delete_var.get())
+        self.ok = True
+        self._close()
+
+    def _close(self):
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class UpdateProgressDialog:
     """更新进度框：展示阶段、进度条、下载速度、已下载大小与详细日志。
 
@@ -1105,7 +1244,8 @@ class UpdateProgressDialog:
         self.txt.append(text, None)
 
 
-def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str = ""):
+def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str = "",
+                       delete_old: bool = True):
     """在进度框中执行更新；成功后短暂展示“更新完成”再关闭主程序，由新版本接管。
 
     download_urls 是候选下载源列表（GitHub Release 直链 + 官网服务器兜底，
@@ -1114,6 +1254,8 @@ def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str =
     见 iqr_update.get_latest_release / perform_update。
     sha256 为期望的更新包摘要（取自 Release 附件 update.json，兜底路径由 Release
     正文的 `SHA256:` 行解析而来），非空时下载完先校验再替换。
+    delete_old 为用户勾选的「更新后自动删除旧版本文件」：默认 True＝既有行为。
+    仅透传给 perform_update，本函数不做任何配置读写。
 
     取消 / 失败时主程序**照常继续运行**（不 destroy），进度框停在可关闭状态。
     """
@@ -1126,7 +1268,8 @@ def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str =
             dlg.emit(**ev)          # emit 只入队，由主线程 _poll 消费
         try:
             perform_update(download_urls, version, on_event=on_event,
-                           cancel=dlg.cancel, sha256=sha256)
+                           cancel=dlg.cancel, sha256=sha256,
+                           delete_old=delete_old)
         except Exception as e:
             # 兜底：工作线程异常退出就再没人报 done，进度框会卡在「不可关闭」状态
             dlg.emit({"type": "detail", "text": f"更新过程出错：{e}"})
@@ -1138,6 +1281,8 @@ def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str =
 
 # 更新检查的互斥守卫：避免「启动静默检查」与手动点「检查更新」同时弹出两个对话框
 _update_dialog_open = threading.Event()
+# 配套锁：把「判断是否已被占用」与「占用」合成原子的一步（见 _begin_update_check）
+_update_check_lock = threading.Lock()
 # 处理任务是否正在进行（进行中就不再弹更新提示，免得打断用户）
 _PROCESSING = threading.Event()
 
@@ -1186,6 +1331,11 @@ def bind_run_log_dir(folder) -> None:
     if _RUN_LOG_DIR:
         for line in list(_RUN_LOG_BUFFER):
             _write_run_log(line)
+        # 补写完就清空：这些是**启动期**攒下的日志（启动版本号、程序路径…）。
+        # 不清的话，每切换到一个新文件夹都会把它们完整重写一遍 ——
+        # N 个文件夹就是 N 份一模一样的开头，白占空间也干扰排查。
+        # （此后 _RUN_LOG_DIR 非空，_append_run_log 直接落盘不再入缓冲，语义安全）
+        del _RUN_LOG_BUFFER[:]
 
 
 def _write_run_log(text: str) -> None:
@@ -1234,11 +1384,17 @@ def _preload_engine() -> None:
 
 
 def _begin_update_check() -> bool:
-    """尝试占用更新检查权。返回 False 表示已有一次检查在进行中，调用方应直接返回。"""
-    if _update_dialog_open.is_set():
-        return False
-    _update_dialog_open.set()
-    return True
+    """尝试占用更新检查权。返回 False 表示已有一次检查在进行中，调用方应直接返回。
+
+    ⚠️ 不能只写 `if _update_dialog_open.is_set(): ... set()`：那是「判断 + 占用」
+       两步、非原子。启动静默检查（后台线程）与用户手点「检查更新」（主线程）
+       恰好重叠时，两边都会通过判断 → 同���弹出两个提示框。故用一把锁包成一步。
+    """
+    with _update_check_lock:
+        if _update_dialog_open.is_set():
+            return False
+        _update_dialog_open.set()
+        return True
 
 
 def _end_update_check():
@@ -1262,13 +1418,24 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             # 等网络返回这段时间里用户可能已经点了「开始处理」，那就别打断他了
             return
         note_text = notes.strip() or "（无更新说明）"
-        ok = messagebox.askyesno(
-            "发现新版本",
-            f"发现新版本 v{'.'.join(map(str, version))}，当前为 v{__VERSION__}。\n\n"
-            f"更新内容：\n{note_text[:600]}\n\n是否立即下载并更新？",
+        # 用自绘弹窗替换 messagebox.askyesno —— 原生消息框放不下复选框。
+        # 勾选项初值取自设置（缺省＝勾选＝维持既有行为）。
+        dlg = UpdatePromptDialog(
+            root,
+            ".".join(map(str, version)),
+            __VERSION__,
+            note_text,
+            delete_old=get_delete_old(),
         )
-        if ok:
-            _start_update_flow(root, download_urls, version, sha256)
+        if dlg.ok:
+            # ⚠️ 只有真要更新时才落盘：点「以后再说」或直接关窗都不该改掉用户的选择。
+            #    写失败（程序目录只读，如装在 Program Files）只降级为「本次生效」，
+            #    绝不影响更新本身。
+            if not set_delete_old(dlg.delete_old):
+                _append_run_log(
+                    "提示：更新设置未能保存（程序目录可能不可写），本次仍按所选执行。")
+            _start_update_flow(root, download_urls, version, sha256,
+                               delete_old=dlg.delete_old)
     finally:
         _end_update_check()
 
@@ -2401,10 +2568,27 @@ def _stash_pdf_dir(target: str, log) -> "str | None":
             return stash
         return None
     try:
-        if os.path.isdir(stash):
-            shutil.rmtree(stash)
         os.makedirs(stash, exist_ok=True)
-        shutil.move(pdf_dir, os.path.join(stash, "PDF"))
+        dst_pdf = os.path.join(stash, "PDF")
+        if os.path.isdir(dst_pdf):
+            # 上一轮在「恢复」中途被杀（关窗口 / 拔电），暂存里还留着没认领的 PDF，
+            # 而「处理后/PDF」又被重建出来了 —— 两者同时存在就是这个状态。
+            # ⚠️ 这里**绝不能 rmtree 暂存目录**：删掉的正是用户已经下载好的发票。
+            #    改成把当前 PDF 逐个并进去，重名的加后缀让位，合并完再删空壳。
+            for f in sorted(os.listdir(pdf_dir)):
+                s_path = os.path.join(pdf_dir, f)
+                d_path = os.path.join(dst_pdf, f)
+                if os.path.exists(d_path):
+                    stem, ext = os.path.splitext(f)
+                    i = 1
+                    while os.path.exists(d_path):
+                        i += 1
+                        d_path = os.path.join(dst_pdf, f"{stem}_{i}{ext}")
+                shutil.move(s_path, d_path)
+            shutil.rmtree(pdf_dir)          # 文件都已搬走，只剩空壳
+            log("前置转换：发现上次未认领的 PDF 暂存，已合并保留。")
+        else:
+            shutil.move(pdf_dir, dst_pdf)
         return stash
     except Exception as e:
         log(f"前置转换：暂存上次下载的 PDF 失败（{e}），本次会重新下载。")
@@ -2439,7 +2623,12 @@ def _restore_pdf_dir(stash: "str | None", target: str, log) -> int:
             ])
     except Exception as e:
         log(f"前置转换：恢复上次下载的 PDF 失败（{e}）。")
-    finally:
+        # ⚠️ 恢复失败时**必须保留**暂存目录：里面还有没挪回来的 PDF，
+        #    直接删掉等于丢掉用户已经下载好的发票（不可恢复）。
+        #    下一轮 _stash_pdf_dir 会自动认领这里的残留。
+        log(f"          暂存目录已保留，下一轮会自动认领：{stash}")
+    else:
+        # 全部挪回成功，才清掉暂存目录
         try:
             shutil.rmtree(stash)
         except OSError:
@@ -2998,6 +3187,7 @@ def _process_folder_impl(
             pos,
             f"✓ 已有 PDF 直接复用（未重新下载，也只保留一份 PDF）：{stats['duplicate']} 张",
         )
+        pos += 1
     if dedup.shot_reused:
         summary.insert(
             pos,
@@ -3393,6 +3583,12 @@ class InvoiceQrToolApp:
             pass
         except tk.TclError:
             return          # 窗口已销毁，停止轮询
+        except Exception:
+            # ⚠️ 处理单条消息时的任何意外，都必须让轮询**继续跑下去**：
+            #    一旦漏掉下面的 after 重排，日志与进度就永久停摆、界面卡在
+            #    「处理中…」，连「停止」按钮也随之失效 —— 用户只能重启软件。
+            #    这里与 _pump_ui 对回调的处理一致：吞掉异常，不让它拖垮轮询。
+            pass
         try:
             self._poll_job = self.root.after(100, self._poll_log)
         except tk.TclError:
