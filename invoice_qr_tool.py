@@ -184,7 +184,7 @@ QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.4.0"
+__VERSION__ = "5.5.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -197,6 +197,8 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 【功能】
 1. 识别指定文件夹内图片中的二维码（每一张图片都会被识别并归类，不会因网址重复整张跳过；
    去重只发生在下载环节，见下条）。
+2. **既可以选整个文件夹，也可以直接选 PDF 文件**（见【使用步骤】第 2 步）；
+   两种方式最终走的是同一套识别、下载与汇总流程。
 2. 二维码为网址：自动下载对应 PDF 到「PDF」子文件夹。
    - 一张图只有 1 个二维码：文件名与原始图片相同（原名.pdf）。
    - 一张图有 2 个及以上二维码：**每个二维码都会各自下载一份 PDF**，
@@ -270,6 +272,12 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 1. 把待处理的图片（和/或 PDF）放在同一个文件夹里；如果按批次 / 单位分放在子文件夹里，
    软件会自动逐个处理，不用一个个点。
 2. 打开本软件，点「浏览…」选择该文件夹（可以是总文件夹，子文件夹会自动遍历）。
+   · 也可以点「添加文件…」**直接选 PDF 文件**（支持一次多选）：软件会先把每个 PDF
+     逐页转成图片，放进与该 PDF **同级、以 PDF 文件名命名**的文件夹里（例如
+     `发票甲.pdf` → `发票甲\发票甲_第1页.jpg …`），再把这些图片送进上面那套识别流程，
+     输出（PDF、未识别、汇总表）同样落在那个同名文件夹里。PDF 原件不会被改动或删除。
+     遇到加密、损坏或转换失败的文件会明确说明原因并跳过，不影响其余文件。
+   · 两个入口都只是「填入」，点「开始处理」才真正开始。
 3. 按需勾选：
    - 处理完成后打开文件夹
    - 将下载的 PDF 转换为图片（JPG，长边 2000px）
@@ -359,6 +367,23 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-10-10  v5.5.0
+- **新增「添加文件…」：可以直接选 PDF 文件，不用先归到一个文件夹里**（支持一次多选）。
+  · 选好后点「开始处理」，软件会先把每个 PDF **逐页转成图片**，放进与该 PDF
+    **同级、以 PDF 文件名（不含扩展名）命名**的文件夹里
+    （例如「发票甲.pdf」→「发票甲」文件夹，内含「发票甲_第1页.jpg …」），
+    再自动把这些图片送进原有的识别流程；
+  · 转出的图片与原有的「将下载的 PDF 转换为图片」完全同一规格：JPG、长边 2000px；
+  · 下载好的 PDF、「未识别」文件夹与汇总表同样落在这个同名文件夹里，整套结果不散；
+  · **PDF 原件不会被改名、移动或删除。**
+- **异常情况会明确说明原因**：PDF 已加密（需要打开密码）、PDF 已损坏或格式不对、
+  文件夹无法创建、以及单个文件转换失败 —— 都会逐条列出并跳过，不影响其余文件。
+- **同名文件夹已存在时自动复用**，并只清理软件自己上次生成的页面图；
+  你自己放在该目录里的其它文件一个都不会动。
+- 「浏览…」（选文件夹）与「添加文件…」（选 PDF）两个入口互不影响：
+  用了后者再点前者会自动切回按文件夹处理。
+- 按文件夹导入的原有行为、识别与去重口径完全不变。
 
 2026-10-09  v5.4.0
 - **「发现新版本」弹窗新增一个选项**：「更新后自动删除旧版本文件」，默认勾选。
@@ -2835,12 +2860,17 @@ def process_folder(
     workers: int = DEFAULT_WORKERS,
     preconvert: bool = True,
     recursive: bool = True,
+    targets: "list | None" = None,
 ):
     """处理整个文件夹（对外入口）。
 
     会自动**递归遍历所选文件夹里的子文件夹**，对每个「含图片或 PDF」的文件夹跑同一套
     识别流程（各自的 PDF/、未识别/、汇总表都落在它自己里面）；跳过程序自建的
     「处理后」/「未识别」/「PDF」，不会把上一轮的产物再处理一遍。
+
+    targets 不为空时**跳过递归扫描**，直接按调用方给定的文件夹列表处理。
+    「文件导入」用它把「PDF 转图后生成的各个同名文件夹」喂进来：之后的聚合、
+    进度、统计、结束弹窗全部复用这里的实现，两条入口只有前面一步不同。
 
     ⚠️ 这里必须保证「无论发生什么，最后一定有 ("done",) 入队」：界面靠它复位按钮与
     状态，漏一次就永久卡在「处理中…」，只能重启软件（打包后没有控制台，异常也看不见）。
@@ -2866,11 +2896,14 @@ def process_folder(
             finish()
             return
 
-        try:
-            targets = _iter_target_folders(folder) if recursive else [folder]
-        except Exception as e:
-            log(f"扫描子文件夹出错（{e}），改为只处理所选文件夹。")
-            targets = [folder]
+        if targets:
+            pass          # 调用方已给定明确的待处理文件夹，跳过扫描
+        else:
+            try:
+                targets = _iter_target_folders(folder) if recursive else [folder]
+            except Exception as e:
+                log(f"扫描子文件夹出错（{e}），改为只处理所选文件夹。")
+                targets = [folder]
 
         if not targets:
             log("没有找到含图片或 PDF 的文件夹，本次没有可处理的内容。")
@@ -2903,7 +2936,12 @@ def process_folder(
             if cancel.cancelled:
                 break
             if total_folders > 1:
-                rel = os.path.relpath(target, folder)
+                # ⚠️ targets 由调用方给定时可能不在 folder 之下、甚至不在同一磁盘
+                #    （os.path.relpath 跨盘会抛 ValueError）→ 拿不到相对路径就用绝对路径。
+                try:
+                    rel = os.path.relpath(target, folder)
+                except Exception:
+                    rel = target
                 log("")
                 log(f"=== [{idx}/{total_folders}] {'（所选文件夹本身）' if rel == '.' else rel} ===")
             sub = _process_folder_impl(
@@ -2939,6 +2977,199 @@ def process_folder(
             log_queue.put(("done",))
         except Exception:
             pass
+
+
+def _describe_pdf_error(e: Exception) -> str:
+    """把 PyMuPDF 的原始报错翻译成用户看得懂的一句话（加密 / 损坏 / 打不开）。"""
+    s = str(e)
+    low = s.lower()
+    if "password" in low or "encrypt" in low:
+        return "PDF 已加密，需要打开密码，无法转换"
+    if "damaged" in low or "no objects" in low or "cannot open" in low \
+            or "not a pdf" in low or "format" in low:
+        return f"PDF 已损坏或格式不正确（{s}）"
+    return f"转换失败：{s}"
+
+
+def _convert_files_to_folders(file_list, log, cancel=None) -> tuple:
+    """把选中的 PDF 逐个转成「同名文件夹里的页面图」。
+
+    返回 ``(成功生成的文件夹列表, [(文件, 失败原因), ...])``。
+
+    约定：
+      · 目标目录 = 与该 PDF **同级**、以 **PDF 文件名（去扩展名）** 命名的文件夹；
+      · 目录已存在时**复用**，并只清理本工具自己命名的「<名>_第N页*.jpg」，
+        目录里的其它文件一律不碰（同名的用户文件夹不会被误清）；
+      · 单个文件失败（加密 / 损坏 / 只读 / 空文件）只记日志跳过，不影响其余文件；
+      · 两个 PDF 落到同一个输出目录（同目录同名词）时，后一个跳过并说明原因。
+    """
+    folders, failures = [], []
+    done_dirs = {}
+    total = len(file_list)
+    for idx, pdf in enumerate(file_list, 1):
+        if cancel is not None and cancel.cancelled:
+            break
+        name = os.path.basename(pdf)
+        stem = os.path.splitext(name)[0]
+        if not stem:
+            failures.append((name, "文件名去掉扩展名后为空，无法确定存放目录"))
+            continue
+        out_dir = os.path.join(os.path.dirname(pdf), stem)
+
+        key = os.path.normcase(os.path.abspath(out_dir))
+        if key in done_dirs:
+            failures.append((name, f"与「{done_dirs[key]}」会转到同一个文件夹「{stem}」，已跳过"))
+            continue
+
+        # 先单独探一次：加密 / 损坏 / 0 页在这里就能给出明确提示，
+        # 比让 convert_pdf_to_images 抛一串底层异常更好懂。
+        try:
+            import pymupdf
+            _doc = pymupdf.open(pdf)
+            try:
+                _needs_pass, _pages = bool(_doc.needs_pass), len(_doc)
+            finally:
+                _doc.close()
+        except Exception as e:
+            failures.append((name, _describe_pdf_error(e)))
+            log(f"  ✗ {name}：{_describe_pdf_error(e)}")
+            continue
+        if _needs_pass:
+            failures.append((name, "PDF 已加密，需要打开密码，无法转换"))
+            log(f"  ✗ {name}：PDF 已加密，需要打开密码，无法转换")
+            continue
+        if _pages <= 0:
+            failures.append((name, "PDF 里没有任何页面"))
+            log(f"  ✗ {name}：PDF 里没有任何页面")
+            continue
+
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            failures.append((name, f"无法创建同名文件夹「{stem}」：{e}"))
+            log(f"  ✗ {name}：无法创建同名文件夹「{stem}」：{e}")
+            continue
+
+        # 目录已存在时清掉本工具上一轮生成的页面图：PDF 页数变了才不会留下旧页，
+        # 而用户自己在该目录里放的其它文件一个都不动。
+        cleaned = 0
+        try:
+            prefix = stem + "_第"
+            for f in os.listdir(out_dir):
+                if f.startswith(prefix) and f.lower().endswith(SUPPORTED_IMAGE_EXTS):
+                    os.remove(os.path.join(out_dir, f))
+                    cleaned += 1
+        except Exception:
+            pass
+
+        try:
+            made = convert_pdf_to_images(pdf, out_dir, stem)
+        except Exception as e:
+            failures.append((name, _describe_pdf_error(e)))
+            log(f"  ✗ {name}：{_describe_pdf_error(e)}")
+            continue
+        if not made:
+            failures.append((name, "没有生成任何页面图"))
+            log(f"  ✗ {name}：没有生成任何页面图")
+            continue
+
+        done_dirs[key] = name
+        folders.append(out_dir)
+        extra = f"（已清理上次遗留的 {cleaned} 张）" if cleaned else ""
+        log(f"  ✓ [{idx}/{total}] {name} → {len(made)} 张图片 → 文件夹「{stem}」{extra}")
+    return folders, failures
+
+
+def process_files(
+    file_list,
+    open_after: bool,
+    convert_pdf: bool,
+    summarize: bool,
+    log_queue: queue.Queue,
+    cancel: "CancelToken | None" = None,
+    workers: int = DEFAULT_WORKERS,
+    preconvert: bool = True,
+):
+    """「文件导入」的处理入口：先把 PDF 转成同名文件夹里的图片，再逐个走图片流程。
+
+    与 :func:`process_folder` 的唯一区别就是前面这一步转换 —— 转完之后把生成的
+    文件夹列表交给 process_folder 的同一套实现（显式 targets，跳过递归扫描），
+    聚合、进度、统计与结束弹窗完全复用，不存在第二份逻辑。
+
+    ⚠️ 同 process_folder：无论发生什么，最后一定有 ("done",) 入队。
+    """
+    def log(msg):
+        log_queue.put(("log", msg))
+
+    def finish(stats=None):
+        if stats is not None:
+            log_queue.put(("stats", dict(stats)))
+        log_queue.put(("done",))
+
+    try:
+        workers = max(1, int(workers))
+    except Exception:
+        workers = DEFAULT_WORKERS
+    cancel = cancel if cancel is not None else CancelToken()
+
+    try:
+        # ① 只收真实存在的 PDF，顺手去重（对话框理论上不会重复，但手工拼路径会）
+        files, seen = [], set()
+        for p in (file_list or []):
+            p = str(p or "").strip()
+            if not p:
+                continue
+            if not p.lower().endswith(SUPPORTED_PDF_EXTS):
+                log(f"  ✗ 已跳过（非 PDF 文件）：{os.path.basename(p)}")
+                continue
+            if not os.path.isfile(p):
+                log(f"  ✗ 已跳过（文件不存在）：{os.path.basename(p)}")
+                continue
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(p)
+
+        if not files:
+            log("错误：没有可处理的 PDF 文件。")
+            finish(_zero_stats(workers))
+            return
+
+        # ② 转图
+        log(f"=== 正在把 {len(files)} 个 PDF 转成图片 ===")
+        t0 = time.perf_counter()
+        folders, failures = _convert_files_to_folders(files, log, cancel=cancel)
+        log(f"=== 转换完成：成功 {len(folders)} 个、失败 {len(failures)} 个，"
+            f"用时 {time.perf_counter() - t0:.1f} 秒 ===")
+
+        if failures:
+            log("")
+            log("以下文件未能转换，已跳过：")
+            for name, why in failures:
+                log(f"  · {name} —— {why}")
+
+        if not folders:
+            log("")
+            log("没有可用于处理的图片，任务结束。")
+            finish(_zero_stats(workers))
+            return
+
+        # ③ 交给 process_folder 的同一套实现，显式指定待处理文件夹
+        try:
+            root = os.path.commonpath([os.path.dirname(p) for p in files])
+        except Exception:
+            root = os.path.dirname(files[0])
+        if not os.path.isdir(root):
+            root = os.path.dirname(files[0])
+        process_folder(
+            root, open_after, convert_pdf, summarize, log_queue,
+            cancel=cancel, workers=workers, preconvert=preconvert,
+            targets=folders,
+        )
+    except Exception as e:
+        log(f"处理文件时出现未预期的错误，本次任务已中止：{e}")
+        finish(_zero_stats(workers))
 
 
 def _process_folder_impl(
@@ -3243,6 +3474,10 @@ class InvoiceQrToolApp:
         apply_window_icon(self.root)
 
         self.folder_var = tk.StringVar()
+        # 「添加文件…」选中的 PDF 清单（为空 = 走原有的文件夹导入）。
+        # 与 folder_var 分开存：folder_var 只是给人看的路径，任务实际处理哪些
+        # 文件由这份清单决定，避免「同目录下别的图片被顺带处理」。
+        self._pending_files: list = []
         self.open_after_var = tk.BooleanVar(value=True)
         self.convert_pdf_var = tk.BooleanVar(value=False)
         self.summarize_var = tk.BooleanVar(value=False)
@@ -3336,26 +3571,35 @@ class InvoiceQrToolApp:
         tk.Frame(self.root, bg=sk.border, height=1).pack(fill=tk.X)
 
     def _build_picker(self, parent):
-        """目标文件夹卡片：说明标签 + 输入框 + 「浏览…」。"""
+        """目标卡片：说明标签 + 输入框 +「浏览…」（选文件夹）+「添加文件…」（选 PDF）。"""
         sk = K.SKIN
         card = K.Card(parent, sk)
         card.pack(fill=tk.X, pady=(0, K.u(sk.card_gap)))
-        tk.Label(card.body, text="目标文件夹", bg=sk.card, fg=sk.muted,
+        tk.Label(card.body, text="目标文件夹 / PDF 文件", bg=sk.card, fg=sk.muted,
                  font=K.f(sk.fs_body, True)).pack(anchor="w")
         row = tk.Frame(card.body, bg=sk.card)
         row.pack(fill=tk.X, pady=(K.u(6), 0))
         self.ent_path = ttk.Entry(row, style="P.TEntry", font=K.f(sk.fs_body),
                                   textvariable=self.folder_var)
         self.ent_path.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # ⚠️ 先让输入框量出自己的高度，「浏览…」再对齐它：ttk.Entry 的高度是
+        # ⚠️ 先让输入框量出自己的高度，两个按钮再对齐它：ttk.Entry 的高度是
         #    「上下内边距 + 字体行高」，硬编码一个数字永远差几像素。
         self.ent_path.update_idletasks()
+        _btn_h = self.ent_path.winfo_reqheight() / max(1.0, K.SCALE)
         self.btn_browse = K.RoundButton(
             row, sk, "浏览…", self._browse_folder, kind="ghost",
-            width=max(76, int(sk.btn_h * 2.2)),
-            height=self.ent_path.winfo_reqheight() / max(1.0, K.SCALE),
+            width=max(76, int(sk.btn_h * 2.2)), height=_btn_h,
             font_size=sk.fs_body)
         self.btn_browse.pack(side=tk.LEFT, padx=(K.u(8), 0))
+        self.btn_add_files = K.RoundButton(
+            row, sk, "添加文件…", self._add_files, kind="ghost",
+            width=max(96, int(sk.btn_h * 2.8)), height=_btn_h,
+            font_size=sk.fs_body)
+        self.btn_add_files.pack(side=tk.LEFT, padx=(K.u(8), 0))
+        # 选了文件时的提示行（走文件夹导入时为空，不占视觉空间）
+        self.picker_hint = tk.Label(card.body, text="", bg=sk.card, fg=sk.faint,
+                                    font=K.f(sk.fs_small), anchor="w")
+        self.picker_hint.pack(fill=tk.X, pady=(K.u(5), 0))
 
     def _build_options(self, parent):
         """处理选项卡片：三个自绘复选框（两个「处理完成后…」并排，转图单独一行）。"""
@@ -3474,9 +3718,66 @@ class InvoiceQrToolApp:
         self._started_at = None
 
     def _browse_folder(self):
+        """选文件夹（原有入口）：一旦改用文件夹，就清掉之前选中的 PDF 清单。"""
         path = filedialog.askdirectory()
         if path:
+            self._pending_files = []
+            self._update_picker_hint()
             self.folder_var.set(path)
+
+    def _update_picker_hint(self):
+        """刷新「已选 N 个 PDF」的提示行。"""
+        try:
+            n = len(self._pending_files or [])
+            if n:
+                self.picker_hint.configure(
+                    text=f"已选 {n} 个 PDF 文件 —— 点「开始处理」后逐个转成同名文件夹里的图片再处理；"
+                         f"点「浏览…」可改回按文件夹处理。")
+            else:
+                self.picker_hint.configure(text="")
+        except Exception:
+            pass
+
+    def _add_files(self):
+        """添加 PDF 文件（可多选）。
+
+        与「浏览…」一致：**只填入、不自动开始**，由用户点「开始处理」。
+        真正的转图与处理都发生在点开始之后（见 process_files）。
+        """
+        if self._busy:
+            self._log("处理任务进行中，暂不能添加文件。")
+            return
+        paths = filedialog.askopenfilenames(
+            title="选择 PDF 文件（可多选）",
+            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+        )
+        if not paths:
+            return
+        files, seen, ignored = [], set(), 0
+        for p in paths:
+            if p.lower().endswith(SUPPORTED_PDF_EXTS) and p not in seen:
+                seen.add(p)
+                files.append(p)
+            else:
+                ignored += 1
+        if not files:
+            messagebox.showwarning("添加文件", "没有选择任何 PDF 文件。")
+            return
+
+        self._pending_files = files
+        try:
+            common = os.path.commonpath([os.path.dirname(p) for p in files])
+        except Exception:
+            common = os.path.dirname(files[0])
+        self.folder_var.set(common)
+        self._update_picker_hint()
+
+        self._log(f"=== 已添加 {len(files)} 个 PDF 文件 ===")
+        for p in files:
+            self._log(f"  · {p}")
+        if ignored:
+            self._log(f"  （已忽略 {ignored} 个非 PDF 文件）")
+        self._log("点「开始处理」后，会先把每个 PDF 转成同名文件夹里的图片，再逐个处理。")
 
     def _check_update(self):
         if self._busy:
@@ -3691,6 +3992,8 @@ class InvoiceQrToolApp:
 
     def _start_processing(self):
         folder = self.folder_var.get().strip()
+        # 文件导入与文件夹导入的唯一差别：入口不同，后续转换 / 处理完全共用。
+        pending = list(self._pending_files or [])
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("路径错误", "请选择一个有效的文件夹。")
             return
@@ -3709,12 +4012,20 @@ class InvoiceQrToolApp:
         # 新一轮开始：先解开上一轮的日志绑定，否则开头这几行会写进上一轮那个文件夹；
         # 随后 worker 进入每个文件夹时会通过 "logdir" 事件重新绑定。
         bind_run_log_dir(None)
-        self._log("=== 开始处理 ===")
+        # 文件导入的清单只用一次，点开始后即清空（避免下次误用同一批）
+        if pending:
+            self._log(f"=== 开始处理（{len(pending)} 个 PDF 文件）===")
+            self._pending_files = []
+            self._update_picker_hint()
+            worker_target, first_arg = process_files, pending
+        else:
+            self._log("=== 开始处理 ===")
+            worker_target, first_arg = process_folder, folder
 
         self.worker_thread = threading.Thread(
-            target=process_folder,
+            target=worker_target,
             args=(
-                folder,
+                first_arg,
                 self.open_after_var.get(),
                 self.convert_pdf_var.get(),
                 self.summarize_var.get(),
