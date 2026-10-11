@@ -183,8 +183,13 @@ MULTI_PAGE_FMT = "_第{n}页"
 QR_MAX_SOURCE_PIXELS = 20_000_000    # 原图像素上限（约 60MB/张）
 QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/张）
 
+# 「锐化补充路线」用的高斯半径（见 detect_qr_codes 内的 _sharpen_for_qr）。
+# 1.6 是实测出来的：模糊 σ≤1.5 原路线本来就认得出，σ≥2.0 只有加上这一路才认得出；
+# 再调大半径对更难的情况（σ3.0）也没有改善，只会放大噪点。
+QR_SHARPEN_SIGMA = 1.6
+
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.5.0"
+__VERSION__ = "5.6.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -367,6 +372,20 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-10-11  v5.6.0
+- **模糊发票也能认出来了**：以前拍照手抖、对焦不准、或者扫描件发虚的发票，
+  二维码经常识别不出来，被当成「无码」直接跳过。现在识别前会自动做一次
+  锐化增强，发糊的二维码也能还原出来。
+  · 实测：过去完全识别不出的模糊图（模糊程度 σ2.0 及以上），现在全部识别成功；
+  · 顺带也让「很小的二维码 + 轻度模糊」这类过去认不出的图片成功率大幅提升。
+- **修复：一张图上有两个二维码、其中一个发糊时只会认出一个**。
+  这种图以前会漏掉第二个二维码，等于**少下载一张发票**；现在两个都能识别，
+  并按「_第1页 / _第2页」正常下载。
+- **识别更快**：查找时只针对二维码本身，不再顺带尝试一维条码等其它码型，
+  干净图片单张识别耗时约降低 10%（清晰图反而比上一版更快）。
+- 清晰发票的识别结果、多二维码的排序（从上到下）、PDF 命名、去重口径、
+  问题图前缀与汇总表，均与 v5.5.0 完全一致。
 
 2026-10-10  v5.5.0
 - **新增「添加文件…」：可以直接选 PDF 文件，不用先归到一个文件夹里**（支持一次多选）。
@@ -1542,33 +1561,60 @@ def detect_qr_codes(image_path: str):
 
     found: list = []          # [(text, (y, x) | None)]
 
-    # 1. zxing-cpp 识别能力更强，先尝试；对小二维码会自动多尺度放大重试。
-    #    ⚠️ 关键修复：**不能识别到一个就 break**。同一张图上可能存在两个以上二维码
-    #       （例：把两张电子票据拼成一张图），只有把各放大倍数的结果**全部合并**，
-    #       才能一个不漏 —— 早期版本遇到第一个码就跳出，第二个码直接被丢掉。
+    qr_format = None
     if zxingcpp is not None:
-        # ② 放大到几倍，由「放大后位图的像素预算」推导，而不是只看原图长边：
-        #    小图照样能放大到 4×，大图则不再无谓放大，单张占用有上限。
-        scales = [s for s in (1, 2, 3, 4)
-                  if h * w * s * s <= QR_MAX_SCALE_PIXELS] or [1]
-
         qr_format = getattr(zxingcpp.BarcodeFormat, "QRCode", None) or getattr(
             zxingcpp.BarcodeFormat, "QR_CODE", None
         )
+
+    # ② 放大到几倍，由「放大后位图的像素预算」推导，而不是只看原图长边：
+    #    小图照样能放大到 4×，大图则不再无谓放大，单张占用有上限。
+    scales = [s for s in (1, 2, 3, 4)
+              if h * w * s * s <= QR_MAX_SCALE_PIXELS] or [1]
+
+    def _sharpen_for_qr(bgr):
+        """灰度 → 高斯模糊(σ=QR_SHARPEN_SIGMA) → 非锐化掩蔽。**只锐化，不做二值化**。
+
+        目的是把失焦 / 运动模糊吃掉的高频边缘重新拉出来，再交给 zxing 内部处理。
+        ⚠️ 刻意不做二值化：实测（评估报告 2.3 节）全局阈值 Otsu 只有 40%，
+           反而低于「完全不做预处理」的 50% —— zxing 内部的 LocalAverage
+           自适应二值化比自己先做一次全局阈值更好，先二值化等于把信息提前毁掉。
+        """
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (0, 0), QR_SHARPEN_SIGMA)
+        sharpened = cv2.addWeighted(gray, 3.0, blurred, -2.0, 0)
+        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+    def _zxing_pass(base_img):
+        """在 base_img（与 img 同尺寸）上按尺度序列跑一遍 zxing，结果并入 found。
+
+        ⚠️ 关键修复：**不能识别到一个就 break**。同一张图上可能存在两个以上二维码
+           （例：把两张电子票据拼成一张图），只有把各放大倍数的结果**全部合并**，
+           才能一个不漏 —— 早期版本遇到第一个码就跳出，第二个码直接被丢掉。
+        """
         for scale in scales:
             if scale == 1:
-                scaled = img
+                scaled = base_img
             else:
-                new_w = int(w * scale)
-                new_h = int(h * scale)
-                scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                scaled = cv2.resize(
+                    base_img, (int(w * scale), int(h * scale)),
+                    interpolation=cv2.INTER_CUBIC,
+                )
             try:
-                results = zxingcpp.read_barcodes(scaled)
+                if qr_format is not None:
+                    # 显式限定只找 QR：实测与「全格式读回再过滤」结果完全一致，
+                    # 但省掉了逐个尝试 Code128 / DataMatrix / EAN… 的开销（2.4×）。
+                    # 票据上的一维条码本来就会被下面的 format 判断丢掉，白跑一趟。
+                    results = zxingcpp.read_barcodes(scaled, formats=qr_format)
+                else:
+                    results = zxingcpp.read_barcodes(scaled)
             except Exception:
                 continue
             for r in results:
-                # 只保留 QR 码（不同版本枚举名可能不同，这里同时兼容两种写法）
-                if qr_format and r.format != qr_format:
+                # 只收二维码（QR），不收一维条码 —— 不同版本枚举名可能不同，
+                # 这里同时兼容 QRCode / QR_CODE 两种写法（都取不到时 qr_format 为 None，
+                # 此时不做格式过滤，退回旧行为）。
+                if qr_format is not None and r.format != qr_format:
                     continue
                 pos = None
                 try:
@@ -1580,7 +1626,26 @@ def detect_qr_codes(image_path: str):
                     pos = None
                 push(found, r.text, pos)
 
-    # 2. OpenCV 自带 QRCodeDetector 兜底（zxing 一个都没认出来时才走）
+    # 1. zxing-cpp 识别能力更强，先跑；对小二维码会自动多尺度放大重试。
+    if zxingcpp is not None:
+        # 1a. 原图路线 —— 与既往版本逐字节相同：干净图像的识别结果完全由此产生，
+        #     所以这条路线保证了「零回归」。
+        _zxing_pass(img)
+        # 1b. 锐化补充路线 —— 实测（评估报告 2.3 / 2.5 节）这条路线是唯一能提升命中的：
+        #     · 模糊 σ≥2.0：原路线 0/4 → 加上后 4/4；
+        #     · 双码图里有一个码发糊：原路线只认到 1 个（**等于漏下第二张发票**）→ 2/2。
+        #     ⚠️ 结果只做「并入」而不是「替换」，靠上面 push() 按文本去重收口，
+        #       因此干净图像多跑这一路不会多出任何结果、也不会改变已有结果。
+        #     ⚠️ 预处理只在原尺度上做一次（不随 scale 放大重复），锐化后由 _zxing_pass
+        #       自己放大 —— 高斯模糊/加权/双三次放大都是线性算子，先锐化后放大与
+        #       「先放大后锐化」等价，但省掉了每个倍率各做一遍的开销。
+        _zxing_pass(_sharpen_for_qr(img))
+
+    # 2. OpenCV 自带 QRCodeDetector 兜底（zxing 两条路线都一个都没认出来时才走）。
+    #    ⚠️ 它的结果同样是**并入** found（同一个去重收口），不是另起一份。
+    #       触发条件故意保持「主引擎全空」：实测它在模糊场景只有 20% 命中、比主引擎还差
+    #       （评估报告 2.3 节），本轮需要救回的案例也全部由上面的锐化路线覆盖 ——
+    #       无条件并集只换来几十毫秒固定开销和误报风险，不划算。
     if not found:
         try:
             detector = cv2.QRCodeDetector()
@@ -1602,12 +1667,18 @@ def detect_qr_codes(image_path: str):
     if not found:
         return []
 
-    # ③ 稳定排序：有坐标的按「从上到下、从左到右」；没坐标的（OpenCV 兜底）保持原序。
-    #    全部无坐标时 sorted 是稳定排序，等价于不做任何改动。
-    if all(p is not None for _, p in found):
-        found.sort(key=lambda item: (round(item[1][0]), round(item[1][1])))
+    # ③ 稳定排序：有坐标的按「从上到下、从左到右」，没坐标的（OpenCV 兜底）接在其后。
+    #    ⚠️ 必须是「先排有坐标的、再把无坐标的拼到末尾」，而不是「只要有任何一个没坐标
+    #       就整体不排」—— 后者在「锐化路线捞回一个码 + OpenCV 又补一个无坐标码」时会
+    #       退化成依赖发现顺序，编号（第 N 页）就不可复现了。
+    #    只有一路结果时（旧行为里的全部有坐标 / 全部无坐标）两者的输出完全一致：
+    #    全部无坐标时 positioned 为空、不排序，等价于保持原序。
+    positioned = [item for item in found if item[1] is not None]
+    loose = [item for item in found if item[1] is None]
+    if positioned:
+        positioned.sort(key=lambda item: (round(item[1][0]), round(item[1][1])))
 
-    return [t for t, _ in found]
+    return [t for t, _ in positioned + loose]
 
 
 def is_url(text: str) -> str | None:
