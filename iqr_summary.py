@@ -5,7 +5,7 @@
 从票据 PDF 提取字段（交款人 / 票据号码 / 开票日期 / 金额合计 / 各支付类），
 并把整批票据汇总成 Excel（「统计（剔重后）」+「重复票据」两块，含公式缓存值注入）。
 
-拆出来的目的：主程序专注界面与流程编排。pdfplumber / openpyxl 仍是函数内懒加载，
+拆出来的目的：主程序专注界面与流程编排。pymupdf / openpyxl 仍是函数内懒加载，
 import 本模块不会拖慢启动。PyInstaller 打包会沿 import 自动收集，spec 无需改动。
 """
 
@@ -192,10 +192,39 @@ def _cn_capital_to_num(text):
     return int_val + dec_val
 
 
+def _load_pages_words(pdf_path):
+    """取一份 PDF 的「每页词表」，元素为 ``{"text", "top", "x0"}`` 字典。
+
+    结构与 ``pdfplumber.Page.extract_words()`` 的输出**保持一致**，因此下游的
+    ``_Pages`` / ``_extract_field`` / ``_field_search`` 以及全部取值规则一行都不用改。
+
+    为什么用 PyMuPDF（而不是 pdfplumber）：取词走 C 实现，实测快 4–12 倍
+    （真实票据 15 份：122.8 → 14.7 ms/份，字段结果逐项一致）；
+    而且 ``pymupdf`` 本就是转图功能的现有依赖，**零新增包**。
+
+    ``page.get_text("words")`` 每个词是一个 8 元组
+    ``(x0, y0, x1, y1, 词文本, block_no, line_no, word_no)``；
+    这里只取下游真正用到的三个：词文本、``y0``（→ ``top``）、``x0``。
+    坐标单位与 pdfplumber 相同（均为 point），故「同一行」的 ``Δtop < 3`` 判据可原样沿用。
+    """
+    import pymupdf  # 懒加载：仅在汇总时才需要
+
+    doc = pymupdf.open(pdf_path)
+    try:
+        # 加密 PDF：pdfplumber 是在 open() 时就抛异常，PyMuPDF 的 open() 会成功、
+        # 取词时才失败。这里提前判定并抛出，保证「这一张跳过并在日志里说明原因」的
+        # 行为与切换前一致，而不是静默返回一份全空字段。
+        if doc.needs_pass:
+            raise ValueError("PDF 已加密，需要密码")
+        return [[{"text": w[4], "top": w[1], "x0": w[0]}
+                 for w in page.get_text("words")]
+                for page in doc]
+    finally:
+        doc.close()
+
+
 def parse_invoice(pdf_path):
     """解析单个 PDF，返回 (字段字典, 错误信息或 None)。"""
-    import pdfplumber  # 懒加载：仅在汇总时才需要
-
     fields = {
         "交款人": None,
         "票据号码": None,
@@ -206,9 +235,8 @@ def parse_invoice(pdf_path):
         "医疗救助支付": None,
     }
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # 用 _Pages 包一层：8 个字段轮流查询，每页文本只规范化一次
-            pages_words = _Pages([page.extract_words() for page in pdf.pages])
+        # 用 _Pages 包一层：8 个字段轮流查询，每页文本只规范化一次
+        pages_words = _Pages(_load_pages_words(pdf_path))
 
         # ⚠️ 字段提取也要在 try 内：畸形 / 损坏的 PDF 会返回缺字段的 word dict，
         #    _field_search 里的 gather_line 会去访问 x["top"] / x["x0"] 而抛异常。
