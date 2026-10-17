@@ -10,7 +10,6 @@ PyInstaller 打包会沿 import 自动收集，spec 无需改动。
 """
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -485,13 +484,16 @@ def send_to_recycle_bin(path: str) -> bool:
                 pass
 
 
-# ---------------- 用户设置（整段与项目无关，可复制到其他项目的更新模块） ----------------
-# 目前只存一项：「更新后是否自动删除旧版本文件」。
-# 放在**程序同目录**（绿色便携，拷到 U 盘也跟着走）；装到 Program Files 时该目录
-# 只读，写入会失败 —— 此时静默降级为「本次生效、不落盘」，绝不影响更新本身。
+# ---------------- 用户设置 ----------------
+# 历史：v5.4.0 曾把「更新后是否自动删除旧版本文件」持久化到程序同目录的
+# settings.json。现已**彻底停用持久化**：
+#   · 该选项每次都取默认值（DEFAULT_DELETE_OLD），不再读写任何配置文件；
+#   · 启动时自动清理旧版本留下的 settings.json（见 _remove_legacy_settings）。
+# 理由：这个选项只有两个取值，持久化的收益抵不上「程序目录多一个文件」的代价；
+# 而且装到 Program Files 时该目录只读，写入本来就会静默失败。
 #
 # ⚠️ 路径**不能**用 os.path.dirname(sys.executable)：源码直接运行时那是 python.exe 的
-#    安装目录（通常只读），设置根本写不进去。打包后 PyInstaller 会置 sys.frozen。
+#    安装目录（通常只读）。打包后 PyInstaller 会置 sys.frozen。
 SETTINGS_FILE = "settings.json"
 DEFAULT_DELETE_OLD = True      # 默认勾选 = 维持既有行为（更新完自动把旧版送回收站）
 
@@ -504,54 +506,41 @@ def _app_dir() -> str:
 
 
 def settings_path() -> str:
-    """设置文件的绝对路径。"""
+    """历史配置文件的绝对路径。**仅用于清理，不再读写。**"""
     return os.path.join(_app_dir(), SETTINGS_FILE)
 
 
-def load_settings() -> dict:
-    """读取设置字典。文件不存在 / 内容损坏 / 无权限一律返回空字典，绝不抛异常 ——
-    配置文件出问题不该让软件起不来。"""
-    try:
-        p = settings_path()
-        if not os.path.isfile(p):
-            return {}
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+def _remove_legacy_settings() -> bool:
+    """删除历史版本留下的 settings.json，返回是否真的删掉了。
 
-
-def save_settings(data: dict) -> bool:
-    """写入设置。成功返回 True；失败返回 False（调用方据此降级，不打断更新）。
-
-    先写 .tmp 再 os.replace 原子替换 —— 避免写到一半被下一次读取撞见半个 JSON。
+    静默失败：装在 Program Files 等只读目录时删不掉属正常，绝不能因此阻断启动
+    或更新；也只动这一个文件，不碰同目录的其它内容。
     """
     try:
         p = settings_path()
-        parent = os.path.dirname(p)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, p)
-        return True
+        if os.path.isfile(p):
+            os.remove(p)
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 def get_delete_old(default: bool = DEFAULT_DELETE_OLD) -> bool:
-    """读「更新后是否自动删除旧版本文件」。缺字段 / 类型不对一律退回 default。"""
-    v = load_settings().get("delete_old_version")
-    return default if v is None else bool(v)
+    """「更新后是否自动删除旧版本文件」的当前选择。
+
+    ⚠️ 已不再读取任何配置文件 —— 恒返回默认值（勾选）。
+    """
+    return bool(default)
 
 
 def set_delete_old(value: bool) -> bool:
-    """保存该项设置；返回是否真的落盘了（False = 目录只读，本次仍生效但不持久）。"""
-    data = load_settings()
-    data["delete_old_version"] = bool(value)
-    return save_settings(data)
+    """记录该项选择。⚠️ 已不再落盘：只清理历史遗留的 settings.json。
+
+    保留函数签名以兼容既有调用方；选择仅在本次更新内生效，恒返回 True。
+    """
+    _remove_legacy_settings()
+    return True
 
 
 def perform_update(download_urls, latest_version: tuple, on_event=None,

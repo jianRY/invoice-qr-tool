@@ -70,7 +70,7 @@ from iqr_update import (
     GITHUB_REPO_OWNER, GITHUB_REPO_NAME,
     _parse_version, _version_str, _derive_base_name,
     get_latest_release, perform_update, send_to_recycle_bin,
-    get_delete_old, set_delete_old,
+    get_delete_old, set_delete_old, _remove_legacy_settings,
     _cleanup_legacy_update_artifacts,
 )
 
@@ -189,7 +189,7 @@ QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/�
 QR_SHARPEN_SIGMA = 1.6
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.7.0"
+__VERSION__ = "5.8.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -283,7 +283,7 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
      输出（PDF、未识别、汇总表）同样落在那个同名文件夹里。PDF 原件不会被改动或删除。
      遇到加密、损坏或转换失败的文件会明确说明原因并跳过，不影响其余文件。
    · 两个入口都只是「填入」，点「开始处理」才真正开始。
-3. 按需勾选：
+3. 处理选项默认**全部勾选**（可按需取消）：
    - 处理完成后打开文件夹
    - 将下载的 PDF 转换为图片（JPG，长边 2000px）
    - 处理完成后汇总发票（生成 Excel）
@@ -302,7 +302,7 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
   即自动下载并安装（无需手动去网页下载）。
 - 弹窗里有一个「更新后自动删除旧版本文件」的勾选项，**默认勾选**：更新完成后旧
   版本自动移入回收站；取消勾选则旧版本文件保留在程序目录，由你自行处理。
-  这个选择会被记住，重启后依然生效（点「以后再说」不会改动它）。
+  这个选择只在本次更新生效，不会写入任何配置文件。
 - 也可随时点顶栏右侧的「检查更新」手动检查。
 - 更新源为公开仓库 jianRY/invoice-qr-tool 的 Release，无需任何账号或令牌。
 - 更新过程有「更新进度」提示框：展示阶段、进度条、下载速度、已下载大小与详细日志。
@@ -372,6 +372,18 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-10-17  v5.8.0
+- **三个处理选项默认全部勾选**：打开软件后直接点「开始处理」，会同时完成
+  「处理完成后打开文件夹」「处理完成后汇总发票（Excel）」「将下载的 PDF 转换为图片」。
+  · 不用再每次手动勾选，开箱即用；
+  · 只想下载 PDF 的话，把不需要的选项取消勾选即可；
+  · 三项全开后单次处理的耗时与磁盘占用会相应增加（多做了转图与汇总）。
+- **不再生成 settings.json**：更新弹窗里的「更新后自动删除旧版本文件」不再写入
+  配置文件，每次打开都默认勾选。
+  · 旧版本留在程序目录的 settings.json 会在启动时自动删除，程序目录更干净；
+  · 装在 Program Files 等无写入权限的目录时，也不会再出现「设置未能保存」的提示。
+- 发票的识别、下载、去重、命名与汇总表结构，均与 v5.7.0 完全一致。
 
 2026-10-14  v5.7.0
 - **「汇总发票」速度大幅提升**：读取票据 PDF 文字的方式换成了更高效的引擎。
@@ -973,8 +985,8 @@ class UpdatePromptDialog:
         dlg = UpdatePromptDialog(root, new_ver, cur_ver, notes, delete_old=True)
         if dlg.ok:  ...用 dlg.delete_old...
 
-    ⚠️ 本类只负责「收集选择」，**不写配置文件** —— 落盘由调用方在真正开始更新时
-       做，这样「以后再说 / 直接关窗」就不会误改用户的设置。
+    ⚠️ 本类只负责「收集选择」，**不写配置文件** —— 该选项已不再持久化，
+       选择仅在本次更新内生效（详见 iqr_update 的用户设置段）。
     """
 
     # 更新说明最多展示多少字符（内容来自 CHANGELOG，天然有界；这里只防异常超长）
@@ -1482,12 +1494,9 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             delete_old=get_delete_old(),
         )
         if dlg.ok:
-            # ⚠️ 只有真要更新时才落盘：点「以后再说」或直接关窗都不该改掉用户的选择。
-            #    写失败（程序目录只读，如装在 Program Files）只降级为「本次生效」，
-            #    绝不影响更新本身。
-            if not set_delete_old(dlg.delete_old):
-                _append_run_log(
-                    "提示：更新设置未能保存（程序目录可能不可写），本次仍按所选执行。")
+            # 该选项已不再持久化（见 iqr_update.get_delete_old）：选择只在本次更新内
+            # 生效，不会有配置文件被写出。这里调用它只为顺手清掉历史遗留的 settings.json。
+            set_delete_old(dlg.delete_old)
             _start_update_flow(root, download_urls, version, sha256,
                                delete_old=dlg.delete_old)
     finally:
@@ -3560,8 +3569,8 @@ class InvoiceQrToolApp:
         # 文件由这份清单决定，避免「同目录下别的图片被顺带处理」。
         self._pending_files: list = []
         self.open_after_var = tk.BooleanVar(value=True)
-        self.convert_pdf_var = tk.BooleanVar(value=False)
-        self.summarize_var = tk.BooleanVar(value=False)
+        self.convert_pdf_var = tk.BooleanVar(value=True)
+        self.summarize_var = tk.BooleanVar(value=True)
         # 进度卡左侧的状态文案。沿用 progress_var 这个变量名：外部脚本与自测
         # 一直是按这个名字读界面状态的。
         self.progress_var = tk.StringVar(value="就绪")
@@ -4212,6 +4221,9 @@ def main():
 
     # 清理早期更新机制遗留的临时文件
     _cleanup_legacy_update_artifacts()
+    # 清理旧版本留下的 settings.json：该选项已不再持久化（见 iqr_update 的用户设置段），
+    # 启动时删掉即可，不留配置文件。目录只读时静默跳过。
+    _remove_legacy_settings()
 
     # 独立工具模式：仅把文件夹里的 PDF 转成图片（含「处理后」整理），到此为止
     if "--pdf2img" in args:
