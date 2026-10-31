@@ -81,9 +81,13 @@ from iqr_update import (
 # 懒加载由各功能函数内部 import 完成，Python 会缓存已导入模块，重复调用无额外开销。
 
 URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+", re.IGNORECASE)
-# 二维码文本里 URL 后面常紧跟中文标点（如「请访问 https://xxx。」）：这些字符不可能
+# 二维码文本里 URL 后面常紧跟标点（如「请访问 https://xxx。」）：这些字符不可能
 # 属于合法 URL，却会被上面那条正则一并吞进去，导致下载失败，故统一削掉尾随标点。
-URL_TAIL_JUNK = "。，、；：！？）】》」”’…"
+# ⚠️ 除了中文全角标点，还必须包含 **ASCII 标点**：二维码正文常写成
+#    「（详见 https://xxx）」或英文句子 "go to https://xxx."，被吞进去的 `)` / `.`
+#    会让 URL 404，最后被误判成「无票-」（审计 #7）。
+#    但 `% & = # / ?` 可能是 URL 自身的一部分，**不能**削。
+URL_TAIL_JUNK = "。，、；：！？）】》」”’…" + ".,;:!?)]}>'\"*"
 
 SUPPORTED_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 SUPPORTED_PDF_EXTS = (".pdf",)
@@ -173,6 +177,9 @@ def _build_problem_prefix(items: list, multi: bool) -> str:
 # 一张图里识别到多个二维码时，第 N 个二维码对应的 PDF 命名：原文件名 + 本后缀。
 # 例：发票照片.jpg 上有两个码 → 发票照片_第1页.pdf、发票照片_第2页.pdf。
 MULTI_PAGE_FMT = "_第{n}页"
+# 多码子项的页码后缀（`图片名_第3页`）。别名表只按「图片名」登记（一张图会转出几页
+# 事先无法预知），查询时要把这层后缀去掉再查一次，否则多码图每轮都会重复请求。
+MULTI_PAGE_SUFFIX_RE = re.compile(r"_第\d+页$")
 
 # 二维码识别的内存护栏。zxing-cpp 识别小二维码靠「逐级放大重试」，而放大后的位图是
 # 实体内存（宽 × 高 × 3 字节）：4000×3000 再放大 2× 就是 8000×6000 ≈ 144MB / 张，
@@ -189,7 +196,7 @@ QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/�
 QR_SHARPEN_SIGMA = 1.6
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.8.0"
+__VERSION__ = "5.8.1"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -372,6 +379,28 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-11-01  v5.8.1
+- **修复「上一轮已下载的发票 PDF 可能被删除」的严重问题**：重跑同一个文件夹时，
+  程序会先把上一轮的 PDF 暂存起来，处理完再放回。如果暂存这一步失败
+  （例如 PDF 正被别的软件或预览窗口占用），旧版本会把整个「处理后」文件夹删掉，
+  连上一轮下载好的 PDF 一起清空。现在遇到这种情况会**原地保留已有的 PDF**，
+  只清理其余文件，不会再有已下载成果丢失。
+- **修复「更新失败却把程序自己关掉」**：以前检查更新的最后一步是启动新版本，
+  程序在确认新版本启动成功之前就当作完成，1 秒后自动关闭窗口。如果新版本
+  因杀毒软件拦截或权限不足无法启动，就会出现「提示启动失败、然后窗口消失、
+  新版本也没跑起来」。现在只有新版本确实启动成功才会关闭窗口。
+- **同一张图上两个二维码指向同一张发票时，不再误报「重复」**：这类图会正常处理，
+  不会再把原图复制进「未识别」并命名成「第二重复-xxx」。真正的重复
+  （不同图片或不同轮次下到相同内容的发票）仍然照旧标记并留证。
+- 勾选「将下载的 PDF 转换为图片」后，若这份 PDF 是上一轮已下载、或手工放进
+  「PDF」文件夹的，现在也会补转图片（以前只在当次新下载时才转）。
+- 多文件夹批量处理时，进度条不再提前走满后卡住（PDF 按页数计入进度）。
+- 某页 PDF 里含多个二维码、且该 PDF 是重跑复用时，不再重复下载。
+- 二维码内容末尾若带英文标点（如 `).`、`,`），不再被吞进网址导致下载失败。
+- 汇总表「票据张数」不再把解析失败或空白的票据算进去，与金额口径保持一致；
+  金额取不到时「可赔付金额」也不会再出现负数。
+- 直接运行源码（.py）时不再尝试自动更新，避免往 Python 目录写文件。
 
 2026-10-17  v5.8.0
 - **三个处理选项默认全部勾选**：打开软件后直接点「开始处理」，会同时完成
@@ -1945,6 +1974,13 @@ class _DedupIndex:
         with self._lock:
             name = self._alias.get(os.path.normcase(img_name))
             if not name:
+                # 多码图的子项键是「图片名_第N页」，而别名表只按「图片名」登记
+                # （一张图转出几页事先不可知）→ 去掉页码后缀再查一次。
+                # 不这么做，含 ≥2 个二维码的源 PDF 每轮都会重新请求（审计 #6）。
+                base = MULTI_PAGE_SUFFIX_RE.sub("", img_name)
+                if base and base != img_name:
+                    name = self._alias.get(os.path.normcase(base))
+            if not name:
                 return None
             if not _is_valid_pdf_file(os.path.join(self.pdf_dir, name)):
                 return None
@@ -2572,7 +2608,9 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 
     ok_items = [r for r in results if r["ok"]]
     bad_items = [r for r in results if not r["ok"]]
-    pdf_count = len(ok_items)
+    # 份数按**实际落盘的不同 PDF 文件**计：多码图里两个码下回来的内容相同时，去重后
+    # 磁盘上只留一份；按子项个数算会把「合计多下 N 份」算大（审计 #10）。
+    pdf_count = len({os.path.normcase(r["pdf"]) for r in ok_items if r.get("pdf")})
 
     # 4) 汇总本图的「问题子项」。两类都算问题，各自带原因标签：
     #      · 失败（非网址 / 无 PDF / 网络失败）→ 无票
@@ -2583,11 +2621,24 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
         tag = "" if not multi else f"[第{r['idx']}页] "
         lines.append(f"  {tag}-> 未下载成功：{r['reason']}")
         problems.append((r["idx"] if multi else 0, TAG_NOT_TICKET))
+    # 本图子项**自己名下**的 PDF（不含内容合并来的）。用来区分两种情况：
+    #   · keeper 是本图另一个码刚下成的那份 → 同一次识别的内部合并（一张发票两个入口），
+    #     不该报「重复」，否则一张完全正常的发票会被复制成「未识别/第二重复-xxx.jpg」；
+    #   · keeper 来自别的图 / 上一轮 → 才是真正值得人工核一眼的重复票据。
+    own_pdfs = {
+        os.path.normcase(r["pdf"]) for r in results
+        if r["ok"] and r.get("pdf") and not r.get("dup_hit")
+    }
     for r in results:
         # 只有「重下回来才发现重复」才算：说明出现了另一个下载入口或网址失效，
         # 稍后多半得人工核一眼。单纯同网址复用（同一发票拍多张图）属于已知去重，
         # 不标「重复」，免得「未识别」文件夹被噪声撑大。
         if r["ok"] and r.get("dup_hit"):
+            tag = "" if not multi else f"[第{r['idx']}页] "
+            if os.path.normcase(r["pdf"]) in own_pdfs:
+                lines.append(f"  {tag}-> 与本图另一个码指向同一张发票，"
+                             f"已合并为一份（不算重复）")
+                continue
             dup_hit = True
             problems.append((r["idx"] if multi else 0, TAG_DUPLICATE))
 
@@ -2620,16 +2671,23 @@ def _process_one(ctx: _TaskCtx, fname: str, out_base: str) -> dict:
 def _convert_downloaded(ctx: _TaskCtx, results: list, lines: list):
     """把本次成功拿到的 PDF 逐个转成图片（受「将 PDF 转换为图片」开关控制）。
 
-    多二维码时每个子项各转各的；复用来的（自己名下没有 PDF）跳过 —— 那份 PDF
-    当初下载时已经转过了，重复渲染只是白花时间。
+    多二维码时每个子项各转各的；复用来的 PDF 只有「文件名正好是本子项该有的那份」
+    才补转 —— 别的子项名下的（别名 / 指纹复用）当初已按它自己的名字转过，再转一次
+    只会多出一套重复图片。图片已存在则跳过，所以重复调用是安全的。
     """
     if not ctx.convert_pdf or not ctx.img_dir:
         return
+    converted = False
     for r in results:
-        if not r["ok"] or r["reused"] or not r["pdf"]:
+        if not r["ok"] or not r["pdf"]:
+            continue
+        base = r["base"]
+        # ⚠️ 以前这里无条件跳过所有 reused 项，导致「上一轮没勾转图 / PDF 是手工放进去的，
+        #    本轮勾上重跑」时命中复用分支 → 一张图片都不会生成，开关看起来完全失效（审计 #4）。
+        if r["reused"] and os.path.normcase(os.path.splitext(r["pdf"])[0]) \
+                != os.path.normcase(base):
             continue
         pdf_path = os.path.join(ctx.pdf_dir, r["pdf"])
-        base = r["base"]
         first_img = os.path.join(ctx.img_dir, f"{base}_第1页.jpg")
         if os.path.exists(first_img):
             lines.append(f"  -> 图片已存在，跳过转换：{os.path.basename(first_img)}")
@@ -2637,10 +2695,11 @@ def _convert_downloaded(ctx: _TaskCtx, results: list, lines: list):
         try:
             for img_path in convert_pdf_to_images(pdf_path, ctx.img_dir, base):
                 lines.append(f"  -> 已生成图片：{os.path.basename(img_path)}")
+            converted = True
         except Exception as e:
             lines.append(f"  -> PDF 转图片失败：{e}")
-    if any(r["reused"] and not r["already"] for r in results):
-        lines.append("  -> 该发票已有 PDF，无需重复转图")
+    if not converted and any(r["reused"] and not r["already"] for r in results):
+        lines.append("  -> 该发票已有 PDF（它自己名下那份转过图），无需重复转图")
 
 
 # =====================================================================
@@ -2663,6 +2722,39 @@ def _unique_path(name: str, used: set) -> str:
 
 # 「处理后」重建时暂存 PDF 目录用的后缀（同级目录，同盘 move 是 rename，瞬间完成）
 _PDF_STASH_SUFFIX = "_PDF暂存"
+
+
+class _StashFailed(Exception):
+    """暂存「处理后/PDF」失败。
+
+    单独定义异常而不是返回 None：调用方拿到 None 会当成「本来就没有 PDF 目录」，
+    紧接着 rmtree 掉「处理后」—— 而那份 PDF 还在里面，等于把用户上一轮下载好的
+    发票连根删了（真实数据丢失）。抛异常才能让上层改走降级路径。
+    """
+
+
+def _clean_dir_except(target: str, keep: set, log=print):
+    """清空 target 下**除 keep 之外**的条目（keep 里放小写名字，按 normcase 比较）。
+
+    专供「暂存 PDF 失败」时用：清掉上一轮遗留的图片与「未识别」，但 ``PDF`` 原地不动。
+    """
+    kept = {os.path.normcase(k) for k in keep}
+    try:
+        names = os.listdir(target)
+    except OSError as e:
+        log(f"  -> 读取「{os.path.basename(target)}」失败：{e}")
+        return
+    for name in names:
+        if os.path.normcase(name) in kept:
+            continue
+        p = os.path.join(target, name)
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+        except Exception as e:
+            log(f"  -> 清理旧内容失败：{name}（{e}）")
 
 
 def _stash_pdf_dir(target: str, log) -> "str | None":
@@ -2706,8 +2798,10 @@ def _stash_pdf_dir(target: str, log) -> "str | None":
             shutil.move(pdf_dir, dst_pdf)
         return stash
     except Exception as e:
-        log(f"前置转换：暂存上次下载的 PDF 失败（{e}），本次会重新下载。")
-        return None
+        # ⚠️ 不能 return None 假装「本来就没有 PDF」：调用方会紧接着 rmtree(target)，
+        #    而 pdf_dir 还在 target 里 —— 上一轮下载好的发票会被一并删掉。
+        #    抛给上层，由它改走「原地保留 PDF、只清其余内容」的降级路径。
+        raise _StashFailed(str(e)) from e
 
 
 def _restore_pdf_dir(stash: "str | None", target: str, log) -> int:
@@ -2819,11 +2913,26 @@ def prepare_target_folder(
 
     # 「处理后」清空重建（要求：每次重建，不带上次遗留）——但 **PDF 子目录要保住**：
     # 那是上一轮下载的成果，一起删掉下一轮就全部重下（老问题：明明下过又下一遍）。
-    stash = _stash_pdf_dir(target, log)
+    keep_pdf = False
+    try:
+        stash = _stash_pdf_dir(target, log)
+    except _StashFailed as e:
+        # 暂存失败（PDF 被占用 / 权限 / 磁盘满）：**绝不能**再整目录重建，
+        # 否则 pdf_dir 会随 rmtree 一起消失（数据丢失）。降级成「原地保留 PDF、
+        # 只清掉其余内容」，效果与重建完成一致，成果一份不丢。
+        log(f"前置转换：暂存上次下载的 PDF 失败（{e}），"
+            f"改为原地保留 PDF、只清理其余内容。")
+        stash = None
+        keep_pdf = True
+
     try:
         if os.path.isdir(target):
-            shutil.rmtree(target)
-            log(f"前置转换：已清空旧的「{sub_name}」文件夹。")
+            if keep_pdf:
+                _clean_dir_except(target, {"pdf"}, log)
+                log(f"前置转换：已清理旧的「{sub_name}」（其中的 PDF 全部保留）。")
+            else:
+                shutil.rmtree(target)
+                log(f"前置转换：已清空旧的「{sub_name}」文件夹。")
         elif os.path.exists(target):
             os.remove(target)
         os.makedirs(target, exist_ok=True)
@@ -2925,16 +3034,39 @@ def _iter_target_folders(root: str) -> list:
     return sorted(targets)
 
 
-def _count_pending(folder: str) -> int:
-    """数一个文件夹里的「待处理文件数」（图片 + PDF），只用于全局进度的预估基数。"""
+def _pdf_page_count(pdf_path: str) -> int:
+    """这份 PDF 转图后会变成几张图（拿不到就按 1 算）—— 只用于全局进度基数。"""
+    try:
+        import pymupdf
+        doc = pymupdf.open(pdf_path)
+        try:
+            if getattr(doc, "needs_pass", False):
+                return 1
+            return max(1, doc.page_count)
+        finally:
+            doc.close()
+    except Exception:
+        return 1
+
+
+def _count_pending(folder: str, preconvert: bool = False) -> int:
+    """数一个文件夹里的「待处理文件数」，只用于全局进度的预估基数。
+
+    preconvert=True（勾了 PDF 前置转换）时，**PDF 按页数计**：转换后每页都是一张
+    待识别图片。以前一律按 1 份算，多文件夹带多页 PDF 时进度条会提前打满并停住，
+    看着像卡死（审计 #5）。
+    """
     n = 0
     try:
         for f in os.listdir(folder):
-            if not os.path.isfile(os.path.join(folder, f)):
+            p = os.path.join(folder, f)
+            if not os.path.isfile(p):
                 continue
             low = f.lower()
-            if low.endswith(SUPPORTED_IMAGE_EXTS) or low.endswith(SUPPORTED_PDF_EXTS):
+            if low.endswith(SUPPORTED_IMAGE_EXTS):
                 n += 1
+            elif low.endswith(SUPPORTED_PDF_EXTS):
+                n += _pdf_page_count(p) if preconvert else 1
     except Exception:
         return 0
     return n
@@ -3017,7 +3149,8 @@ def process_folder(
                 log(f"  · {'（所选文件夹本身）' if rel == '.' else rel}")
                 shown += 1
 
-        grand_total = sum(_count_pending(t) for t in targets)
+        # 进度基数：勾了前置转换时 PDF 按页数折算（转换后每页一张图），否则按文件数
+        grand_total = sum(_count_pending(t, preconvert) for t in targets)
         base_done = 0
         agg = _zero_stats(workers)
         t_start = time.perf_counter()
@@ -3041,7 +3174,7 @@ def process_folder(
             ) or _zero_stats(workers)
             for key in _SUMMABLE_STATS:
                 agg[key] += sub.get(key, 0) or 0
-            base_done += _count_pending(target)
+            base_done += _count_pending(target, preconvert)
 
         agg["elapsed"] = time.perf_counter() - t_start
 
@@ -4027,10 +4160,14 @@ class InvoiceQrToolApp:
             # 文件夹里没有可处理的图片：空进度 + 明确文案，别显示成跑满
             self.progress.reset()
             self.progress_var.set("没有需要处理的图片")
-        else:
+        elif s:
             self.progress.set_value(100)
-            if s:
-                self.progress_var.set(f"已完成 {s['total']} / {s['total']} 份")
+            self.progress_var.set(f"已完成 {s['total']} / {s['total']} 份")
+        else:
+            # 异常收尾：process_folder 抛未预期错误时只发 ("done",)、不带 stats。
+            # 处理到第几张无从得知 —— 不把进度条刷到 100%（那等于谎报跑完），
+            # 也不能留着「正在处理 3 / 10 份」的旧文案（审计 #12）。
+            self.progress_var.set("任务异常结束（详见日志）")
         # 停表：优先用工作线程实测的耗时，拿不到就用界面自己的计时
         el = (s or {}).get("elapsed") or 0.0
         if el:

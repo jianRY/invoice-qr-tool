@@ -317,7 +317,29 @@ _AUX_TAG = "重复份"        # 辅助列标记值：同一票据号第 2 张及
 _AUX_FIRST = "首份"        # 辅助列标记值：该票号的首张（空票号也算首份，不算重复）
 
 
-_AUX_HEADER = "首份/重复份标记（辅助列，不参与展示）"
+# 辅助列标记值：解析失败 / 一个字都没取到的空行。
+# 这类行照旧留在明细里（用户要看到「哪份 PDF 没解析出来」），但**不计入「票据张数」**
+# —— 否则张数比金额多一张，统计块自相矛盾（审计 #8）。
+_AUX_INVALID = "无效"
+
+
+_AUX_HEADER = "首份/重复份/无效标记（辅助列，不参与展示）"
+
+
+def _is_blank_row(row: dict) -> bool:
+    """这一行是否「什么都没解析出来」（解析失败 / 空白扫描件）。
+
+    判定只看基础列（文件名除外）是否**全部为空**：金额、票号、日期、交款人一个都
+    没有的行，对统计没有任何意义，算进「票据张数」只会让张数与金额对不上。
+    """
+    if row.get("交款人") == "解析失败":
+        return True
+    for fld in _SUMMARY_BASE_FIELDS:
+        if fld == "文件名":
+            continue
+        if row.get(fld) not in (None, ""):
+            return False
+    return True
 
 
 def _total_label(field):
@@ -479,11 +501,15 @@ def _write_summary_excel(rows, out_path, include_cond=()):
         if tn and _ticket_counts[tn] >= 2:
             _dup_group_rows.setdefault(tn, []).append(i + 1)
 
-    # 每行的「首份 / 重复份」：同票号第 2 张及以后算「重复份」；
-    # 空票号（识别失败）不算重复，记「首份」，保证 首份数 + 重复份数 = 明细总行数。
+    # 每行的「首份 / 重复份 / 无效」：同票号第 2 张及以后算「重复份」；
+    # 空票号（识别失败）不算重复，记「首份」；解析失败 / 全空的行记「无效」，
+    # 明细照样保留，但不计入「票据张数」（张数才与金额口径一致，见审计 #8）。
     _seen_ticket = Counter()
     aux_flags = []
     for r in rows:
+        if _is_blank_row(r):
+            aux_flags.append(_AUX_INVALID)
+            continue
         tn = r.get(_TICKET_FIELD)
         _seen_ticket[tn] += 1
         aux_flags.append(_AUX_TAG if (tn and _seen_ticket[tn] > 1) else _AUX_FIRST)
@@ -576,7 +602,10 @@ def _write_summary_excel(rows, out_path, include_cond=()):
             (_total_label(f), f"=SUMIF({aux_rng},{first_crit},{L}2:{L}{last})"))
     left_items.append(
         ("可赔付金额",
-         f"={stat_vcol}{left_row['合计总金额']}-" + "-".join(deduct_cells)))
+         # ⚠️ 套一层 MAX(0, …)：金额列整体没识别出来时，减去统筹会得到负数，
+         #    用户看到一个「-500」只会怀疑算错（审计 #9）。
+         f"=MAX(0,{stat_vcol}{left_row['合计总金额']}-"
+         + "-".join(deduct_cells) + ")"))
 
     # 右块「重复票据」：只累计「重复份」（同票号第 2 张及以后），首张不重复计入
     right_items = [
@@ -638,9 +667,11 @@ def _write_summary_excel(rows, out_path, include_cond=()):
     tag_deduct = {f: _col_sum(tag_rows, f) for f in deduct_fields}
 
     cache = {}
+    # 可赔付金额与公式一样夹到 ≥0：金额缺失时不能算出负数（审计 #9）
+    payable = max(0.0, first_amount - sum(first_deduct.values()))
     left_values = ([len(first_rows), first_amount]
                    + [first_deduct[f] for f in deduct_fields]
-                   + [first_amount - sum(first_deduct.values())])
+                   + [payable])
     for i, v in enumerate(left_values):
         cache[f"{stat_vcol}{stat_first_row + i}"] = (
             round(v, 2) if isinstance(v, float) else v, False)

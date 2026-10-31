@@ -497,6 +497,12 @@ def send_to_recycle_bin(path: str) -> bool:
 SETTINGS_FILE = "settings.json"
 DEFAULT_DELETE_OLD = True      # 默认勾选 = 维持既有行为（更新完自动把旧版送回收站）
 
+# 源码模式下是否允许真的走完「落盘 → 启动新版本」。
+# 正常恒为 False：源码运行时 sys.executable 是 python.exe，落盘会写出
+# 「python_vX.Y.Z.exe」到 Python 安装目录（2026-10-31 审计 #11）。
+# 只有回归测试（outputs/_test_cancel*.py）会临时置 True。
+ALLOW_SOURCE_UPDATE = False
+
 
 def _app_dir() -> str:
     """程序所在目录：打包后是 exe 目录，源码运行时是本文件所在目录。"""
@@ -579,7 +585,7 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
     def _cancelled() -> bool:
         return cancel is not None and cancel.is_set()
 
-    emit({"type": "stage", "text": "正在下载新版本…"})
+    # 这一行挪到「源码模式」检查之后：源码运行时不该先闪一句「正在下载新版本…」
     tmp_dir = tempfile.gettempdir()
     part = os.path.join(tmp_dir, "InvoiceQRDownloader_update.part")
     try:
@@ -618,6 +624,19 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
         emit({"type": "detail", "text": "当前版本保持不变，软件可继续正常使用。"})
         emit({"type": "cancelled"})
         emit({"type": "done", "ok": False})
+
+    # ---- ⓿ 源码模式保护 ----
+    # 未打包运行时 sys.executable 是 python.exe：继续走下面的落盘逻辑，会把更新包
+    # 写成「python_v5.9.0.exe」塞进 Python 安装目录并试图启动它 —— 纯属污染。
+    # 回归测试要用完整更新流程，就把 ALLOW_SOURCE_UPDATE 置 True（默认关闭）。
+    if not getattr(sys, "frozen", False) and not ALLOW_SOURCE_UPDATE:
+        _cleanup_part()
+        emit({"type": "detail",
+              "text": "当前是源码运行模式，不支持自动更新（请使用打包后的 exe）。"})
+        emit({"type": "done", "ok": False})
+        return False
+
+    emit({"type": "stage", "text": "正在下载新版本…"})
 
     # ---- ① 下载（可取消）：多源依次尝试 ----
     urls = download_urls if isinstance(download_urls, (list, tuple)) else [download_urls]
@@ -725,7 +744,9 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
         else:
             emit({"type": "detail",
                   "text": f"按当前设置保留旧版本文件（未删除）：{os.path.basename(current_exe)}"})
-        emit({"type": "done", "ok": True})
+        # ⚠️ done(ok=True) 必须等新进程**真的起来之后**再发：界面收到它就会排定
+        #    「1 秒后关窗」，若 Popen 抛错，用户看到的是「更新完软件直接消失」，
+        #    而新版本其实一个都没启动（2026-10-31 审计 #2，已复现）。
 
         # 启动新版本并把“当前（旧）exe 路径”交给它回收；随后退出旧进程，
         # 交由新进程在旧进程释放文件后把旧 exe 移入回收站。
@@ -753,7 +774,6 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
                 env=child_env,
                 close_fds=True,
             )
-            return True
         except Exception as e:
             emit({"type": "detail",
                   "text": f"启动新版本失败：{e}，旧版本仍保留，可手动打开新文件。"})
@@ -761,6 +781,9 @@ def perform_update(download_urls, latest_version: tuple, on_event=None,
                   "text": f"新版本文件已保存在：{new_exe}"})
             emit({"type": "done", "ok": False})
             return False
+        # 新进程已经拉起来了 → 到这一步才通知界面「可以关窗切新版本」
+        emit({"type": "done", "ok": True})
+        return True
     except Exception as e:
         emit({"type": "detail", "text": f"保存新版本失败：{e}"})
         emit({"type": "done", "ok": False})
