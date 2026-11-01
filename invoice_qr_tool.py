@@ -196,7 +196,7 @@ QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/�
 QR_SHARPEN_SIGMA = 1.6
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.8.1"
+__VERSION__ = "5.9.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
