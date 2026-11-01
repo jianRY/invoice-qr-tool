@@ -75,3 +75,43 @@ id_ed25519
 
 # AI 生成图标的中间产物（不入库）
 generated-images/
+
+# ---- 缓存与临时文件 ----
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.tmp
+*.bak
+*.old
+*.orig
+*.rej
+*.spec.bak
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统杂项 ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---- 前端 / Node（本项目无前端，防御性排除） ----
+node_modules/
+.next/
+out/
+dist_*/
