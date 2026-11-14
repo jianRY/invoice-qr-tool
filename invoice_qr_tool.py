@@ -196,7 +196,7 @@ QR_MAX_SCALE_PIXELS = 12_000_000     # 放大后位图像素预算（约 36MB/�
 QR_SHARPEN_SIGMA = 1.6
 
 # 软件自身版本与 GitHub 更新源（公开仓库，更新检查无需鉴权）
-__VERSION__ = "5.9.0"
+__VERSION__ = "5.10.0"
 
 
 USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
@@ -382,6 +382,26 @@ USAGE_TEXT = f"""发票二维码识别下载工具 · 使用说明
 
 CHANGELOG_TEXT = """发票二维码识别下载工具 · 更新记录
 ================================
+
+2026-11-14  v5.10.0
+- **修复「新发票被跳过、PDF 里装的是上一张票」的严重问题**：以前如果你把发票图片
+  放进一个和上一轮**同名**的文件夹里，程序可能以为「这张发票已经下载过了」而直接跳过，
+  结果 PDF 文件里装的是**上一轮那张发票**的内容 —— 金额、票号全对不上，
+  汇总表也跟着张冠李戴。现在改为按**图片内容**判定是否已下载；
+  万一目标文件名真的被别的票占着，程序会换一个名字保存，**绝不覆盖你已有的 PDF**。
+- **修复「同一张发票的多个图片被互相错认」**：别名登记与实际保存的文件名现在严格同源，
+  不会再把 A 发票的图登记到 B 发票的 PDF 上。
+- **修复「手动点『检查更新』没反应」**：软件刚打开时正在后台检查更新，
+  这期间你点「检查更新」，以前界面一点动静都没有（像是按钮坏了）。
+  现在会明确告诉你「正在检查，请稍候」，并把检查结果**主动送给你**，
+  不用再点第二次。
+- **修复「更新出错却一声不吭」**：以前弹窗或更新过程内部出错时，异常会被悄悄吞掉，
+  屏幕上什么现象都没有。现在会直接弹出错误提示并说明原因，
+  同时把现场写进运行日志，方便排查。
+- **更新链安全加固**：① 下载包的校验值算不出来时一律**中止**（以前会当成校验通过）；
+  ② 版本与校验值**只从可信源获取**（加速镜像仅用于下载文件本身，不再用于取校验值）；
+  ③ 发版脚本现在会先探测线上版本，探测失败就中止，不再覆盖线上文件；
+  ④ 上传附件改成「先改名让位再传」，中途断网也不会让线上下载地址失效。
 
 2026-11-01  v5.9.0
 - **自动更新模块重构为跨项目共享内核**：本工具的检查更新逻辑现在与「发票识别汇总工具」
@@ -1392,6 +1412,11 @@ def _start_update_flow(root: tk.Tk, download_urls, version: tuple, sha256: str =
 _update_dialog_open = threading.Event()
 # 配套锁：把「判断是否已被占用」与「占用」合成原子的一步（见 _begin_update_check）
 _update_check_lock = threading.Lock()
+# ⚠️ 有人点了「检查更新」但撞上了正在进行的检查时置位。
+#    用途：那次检查（多半是启动时的静默检查）回来时，发现有人等着结果，
+#    就按**手动**方式把结果给出来（弹「已是最新」或更新提示框）。
+#    没有它的话，用户点了「检查更新」只能干等，且等完还不知道结果（2026-11-14 修）。
+_update_manual_pending = threading.Event()
 # 处理任务是否正在进行（进行中就不再弹更新提示，免得打断用户）
 _PROCESSING = threading.Event()
 
@@ -1513,6 +1538,11 @@ def _end_update_check():
 def _handle_update_result(root: tk.Tk, result, manual: bool):
     """**主线程**：按检查结果显示提示 / 询问是否更新，最后释放检查锁。"""
     try:
+        # ⚠️ 有人点了「检查更新」却撞上了正在进行的检查（多半是启动静默检查）：
+        #    那次检查的结果现在要按**手动**方式给他，否则他点了按钮却什么都没等到。
+        if _update_manual_pending.is_set():
+            _update_manual_pending.clear()
+            manual = True
         if not result:
             if manual:
                 messagebox.showinfo(
@@ -1525,6 +1555,7 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             return
         if not manual and _PROCESSING.is_set():
             # 等网络返回这段时间里用户可能已经点了「开始处理」，那就别打断他了
+            _append_run_log("静默检查发现新版本，但正在处理任务中，本次不打扰。")
             return
         note_text = notes.strip() or "（无更新说明）"
         # 用自绘弹窗替换 messagebox.askyesno —— 原生消息框放不下复选框。
@@ -1542,8 +1573,24 @@ def _handle_update_result(root: tk.Tk, result, manual: bool):
             set_delete_old(dlg.delete_old)
             _start_update_flow(root, download_urls, version, sha256,
                                delete_old=dlg.delete_old)
+    except Exception as e:  # noqa: BLE001
+        # ⚠️ 这里必须有兜底：异常会一路冒到 _pump_ui，而 _pump_ui 把异常**静默吞掉**
+        #    ⇒ 用户点了「立即更新」却什么都没发生、连报错都看不到（2026-11-14 修）。
+        _append_run_log("检查更新处理时出错：%r" % (e,))
+        try:
+            messagebox.showerror("检查更新", "检查更新时出错：\n%s" % e)
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         _end_update_check()
+
+
+def _notify_update_busy(root: tk.Tk):
+    """已有一次检查在进行：明确告诉用户，别让他对着没反应的按钮发呆。"""
+    try:
+        messagebox.showinfo("检查更新", "正在检查更新，请稍候…")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _check_update_async(root: tk.Tk, manual: bool = False):
@@ -1553,6 +1600,14 @@ def _check_update_async(root: tk.Tk, manual: bool = False):
     """
     if manual:
         if not _begin_update_check():
+            # ⚠️ 不能静默返回（2026-11-14 修）：
+            #    启动时那次静默检查还没回来，用户此时点了「检查更新」，
+            #    旧写法直接 return —— 界面毫无反应，也没有报错，
+            #    用户只会以为按钮坏了。
+            #    现在：登记「有人等结果」+ 给一句明确提示；
+            #    那次检查回来时按手动方式把结果给他（见 _handle_update_result）。
+            _update_manual_pending.set()
+            _ui_post(root, lambda: _notify_update_busy(root))
             return
     elif _PROCESSING.is_set() or not _begin_update_check():
         return
@@ -1560,7 +1615,9 @@ def _check_update_async(root: tk.Tk, manual: bool = False):
     def _worker():
         try:
             result = get_latest_release()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # 静默模式下不打扰用户，但必须留下现场，否则事后无从查起
+            _append_run_log("检查更新失败：%r" % (e,))
             result = None
         _ui_post(root, lambda: _handle_update_result(root, result, manual))
 
@@ -4202,8 +4259,12 @@ class InvoiceQrToolApp:
                 fn = _UI_QUEUE.get_nowait()
                 try:
                     fn()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # ⚠️ 异常不能**完全**静默：这条通道上跑的正是更新检查，
+                    #    吞掉就等于「用户点了没反应 + 事后无据可查」。
+                    #    更新流程内部自己会兜底并弹报错框；这里只作最后一道兜底，
+                    #    至少把现场写进运行日志。
+                    _append_run_log("界面回调异常：%r" % (e,))
         except queue.Empty:
             pass
         try:
