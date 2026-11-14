@@ -310,7 +310,14 @@ def _parse_update_json(data=None):
 
 
 def _api_url_candidates():
-    """API 查询候选：直连优先，再试能代理 API 的镜像。"""
+    """API 查询候选：**只走可信源**（直连 api.github.com）。
+
+    ⚠️ 2026-11-14 修正（审计 S-2）：旧实现在这里挂了 gh-proxy 兜底。
+    GitHub API 响应里**同时**含 exe 下载地址与 sha256 —— 镜像代理 API 时
+    可以同时改写这两样，被控的镜像就能让 sha256 校验变成摆设，直接达成
+    静默远程代码执行。所以镜像**只用于下载 exe 字节**，不碰元数据。
+    取不到就走自有站 update.json（域名在信任白名单里，同样带 sha256）。
+    """
     return _core.api_url_candidates(CFG)
 
 
@@ -776,8 +783,21 @@ def perform_update(download_urls, latest_version, on_event=None,
         except Exception as e:  # noqa: BLE001
             actual = ""
             emit({"type": "detail", "text": "读取更新包准备校验时出错：%s" % e})
-        # 读不到（actual 为空）时放行，避免因偶发 IO 问题把正常更新挡掉
-        if actual and actual != sha256:
+        # ⚠ 读不到校验值 **不等于** 校验通过（2026-11-14 修正，审计 S-1）：
+        #   旧写法是 `if actual and actual != sha256` —— actual 为空时两条判断同时短路，
+        #   于是「读不到 sha256」被当成「校验通过」，未校验的 exe 被落位并启动
+        #   （杀软独占锁定 .part 时就会走到这里）。sha256 是抵御「加速镜像被控」的
+        #   唯一屏障，跳过它等于没有屏障 ⇒ 读不到就按失败处理。
+        if not actual:
+            _cleanup_part()
+            emit({"type": "detail",
+                  "text": "无法读取更新包完成校验（校验值算不出来），已放弃本次更新。"})
+            emit({"type": "detail",
+                  "text": "常见原因是安全软件正占用该文件。请关闭实时防护后重试，"
+                          "或前往 GitHub Releases 手动下载。"})
+            emit({"type": "done", "ok": False})
+            return False
+        if actual != sha256:
             _cleanup_part()
             emit({"type": "detail",
                   "text": "更新包校验失败（SHA256 不一致），已丢弃该文件。"})
@@ -785,8 +805,7 @@ def perform_update(download_urls, latest_version, on_event=None,
                   "text": "可能是下载中途断流或缓存了损坏的文件，请稍后重试。"})
             emit({"type": "done", "ok": False})
             return False
-        if actual:
-            emit({"type": "detail", "text": "更新包校验通过（SHA256 一致）。"})
+        emit({"type": "detail", "text": "更新包校验通过（SHA256 一致）。"})
 
     # ---- ② 落盘（临界区，不可取消）----
     try:

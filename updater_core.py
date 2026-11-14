@@ -88,7 +88,7 @@ __all__ = [
 ]
 
 # 内核版本号：改动内核后 +1，同步脚本据此判断副本是否过期。
-CORE_VERSION = "1.0.0"
+CORE_VERSION = "1.2.0"
 
 # ---------------- 常量 ----------------
 UA = (
@@ -106,6 +106,10 @@ MIRROR_PREFIXES = (
 
 # 能代理 **API 查询** 的镜像（与下载用的不是同一批，别混用）。
 # 实测：只有 gh-proxy.com 能代理 api.github.com，另两家一律 403。
+# ⚠️ 2026-11-14 起**不再用于 API 查询**（审计 S-2）：API 响应里同时含 exe
+#    地址与 sha256，镜像能同时改写这两样 ⇒ sha256 校验形同虚设。
+#    常量保留只为兼容旧调用方（接口统一契约要求它存在），**不要再拿来拼 URL**。
+#    exe **字节**的下载仍然走 MIRROR_PREFIXES 那批镜像。
 API_MIRROR_PREFIXES = ("https://gh-proxy.com/",)
 
 PROBE_BYTES = 256 * 1024        # 探测读取的字节数（探活，不是精确测速）
@@ -320,6 +324,53 @@ def strip_md(text, limit=4000):
     if len(t) > limit:
         t = t[:limit] + "\n…（更多见 Release 页）"
     return t
+
+
+# ============================================================== 手动下载入口
+
+
+def manual_download_links(site_url="", html_url="", download_urls=None):
+    """自动更新失败时可用的手动下载入口：[("标签", "地址")]。
+
+    为什么要有它（2026-11-14：2.12.0/2.13.0 两版自动更新全挂，用户只看到
+    一句「更新失败」，窗口里没有任何可点的地址 —— 等于「知道有新版，却不知道
+    去哪下」）。这条入口必须在三处同时出现，且**共用同一份推导逻辑**，
+    免得地址各写一份、换站点时漏改：
+
+      ① 更新弹窗（发现新版本时就能直接手动下，不用等失败）
+      ② 更新失败提示框 + 运行日志
+      ③ 发版写进 Release 说明（= 弹窗里的「本次更新内容」）与 CHANGELOG
+
+    顺序 = 自有站（国内直连，最可能通）→ Release 页（含历史版本与校验信息）
+    → 直链（点开就下）。只收 HTTPS（与更新链基线一致），重复地址只留第一次。
+    """
+    out = []
+
+    def _add(label, url):
+        u = str(url or "").strip()
+        if not u or not u.lower().startswith("https://"):
+            return
+        if any(u == x[1] for x in out):
+            return
+        out.append((label, u))
+
+    _add("官网下载页", site_url)
+    _add("Release 页", html_url)
+    for u in list(download_urls or [])[:1]:
+        _add("直链", u)
+    return out
+
+
+def manual_download_text(site_url="", html_url="", download_urls=None):
+    """把手动下载入口拼成纯文本（失败弹窗 / 日志用）。无可用地址时返回空串。
+
+    ⚠️ 必须写**裸地址**，不能用 markdown 的 `[文字](地址)`：弹窗正文要过
+       strip_md()，那种写法会被还原成只剩文字，地址反而丢了。
+    """
+    items = manual_download_links(site_url, html_url, download_urls)
+    if not items:
+        return ""
+    return "可手动下载安装：\n" + "\n".join("  · %s：%s" % (k, v) for k, v in items)
 
 
 # ============================================================== 下载源
@@ -648,18 +699,24 @@ def _match_asset(cfg, asset, version, strict=True):
 
 
 def api_url_candidates(cfg):
-    """GitHub API 的查询候选：直连优先，再试能代理 API 的加速镜像。
+    """GitHub API 的查询候选：**只保留可信源**。
 
-    实测（2026-09-24）：api.github.com 直连在国内本来就能通（约 0.8s），所以直连
-    排第一；镜像只作兜底 —— 多数 gh-proxy 系镜像**不代理 API**
-    （实测 ghfast.top / ghproxy.net 对 api.github.com 一律 403）。
+    ⚠ 加速镜像**不在此列**（2026-11-14 修正，审计 S-2）：
+    GitHub API 的响应里**同时**含 exe 下载地址（``browser_download_url``）与
+    ``assets[].digest``（sha256）。镜像代理 API 时可以同时改写这两样 ——
+    被控的镜像就能让 sha256 校验变成摆设，直接达成静默远程代码执行
+    （红线：元数据不走加速镜像）。镜像只用于下载 exe 字节。
+
+    旧实现在这里挂了 gh-proxy 兜底（实测国内确实只有它能代理 api.github.com），
+    但那条路的元数据不可信 ⇒ 宁可查不到（回落自有站 update.json），
+    也不能拿被改写过的版本号 + 校验值去更新。
     """
     base = (cfg.api_latest_url if cfg is not None else "")
     out, seen = [], set()
-    for u in [base] + [p + base for p in API_MIRROR_PREFIXES]:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
+    u = (base or "").strip()
+    if u and u not in seen and is_trusted_meta_url(u, cfg):
+        seen.add(u)
+        out.append(u)
     return out
 
 
@@ -671,7 +728,10 @@ def fetch_latest_release(cfg, timeout=15):
     为什么重要：这条路径走 api.github.com，比 github.com 稳定得多；有了 digest，
     「取不到 update.json 就没法安全更新」的死路就通了 —— 两条可信路径都能给校验值。
 
-    依次尝试 api_url_candidates()：直连优先，能代理 API 的镜像兜底。
+    依次尝试 api_url_candidates()：**只有可信源**（直连 api.github.com）。
+    ⚠️ 镜像不再作为 API 兜底（S-2）：镜像能同时改写 exe 地址与 sha256，
+    被控就等于静默远程代码执行。查不到就返回 None，由调用方回落自有站
+    update.json（那条路同样带 sha256，且站点域名已在信任白名单里）。
     """
     import urllib.request
     data = None
@@ -847,12 +907,30 @@ def _read_json(path):
 
 
 def _write_json(path, data):
+    """原子写 JSON：先写同目录临时文件，再 os.replace 顶替。
+
+    ⚠️ 直接 open(path, "w") 是先截断后写。写到一半断电 / 被杀进程 / 文件被占用，
+    磁盘上就只剩半截 JSON；而读配置的每个调用方都是「读失败 → 用默认值」，
+    于是用户会「莫名其妙被重置成出厂设置」，日志里一个字都没有。
+    os.replace 在同分区上是原子操作：要么旧内容、要么新内容，不会出现半截文件。
+    """
     try:
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=".cfg-", suffix=".tmp", dir=d or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
         return True
     except Exception:
         return False
@@ -1100,26 +1178,34 @@ def write_cleanup_flag(directory, cleanup_old):
 def read_and_consume_cleanup_flag(directory):
     """新版进程：读取旧版留下的选择并删掉标记文件。
 
-    返回 True/False 表示要不要删旧版；**文件不存在时返回 True**（默认保持原行为，
-    不因为机制故障就悄悄改成「保留一堆旧版文件」）。
+    返回 True/False 表示要不要删旧版；**文件不存在 / 读不出来时返回 True**
+    （默认保持原行为，不因为机制故障就悄悄改成「保留一堆旧版文件」）。
 
     必须「读完就删」：这个文件表达的是「本次更新」的意图，若留着会被下一次启动
     当成新决策反复生效，用户后来改了勾选状态也不生效。
+
+    ⚠️ 这里**没有任何异常可以抛出去**：它跑在 settle_after_update 里，也就是
+    每次启动的路径上。原来只 except OSError，且 txt 只在 try 内赋值 ——
+    文件被其他编码写过 / 内容损坏（UnicodeDecodeError）时异常会一路穿到启动流程，
+    轻则少做一次清理，重则整个启动流程中断。现在一律兜住并当作「默认」。
     """
     path = os.path.join(directory or "", CLEANUP_FLAG)
+    txt = ""
     try:
         if not os.path.exists(path):
             return True
+        # 严格按 UTF-8 读：内容损坏（非 UTF-8 字节）时宁愿当「没有决定」，
+        # 也不要用 errors="replace" 硬解出一堆乱码再猜用户勾了什么。
         with open(path, "r", encoding="utf-8") as f:
             txt = f.read()
-    except OSError:
+    except Exception:  # noqa: BLE001
         return True
     finally:
         try:
             os.remove(path)
         except OSError:
             pass
-    return "cleanup_old=0" not in txt.replace(" ", "")
+    return "cleanup_old=0" not in (txt or "").replace(" ", "")
 
 
 # ---------------------------------------------------------------- 待改名登记
@@ -1302,7 +1388,9 @@ def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=No
     if cleanup_old is None:
         cleanup_old = read_and_consume_cleanup_flag(directory)
     _log("旧版本文件处理方式：%s" % ("更新完成后自动删除"
-                                   if cleanup_old else "保留（用户取消了勾选）"))
+                                   if cleanup_old else
+                                   "保留 —— 会被改名为「<软件名>_旧版_<时间戳>.exe」"
+                                   "留在程序目录，可直接双击它回退到旧版"))
 
     # ① 名字不对时：腾位置 + 登记待改名（**不在这里动手**）
     if os.path.abspath(current).lower() != os.path.abspath(final).lower():
@@ -1352,18 +1440,78 @@ def settle_after_update(log_fn=None, app_name=None, version=None, cleanup_old=No
                   max_wait=12.0, prefixes=prefixes, cleanup_old=cleanup_old)
 
 
+def _take_over_in_place(current, staging, directory, cleanup_old, log_fn):
+    """（restart=False 专用）把新版本顶到原文件名，旧版挪成 `xxx_旧版_<时间戳>.exe`。
+
+    ⚠️ 顺序不能颠倒：**先挪开自己，再给新版改名**。
+       Windows 允许给正在运行的 exe 改名，但不允许覆盖或删除它；颠倒会直接
+       WinError 32 —— 那时新版已经写进目录了，用户会看到「旧版 + 更新中」两个
+       文件，不知道该点哪个。
+
+    ⚠️ 挪开自己之后，本进程的网络能力会失效（实测，见 `_PENDING_RENAME` 段的铁律），
+       所以只能用在「马上就要退出」的收尾路径上。
+
+    ⚠️ 旧版挪开后**删不掉**（映像仍被本进程占用）：cleanup_old=True 时不要在这里
+       硬删，交给**下次启动**的 cleanup_old_versions() 按标记文件清理。
+    """
+    pstem, ext = os.path.splitext(os.path.basename(current))
+    parked = os.path.join(
+        directory, "%s_旧版_%s%s" % (pstem, time.strftime("%Y%m%d%H%M%S"), ext))
+    if os.path.exists(parked):
+        # 同一秒内重复更新会撞名；换毫秒后缀，绝不覆盖已有文件
+        parked = os.path.join(
+            directory, "%s_旧版_%d%s" % (pstem, int(time.time() * 1000), ext))
+    moved_self = False
+    try:
+        if os.path.exists(current):
+            os.rename(current, parked)
+            moved_self = True
+        try:
+            os.replace(staging, current)
+        except OSError:
+            # 跨卷（临时目录在别的盘）时 os.replace 会失败，退回拷贝+删源
+            shutil.move(staging, current)
+    except Exception as e:  # noqa: BLE001
+        # 回滚：把旧版名字改回去，别让用户既没有新版、也没有能用的旧版
+        if moved_self and os.path.exists(parked) and not os.path.exists(current):
+            try:
+                os.rename(parked, current)
+            except OSError:
+                pass
+        raise RuntimeError(
+            "新版本已下载完成，但替换程序文件失败（%s）。\n"
+            "请手动把 %s 改名为 %s（先关掉本程序）"
+            % (e, os.path.basename(staging), os.path.basename(current)))
+    if moved_self:
+        try:
+            log_fn("旧版本已改名为：%s（%s）"
+                   % (os.path.basename(parked),
+                      "下次启动自动清理" if cleanup_old else "保留，可用于回退"))
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def windows_replace_and_restart(new_exe_path, log_fn=None, cleanup_old=True,
-                                 app_name=None, version=None):
-    """就地更新：把下载好的新 exe 放进程序目录，启动它，本进程退出。
+                                 app_name=None, version=None, restart=True):
+    """就地更新：把下载好的新 exe 放进程序目录；随后启动它（restart=True）或只落位。
 
     步骤（全在本进程内完成，不生成任何外部脚本、不做进程退出轮询）：
         ① 新 exe 搬进程序目录，暂用中间名 xxx_更新中.exe
         ② 把「是否删除旧版本」写进标记文件（跨进程传给新版）
-        ③ 以中间名启动它（**不能**用原文件名，见 settle_after_update 里的说明）
-        ④ 本进程退出；新版启动后由 settle_after_update() 接管原文件名并按标记决定删不删旧版
+        ③ restart=True  → 以中间名启动它（**不能**用原文件名，见 settle_after_update 的说明）；
+           restart=False → **不启动**，就地完成「新版顶替原文件名」（见 _take_over_in_place）
+        ④ 本进程退出；restart=True 时新版启动后由 settle_after_update() 接管原文件名并
+           按标记决定删不删旧版
+
+    restart: 更新完是否自动拉起新版本。
+        True （默认，与历史行为一致）= 自动重启，用户无感。
+        False = 只落位、不启动，由调用方提示用户「重新运行程序」。
+        ⚠️ False 时必须**就地**把新版顶到原文件名（不能只把文件丢在那儿）：
+        否则目录里会同时躺着「旧版 xxx.exe」和「新版 xxx_更新中.exe」，
+        用户双击的还是旧版 —— 看起来就是「更新了却没生效」，比不更新更糟。
 
     cleanup_old: 用户在更新弹窗里的选择（默认 True = 删，与旧行为一致）。
-                 这里只负责传下去，真正删除发生在新进程里。
+                 这里只负责传下去，真正删除发生在新进程（或下次启动的清理）。
 
     new_exe_path: 下载好的新版 exe 路径（通常位于临时目录）。
     失败时抛 RuntimeError，调用方负责提示。下载失败时文件原封不动。
@@ -1408,6 +1556,12 @@ def windows_replace_and_restart(new_exe_path, log_fn=None, cleanup_old=True,
     if write_cleanup_flag(directory, cleanup_old):
         _log("旧版本文件处理方式已传给新版本：%s"
              % ("更新完成后自动删除" if cleanup_old else "保留旧版本文件"))
+
+    # ②' 不自动启动：现在就完成「新版顶替原文件名」，本进程随后退出。
+    if not restart:
+        _take_over_in_place(current, staging, directory, cleanup_old, _log)
+        _log("新版本已就位，未自动启动（请重新运行程序）")
+        return True
 
     # ③ 启动新版。用中间名（而非原文件名）启动：Windows 不允许在「当前进程自己的
     #    映像路径」上启动新进程，用原名会静默失败（引导器起来、真实程序起不来）。

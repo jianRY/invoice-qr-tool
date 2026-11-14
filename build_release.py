@@ -454,10 +454,17 @@ SENSITIVE_RULES = (
     (r"[Cc]:[\\/]+Users[\\/]+[A-Za-z0-9_.\-]{2,}", "本机用户目录"),
     (r"(?i)[a-z]:[\\/]+workbuddy[\\/]", "本地开发盘路径"),
     (r"(?i)\bgh[pousr]_[A-Za-z0-9]{20,}\b", "GitHub 令牌"),
-    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥内容"),
+    # ⚠ fine-grained PAT 的前缀是 github_pat_（不是 ghp_/gho_…），
+    #    旧正则 [pousr] 完全覆盖不到它 ⇒ 漏进公开仓库就洗不掉了（审计 S-9）。
+    (r"(?i)\bgithub_pat_[A-Za-z0-9_]{20,}\b", "GitHub fine-grained 令牌"),
+    (r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----", "私钥内容"),
     (r"(?i)\b(password|passwd|pwd|secret|api[_-]?key)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']",
      "疑似硬编码凭据"),
 )
+# 裸 40 位十六进制：classic PAT 没有前缀，光看形状认不出来。
+# ⚠ 但 git 的 commit SHA 恰恰也是 40 位十六进制 ⇒ 用仓库里真实存在的 SHA 排除，
+#    否则任何提到提交号的文档/日志都会被误拦（误拦只是烦人，漏放才是灾难）。
+BARE_HEX40_RE = r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])"
 # 不该出现在公开仓库里的文件名
 SENSITIVE_PATHS = (r"(?i)\.(pfx|pvk|pem|key)$", r"(?i)token\.txt$",
                    r"(?i)local_config\.json$", r"(?i)^\.env", r"(?i)gh_token")
@@ -478,6 +485,7 @@ def scan_staged_sensitive():
         if n and any(re.search(p, n) for p in SENSITIVE_PATHS):
             hits.append(("不该入库的文件", n))
     diff = git("diff", "--cached", "-U0", check=False).stdout or ""
+    shas = _known_repo_shas()
     for line in diff.splitlines():
         if not line.startswith("+") or line.startswith("+++"):
             continue
@@ -487,7 +495,24 @@ def scan_staged_sensitive():
         for pat, label in SENSITIVE_RULES:
             for m in re.finditer(pat, body):
                 hits.append((label, m.group(0)[:70]))
+        # 裸 40 位 hex：可能是 classic PAT（无前缀），也可能只是 git 提交号。
+        # 仓库里真实存在的 SHA 放行，其余一律拦下（审计 S-9）。
+        for m in re.finditer(BARE_HEX40_RE, body):
+            if m.group(0).lower() in shas:
+                continue
+            hits.append(("疑似 GitHub classic 令牌（40 位十六进制）", m.group(0)[:70]))
     return hits
+
+
+def _known_repo_shas():
+    """仓库里已知的 40 位 SHA（所有分支/标签可达的提交）——用于排除误报。"""
+    out = set()
+    r = git("rev-list", "--all", check=False)
+    for line in (r.stdout or "").splitlines():
+        line = line.strip().lower()
+        if len(line) == 40:
+            out.add(line)
+    return out
 
 
 def guard_staged(where):
@@ -546,14 +571,28 @@ def api(method, url, token=None, json_data=None, raw=None, ctype=None):
 
 
 def latest_release_tag(token):
+    """线上最新 Release 的 tag。
+
+    ⚠ 返回 None **只**表示「这个仓库一个 Release 都没有」；**探测失败必须抛异常**
+      （2026-11-14 修正，审计 S-7）。两者都压成 None 时，parse_ver(None)=(0,0,0)
+      ⇒「目标版本不高于线上最新」这道护栏恒为假 ⇒ 同版本号就能覆盖线上已发布的
+      附件（用户拿到的是新 exe、版本号却没变，后续再也收不到更新）。
+    """
     url = "https://api.github.com/repos/{}/{}/releases/latest".format(OWNER, REPO)
     try:
         status, data = api("GET", url, token)
-        if status == 200:
-            return data.get("tag_name")
-    except Exception:
-        pass
-    return None
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "查询线上最新版本失败（{}）。探测失败 ≠ 线上没有新版：继续发版会有"
+            "「同版本号覆盖线上附件」的风险。确认网络/代理后重试；确需覆盖用 --force。"
+            .format(e))
+    if status == 200:
+        return data.get("tag_name")
+    if status == 404:
+        return None                     # 真的一个 Release 都没有
+    raise RuntimeError(
+        "查询线上最新版本失败（HTTP {}）。探测失败 ≠ 线上无新版，已中止；"
+        "确需覆盖线上同名版本请用 --force。".format(status))
 
 
 def repo_private(token):
@@ -912,10 +951,17 @@ def publish(new_tag, token):
         raise RuntimeError(
             "创建/复用 Release {} 失败：HTTP {}，响应 {}".format(new_tag, status, str(data)[:400])
         )
-    # 4) 上传附件（先删同名旧附件，保证幂等可重跑）
+    # 4) 上传附件（临时名上传 → 改名让位 → 才删旧的；见循环内的说明）
     from urllib.parse import quote
     _, assets_data = api("GET", "https://api.github.com/repos/{}/{}/releases/{}/assets".format(OWNER, REPO, release_id), token)
     existing = {a.get("name"): a.get("id") for a in (assets_data or [])}
+    # 清理上次失败留下的临时附件（.uploading / .old）—— 同名上传会被 GitHub 拒掉
+    for a in (assets_data or []):
+        nm = a.get("name") or ""
+        if nm.endswith(".uploading") or nm.endswith(".old"):
+            api("DELETE", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(
+                OWNER, REPO, a.get("id")), token)
+            print("    清理上次遗留的临时附件:", nm)
     for fn, ctype in [
         ("InvoiceQRDownloader_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
         ("InvoiceQRInstaller_{}.exe".format(new_tag.lstrip("v")), "application/octet-stream"),
@@ -927,16 +973,45 @@ def publish(new_tag, token):
         p = os.path.join(ASSET_DIR, fn)
         if not os.path.exists(p):
             print("    跳过（缺失）:", fn); continue
-        if fn in existing:
-            api("DELETE", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(OWNER, REPO, existing[fn]), token)
-            print("    删除旧附件:", fn)
         with open(p, "rb") as fh:
             raw = fh.read()
-        url = "{}?name={}&label={}".format(upload_url, quote(fn), quote(fn))
-        st, _ = api("POST", url, token, raw=raw, ctype=ctype)
-        print("    上传 {} ({}KB) -> HTTP {}".format(fn, len(raw) // 1024, st))
+        # ⚠ 先用临时名上传，成功后再改名（2026-11-14 修正，审计 S-10）。
+        #    GitHub 的 Release 里附件名唯一，「同名覆盖」只能靠改名做。
+        #    旧写法是「先删旧附件、再传新的」：100MB 的 POST 中途一断连，
+        #    线上就永久少了这个 exe（用户点下载 404，更新通道直接断掉）。
+        #    现在：① 临时名上传 → ② 旧附件改名让位（不是删除）→ ③ 新附件改正式名
+        #    → ④ 才删旧的。任何一步失败，旧附件都还在（只是名字变了）。
+        tmp_name = fn + ".uploading"
+        url = "{}?name={}&label={}".format(upload_url, quote(tmp_name), quote(tmp_name))
+        try:
+            st, resp = api("POST", url, token, raw=raw, ctype=ctype)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("上传附件 {} 失败（网络异常）：{}；旧附件未动，线上不受影响。"
+                               .format(fn, e))
         if st not in (200, 201):
-            raise RuntimeError("上传附件 {} 失败：HTTP {}".format(fn, st))
+            raise RuntimeError("上传附件 {} 失败：HTTP {}；旧附件未动，线上不受影响。"
+                               .format(fn, st))
+        new_id = (resp or {}).get("id")
+        if not new_id:
+            raise RuntimeError("上传附件 {} 成功但没拿到 asset id，无法改名（线上仍是旧附件）。"
+                               .format(fn))
+        old_id = existing.get(fn)
+        if old_id:
+            st_old, _ = api("PATCH", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(
+                OWNER, REPO, old_id), token, json_data={"name": fn + ".old"})
+            if st_old not in (200, 201):
+                raise RuntimeError("旧附件改名失败（HTTP {}）：{} 仍以原名存在，线上不受影响。"
+                                   .format(st_old, fn))
+        st_new, _ = api("PATCH", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(
+            OWNER, REPO, new_id), token, json_data={"name": fn})
+        if st_new not in (200, 201):
+            raise RuntimeError("新附件改名失败（HTTP {}）：旧附件仍在（临时名），线上不受影响。"
+                               .format(st_new))
+        if old_id:
+            api("DELETE", "https://api.github.com/repos/{}/{}/releases/assets/{}".format(
+                OWNER, REPO, old_id), token)
+            print("    旧附件已替换:", fn)
+        print("    上传 {} ({}KB) -> HTTP {}".format(fn, len(raw) // 1024, st))
     # 5) 记录已发布提交
     # 该文件不入库（.gitignore），所以通常没有可提交的内容；只有确实产生了新提交才推送。
     # 否则代理抖动时这次多余的 push 会让「已经发布成功」的流程以非 0 退出，很容易被误判成发版失败。
@@ -970,9 +1045,23 @@ def main():
             ver_override = args[i + 1]
 
     token = get_pat() if do_publish else None
-    latest = latest_release_tag(token) if do_publish else None
+    # ⚠ 线上版本探测失败与「线上没有新版」必须分开（审计 S-7）。
+    #    探测失败时 latest_v=(0,0,0)，「目标版本不高于线上最新」这道护栏恒为假
+    #    ⇒ 同版本号就能覆盖线上附件。探测失败一律中止（除非 --force）。
+    latest = None
+    latest_failed = False
+    if do_publish:
+        try:
+            latest = latest_release_tag(token)
+        except RuntimeError as e:
+            latest_failed = True
+            print("[护栏] ⚠ " + str(e))
     latest_v = parse_ver(latest)
     local_v = parse_ver(read_version())
+
+    if do_publish and latest_failed and not force:
+        print("[护栏] 线上版本探测失败，已中止发版（确需覆盖线上同名版本请用 --force）。")
+        return
 
     # 目标版本：显式指定 > 自动在线上最新版基础上 +1（满足“版本号按实际情况新增”）
     if ver_override:
@@ -1047,10 +1136,23 @@ def main():
             print("[错误] 未能获取 GitHub PAT，无法发布。请确认 wincred 中 git:https://github.com 凭据。")
             return
         write_version(new_tag.lstrip("v"))
-        git("add", "-A", check=False)
+        # ⚠ add / commit / tag 都必须校验结果（2026-11-14 修正，审计 S-8）：
+        #    旧写法全是 check=False 且返回值丢弃 —— commit 失败（钩子拦截/冲突）或
+        #    tag 没打上，流程照样往下走，最后建出来的 Release 指向的是**旧提交**，
+        #    线上版本号与 exe 对不上（用户下到的还是上一版）。
+        git("add", "-A")
         guard_staged("发布提交")
-        git("commit", "-m", "release: {}".format(new_tag), check=False)
-        git("tag", new_tag, check=False)
+        r = git("commit", "-m", "release: {}".format(new_tag), check=False)
+        if r.returncode != 0:
+            dirty = (git("status", "--porcelain", check=False).stdout or "").strip()
+            if dirty:
+                raise RuntimeError(
+                    "git commit 失败（returncode={}），已中止发版：\nSTDOUT: {}\nSTDERR: {}\n"
+                    "未提交的工作区：\n{}".format(
+                        r.returncode, (r.stdout or "").strip()[-800:],
+                        (r.stderr or "").strip()[-800:], dirty[-800:]))
+            print("[提交] 工作区无变化，跳过提交（沿用当前 HEAD 发版）")
+        git("tag", new_tag)        # tag 失败必须中止：否则 Release 会指向旧提交
         publish(new_tag, token)
     else:
         print("\n[本地验证完成] 未执行发布（需要 --publish）。产物与签名均已就绪。")
