@@ -847,7 +847,6 @@ def update_website(new_tag):
 
     只改「版本相关」的字段，不动文案与版式，幂等可重跑。
     """
-    ver = new_tag.lstrip("v")                    # 4.0
     today = time.strftime("%Y-%m-%d")            # 2026-09-16
 
     def _mb(path):
@@ -886,7 +885,7 @@ def update_website(new_tag):
         # 数据卡「111 MB / 单文件 EXE」只改数字，标签不动（首个匹配即该卡片）
         (r">\d+ MB</b>", ">{} MB</b>".format(size_mb), 1),
     ])
-    # 下载页：meta 描述、版本 chip、日期 chip、体积 chip、主下载直链（含无 v 前缀的真实附件名）
+    # 下载页：meta 描述、版本 chip、日期 chip、体积 chip
     rewrite(os.path.join(WEBSITE_DIR, "download.html"), [
         (r"v[\d.]+（Windows", new_tag + "（Windows"),
         (r'(<span class="chip">)v[\d.]+', r"\g<1>" + new_tag),
@@ -895,13 +894,13 @@ def update_website(new_tag):
         # 负向断言排除日期 chip，避免把发布日期也当体积写掉
         (r'(<span class="chip gray">)(?!\d{4}-\d{2}-\d{2})[^<]*',
          r"\g<1>单文件 {} MB · 安装版 {} MB".format(size_mb, size_mb_i)),
-        # 下载直链走自有服务器（国内直连，2026-09-22 起）：只刷 files/ 下的文件名版本号。
-        # 页面里已不再出现 GitHub 直链，故原先针对 releases/download/ 的两条正则已删除 ——
-        # 留着只会每次发版报「未命中」噪音。
-        (r"files/InvoiceQRDownloader[_v]*[\d.]+\.exe",
-         "files/InvoiceQRDownloader_{}.exe".format(ver)),
-        (r"files/InvoiceQRInstaller[_v]*[\d.]+\.exe",
-         "files/InvoiceQRInstaller_{}.exe".format(ver)),
+        # ⚠️ 这里**不再**刷任何下载直链（2026-11-14 删）：
+        #    下载按钮统一指向 https://github.com/<repo>/releases/latest，
+        #    永远拿到最新版，页面里根本不存在 files/ 或 releases/download/ 的具体文件名。
+        #    原先针对 releases/download/ 的两条规则已删，这次把剩下的 files/ 两条也删掉 ——
+        #    否则每次发版都报两条「未命中」噪音，而「未命中」本来的用途是
+        #    「字段真的该改却没改到」的告警。噪音会把真告警淹掉。
+        #    （若将来官网改回写死具体文件名，这里要同步加回规则。）
     ])
     print("[网页] 官网版本数据已同步 -> {} | 日期 {} | {} MB".format(new_tag, today, size_mb))
 
